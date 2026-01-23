@@ -18,6 +18,7 @@ use super::config::SshConfig;
 use super::handler::SshHandler;
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
+use russh::ChannelMsg;
 
 /// SSH Connection Manager
 ///
@@ -42,6 +43,9 @@ pub struct SshConnectionManager {
 
     /// Flag indicating whether we're running as root via su
     is_elevated: AtomicBool,
+
+    /// Cached availability of the `timeout` command on the remote system
+    has_timeout_cmd: AtomicBool,
 }
 
 impl SshConnectionManager {
@@ -56,6 +60,7 @@ impl SshConnectionManager {
             is_connecting: AtomicBool::new(false),
             su_channel: Arc::new(Mutex::new(None)),
             is_elevated: AtomicBool::new(false),
+            has_timeout_cmd: AtomicBool::new(false),
         }
     }
 
@@ -265,6 +270,85 @@ impl SshConnectionManager {
     /// Check if currently elevated to root via su
     pub fn is_elevated(&self) -> bool {
         self.is_elevated.load(Ordering::SeqCst)
+    }
+
+    /// Check if the `timeout` command is available on the remote system
+    ///
+    /// Uses cached result after first check. To trigger a new check,
+    /// the connection must be re-established.
+    pub fn use_timeout_wrapper(&self) -> bool {
+        self.has_timeout_cmd.load(Ordering::SeqCst)
+    }
+
+    /// Disables timeout wrapper for the rest of this connection lifetime
+    ///
+    /// When called, this sets `has_timeout_cmd` to false, causing all subsequent
+    /// commands to fall back to the tokio timeout + pkill method instead of using
+    /// the remote timeout command wrapper.
+    pub fn disable_timeout_wrapper(&self) {
+        self.has_timeout_cmd.store(false, Ordering::SeqCst);
+        warn!("timeout wrapper disabled due to errors, falling back to pkill");
+    }
+
+    /// Detect whether the `timeout` command is available on the remote system
+    ///
+    /// This performs a one-time detection check by running `command -v timeout`
+    /// on the remote system. The result is cached for the lifetime of the
+    /// connection.
+    ///
+    /// Returns true if timeout is available, false otherwise.
+    pub async fn check_timeout_availability(&self) -> bool {
+        // Check cache first
+        if self.has_timeout_cmd.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        // Open a new channel for detection
+        let mut channel = match self.open_channel().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                debug!("Failed to open channel for timeout detection: {}", e);
+                return false;
+            }
+        };
+
+        // Run detection command
+        let exec_result = channel.exec(true, "command -v timeout").await.map_err(|e| {
+            SshMcpError::connection(format!("Failed to exec detection command: {}", e))
+        });
+
+        if exec_result.is_err() {
+            debug!("Failed to exec timeout detection command");
+            return false;
+        }
+
+        // Collect output
+        let mut output = String::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    output.push_str(&String::from_utf8_lossy(&data));
+                }
+                ChannelMsg::Close | ChannelMsg::Eof => {
+                    break;
+                }
+                _ => {
+                    // Ignore other messages
+                }
+            }
+        }
+
+        // If timeout command exists, output contains its path (e.g., /usr/bin/timeout)
+        let available = !output.is_empty();
+        self.has_timeout_cmd.store(available, Ordering::SeqCst);
+
+        if available {
+            info!("timeout command available on remote host");
+        } else {
+            info!("timeout command NOT available, using fallback pkill");
+        }
+
+        available
     }
 
     /// Check if an elevated su channel is available
@@ -522,6 +606,10 @@ impl std::fmt::Debug for SshConnectionManager {
             .field("username", &self.config.username)
             .field("is_connecting", &self.is_connecting.load(Ordering::SeqCst))
             .field("is_elevated", &self.is_elevated.load(Ordering::SeqCst))
+            .field(
+                "has_timeout_cmd",
+                &self.has_timeout_cmd.load(Ordering::SeqCst),
+            )
             .finish()
     }
 }

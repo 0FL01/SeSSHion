@@ -9,8 +9,9 @@ use russh::ChannelMsg;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
+use super::config::TIMEOUT_KILL_AFTER_SECS;
 use super::connection::SshConnectionManager;
-use super::sanitize::escape_command_for_shell;
+use super::sanitize::{escape_command_for_shell, escape_for_timeout_wrapper};
 use crate::error::{Result, SshMcpError};
 
 /// Output from a command execution
@@ -47,6 +48,25 @@ impl CommandOutput {
             format!("{}\n{}", self.stdout, self.stderr)
         }
     }
+}
+
+/// Wrap a command with the timeout utility
+///
+/// Creates a wrapper command: `timeout -k {kill_after}s {duration}s sh -lc '{command}'`
+///
+/// # Arguments
+/// * `command` - The command to wrap (should be pre-escaped)
+/// * `duration_secs` - Timeout duration in seconds
+///
+/// # Returns
+/// A wrapped command string that includes timeout logic
+pub fn wrap_command_with_timeout(command: &str, duration_secs: u64) -> String {
+    format!(
+        "timeout -k {}s {}s sh -lc '{}'",
+        TIMEOUT_KILL_AFTER_SECS,
+        duration_secs,
+        escape_for_timeout_wrapper(command)
+    )
 }
 
 impl SshConnectionManager {
@@ -92,6 +112,14 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
+        // Check duration edge case
+        let duration_secs = timeout_duration.as_secs();
+        if duration_secs == 0 {
+            return Err(SshMcpError::InvalidParams(
+                "duration must be > 0".to_string(),
+            ));
+        }
+
         // Take the channel from the mutex (we'll put it back after)
         let mut channel = {
             let mut guard = self.su_channel.lock().await;
@@ -100,8 +128,25 @@ impl SshConnectionManager {
                 .ok_or_else(|| SshMcpError::connection("No su channel available"))?
         };
 
+        // Check timeout availability lazily on first use (same as exec_via_channel)
+        let use_wrapper = if self.use_timeout_wrapper() {
+            true
+        } else {
+            let _ = self.check_timeout_availability().await;
+            self.use_timeout_wrapper()
+        };
+
+        // Wrap command with timeout if available
+        let wrapped_cmd = if use_wrapper {
+            wrap_command_with_timeout(command, duration_secs)
+        } else {
+            command.to_string()
+        };
+
+        debug!("Executing elevated command: {}", wrapped_cmd);
+
         // Send command
-        if let Err(e) = channel.data(format!("{}\n", command).as_bytes()).await {
+        if let Err(e) = channel.data(format!("{}\n", wrapped_cmd).as_bytes()).await {
             // Put channel back before returning error
             let mut guard = self.su_channel.lock().await;
             *guard = Some(channel);
@@ -113,11 +158,18 @@ impl SshConnectionManager {
 
         // Collect output until we see a root prompt (#)
         let mut buffer = String::new();
-        let deadline = tokio::time::Instant::now() + timeout_duration;
+        // When using wrapper, timeout is handled remotely - no local deadline needed
+        let deadline = if use_wrapper {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + timeout_duration)
+        };
 
         let result = loop {
-            if tokio::time::Instant::now() > deadline {
-                break Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
+            if let Some(deadline_ref) = deadline {
+                if tokio::time::Instant::now() > deadline_ref {
+                    break Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
+                }
             }
 
             let wait_result =
@@ -190,30 +242,105 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
-        // Open a new channel
+        // Check duration edge case
+        let duration_secs = timeout_duration.as_secs();
+        if duration_secs == 0 {
+            return Err(SshMcpError::InvalidParams(
+                "duration must be > 0".to_string(),
+            ));
+        }
+
         let channel = self.open_channel().await?;
 
-        // Execute command
+        // Wrap command with timeout if available
+        // Check timeout availability lazily on first use
+        let use_wrapper = if self.use_timeout_wrapper() {
+            // Already cached as available
+            true
+        } else {
+            // Try detection - if it becomes available after check, use wrapper
+            let _ = self.check_timeout_availability().await;
+            self.use_timeout_wrapper()
+        };
+
+        let wrapped_cmd = if use_wrapper {
+            wrap_command_with_timeout(command, duration_secs)
+        } else {
+            // Fall back to old method: use tokio timeout + pkill
+            command.to_string()
+        };
+
+        debug!("Executing command: {}", wrapped_cmd);
         channel
-            .exec(true, command)
+            .exec(true, wrapped_cmd.as_str())
             .await
             .map_err(|e| SshMcpError::connection(format!("Failed to exec command: {}", e)))?;
 
-        // Collect output with timeout
-        let result = timeout(timeout_duration, self.collect_channel_output(channel)).await;
+        // Collect output with appropriate timeout strategy
+        let output = if use_wrapper {
+            // When using wrapper, timeout is handled remotely - no tokio timeout needed
+            self.collect_channel_output(channel).await?
+        } else {
+            // Fall back: use tokio timeout + pkill for abort
+            let result = timeout(timeout_duration, self.collect_channel_output(channel)).await;
 
-        match result {
-            Ok(output) => output,
-            Err(_) => {
-                // Timeout occurred - attempt graceful abort
-                warn!(
-                    "Command timed out after {}ms, attempting abort",
-                    timeout_duration.as_millis()
-                );
-                self.abort_command(command).await;
-                Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64))
+            match result {
+                Ok(inner_result) => inner_result,
+                Err(_) => {
+                    // Timeout occurred - attempt graceful abort
+                    warn!(
+                        "Command timed out after {}ms, attempting abort",
+                        timeout_duration.as_millis()
+                    );
+                    self.abort_command(command).await;
+                    return Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
+                }
+            }?
+        };
+
+        // Check if timeout command failed (e.g., not found) when using wrapper
+        if use_wrapper {
+            let stderr_lower = output.stderr.to_lowercase();
+            // Check for timeout command not found errors (multiple languages)
+            let timeout_not_found = stderr_lower.contains("timeout: command not found")
+                || stderr_lower.contains("timeout: не найдена команда")
+                || stderr_lower.contains("timeout: introuvable")
+                || stderr_lower.contains("timeout: команда не найдена");
+
+            if timeout_not_found {
+                error!("timeout command not available on remote host, enabling fallback");
+                self.disable_timeout_wrapper();
+
+                // Execute the command again using fallback method (tokio timeout + pkill)
+                let channel = self.open_channel().await?;
+                channel.exec(true, command).await.map_err(|e| {
+                    SshMcpError::connection(format!("Failed to exec command: {}", e))
+                })?;
+
+                let result = timeout(timeout_duration, self.collect_channel_output(channel)).await;
+
+                return match result {
+                    Ok(inner_output) => inner_output,
+                    Err(_) => {
+                        warn!(
+                            "Command timed out after {}ms (fallback), attempting abort",
+                            timeout_duration.as_millis()
+                        );
+                        self.abort_command(command).await;
+                        Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64))
+                    }
+                };
+            }
+
+            // Check if the command was killed by timeout
+            // timeout returns 124 when it kills the command
+            if output.exit_code == Some(124) {
+                warn!("Command timed out (timeout wrapper returned 124)");
+                return Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
             }
         }
+
+        Ok(output)
     }
 
     /// Collect output from a channel until it closes
@@ -367,5 +494,30 @@ mod tests {
             exit_code: Some(1),
         };
         assert_eq!(output.combined_output(), "stderr");
+    }
+
+    #[test]
+    fn test_wrap_command_with_timeout() {
+        let cmd = wrap_command_with_timeout("sleep 10", 2);
+        assert!(cmd.contains("timeout -k 2s 2s"));
+        assert!(cmd.contains("sh -lc"));
+        assert!(cmd.contains("sleep 10"));
+    }
+
+    #[test]
+    fn test_wrap_command_with_timeout_zero_duration() {
+        // Edge case: wrapper accepts zero (validation is elsewhere)
+        let cmd = wrap_command_with_timeout("echo test", 0);
+        assert!(cmd.contains("timeout -k 2s 0s"));
+        assert!(cmd.contains("sh -lc"));
+        assert!(cmd.contains("echo test"));
+    }
+
+    #[test]
+    fn test_wrap_command_with_timeout_complex_command() {
+        let cmd = wrap_command_with_timeout("echo 'hello world'", 10);
+        assert!(cmd.contains("timeout -k 2s 10s"));
+        assert!(cmd.contains("sh -lc"));
+        assert!(cmd.contains("echo"));
     }
 }

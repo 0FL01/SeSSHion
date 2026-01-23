@@ -51,23 +51,72 @@ pub fn sanitize_command(command: &str, max_chars: Option<usize>) -> Result<Strin
     Ok(trimmed.to_string())
 }
 
-/// Escape a command for use in shell contexts (like pkill -f)
+/// Escape a command for safe execution in shell (for pkill -f patterns)
 ///
-/// This escapes single quotes in the command so it can be safely
-/// used inside single-quoted shell strings.
+/// This escapes characters that could cause shell injection when used
+/// inside single-quoted shell strings (like in `pkill -f 'command'`).
+///
+/// Escaped characters:
+/// - Single quotes: `'` → `'"'"'`
+/// - Dollar signs: `$` → `\$` (prevents variable expansion)
+/// - Backticks: `` ` `` → `\`` (prevents command substitution)
+/// - Backslashes: `\` → `\\` (prevents escape sequences)
+/// - Parentheses: `(` and `)` → `\(` and `\)` (prevents subshells)
+/// - Pipes: `|` → `\|` (prevents command chaining)
 ///
 /// # Example
 /// ```
 /// use ssh_mcp::ssh::sanitize::escape_command_for_shell;
 ///
-/// let escaped = escape_command_for_shell("echo 'hello'");
-/// assert_eq!(escaped, "echo '\"'\"'hello'\"'\"'");
+/// let escaped = escape_command_for_shell("echo 'hello' | cat");
+/// assert_eq!(escaped, "echo '\"'\"'hello'\"'\"' \\| cat");
 /// ```
 pub fn escape_command_for_shell(command: &str) -> String {
-    // Replace single quotes with escaped single quotes
-    // 'word' becomes '"'"'word'"'"'
-    // This effectively: end quote, add literal quote via double quotes, start quote again
-    command.replace('\'', "'\"'\"'")
+    // Escape order matters for backslash - we escape it first
+    // to avoid double-escaping subsequent characters
+    command
+        .replace('\\', "\\\\")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
+        .replace('|', "\\|")
+        .replace('\'', "'\"'\"'")
+}
+
+/// Escapes a command for safe inclusion inside single quotes in timeout wrapper
+///
+/// This function escapes characters that would break out of single quotes
+/// when used inside the timeout wrapper: `timeout -k 2s 10s sh -lc '{cmd}'`
+///
+/// The escaping order is important:
+/// 1. First escape backslashes (so `\$HOME` becomes `\\$HOME`)
+/// 2. Then escape single quotes (so `'` becomes `'"'"'`)
+///
+/// # Arguments
+/// * `command` - The raw command string
+///
+/// # Returns
+/// A safely escaped command string
+///
+/// # Examples
+/// ```
+/// use ssh_mcp::ssh::sanitize::escape_for_timeout_wrapper;
+///
+/// // Simple command
+/// assert_eq!(escape_for_timeout_wrapper("sleep 10"), "sleep 10");
+///
+/// // Command with single quotes
+/// assert_eq!(escape_for_timeout_wrapper("echo 'hello'"), "echo '\"'\"'hello'\"'\"'");
+///
+/// // Command with backslashes
+/// assert_eq!(escape_for_timeout_wrapper(r"echo \$HOME"), r"echo \\$HOME");
+/// ```
+pub fn escape_for_timeout_wrapper(command: &str) -> String {
+    // First escape backslashes, then single quotes
+    // This order is important: we need to preserve backslash escaping
+    // for the shell while also escaping single quotes
+    command.replace('\\', "\\\\").replace('\'', "'\"'\"'")
 }
 
 #[cfg(test)]
@@ -137,6 +186,42 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_command_for_shell_dollar_sign() {
+        let escaped = escape_command_for_shell("echo $HOME");
+        assert_eq!(escaped, "echo \\$HOME");
+    }
+
+    #[test]
+    fn test_escape_command_for_shell_backtick() {
+        let escaped = escape_command_for_shell("echo `date`");
+        assert_eq!(escaped, "echo \\`date\\`");
+    }
+
+    #[test]
+    fn test_escape_command_for_shell_backslash() {
+        let escaped = escape_command_for_shell("echo \\n");
+        assert_eq!(escaped, "echo \\\\n");
+    }
+
+    #[test]
+    fn test_escape_command_for_shell_parentheses() {
+        let escaped = escape_command_for_shell("echo (test)");
+        assert_eq!(escaped, "echo \\(test\\)");
+    }
+
+    #[test]
+    fn test_escape_command_for_shell_pipe() {
+        let escaped = escape_command_for_shell("cat file | grep test");
+        assert_eq!(escaped, "cat file \\| grep test");
+    }
+
+    #[test]
+    fn test_escape_command_for_shell_combined_special_chars() {
+        let escaped = escape_command_for_shell("echo '$HOME' | cat");
+        assert_eq!(escaped, "echo '\"'\"'\\$HOME'\"'\"' \\| cat");
+    }
+
+    #[test]
     fn test_escape_command_for_shell_multiple_quotes() {
         let escaped = escape_command_for_shell("echo 'a' 'b'");
         assert_eq!(escaped, "echo '\"'\"'a'\"'\"' '\"'\"'b'\"'\"'");
@@ -146,5 +231,41 @@ mod tests {
     fn test_escape_command_for_shell_empty() {
         let escaped = escape_command_for_shell("");
         assert_eq!(escaped, "");
+    }
+
+    #[test]
+    fn test_escape_for_timeout_wrapper_no_special_chars() {
+        let escaped = escape_for_timeout_wrapper("sleep 10");
+        assert_eq!(escaped, "sleep 10");
+    }
+
+    #[test]
+    fn test_escape_for_timeout_wrapper_with_single_quotes() {
+        let escaped = escape_for_timeout_wrapper("echo 'hello'");
+        assert_eq!(escaped, "echo '\"'\"'hello'\"'\"'");
+    }
+
+    #[test]
+    fn test_escape_for_timeout_wrapper_with_backslashes() {
+        let escaped = escape_for_timeout_wrapper("echo \\$HOME");
+        assert_eq!(escaped, "echo \\\\$HOME");
+    }
+
+    #[test]
+    fn test_escape_for_timeout_wrapper_with_both_quotes_and_backslashes() {
+        let escaped = escape_for_timeout_wrapper("echo '$HOME'");
+        assert_eq!(escaped, "echo '\"'\"'$HOME'\"'\"'");
+    }
+
+    #[test]
+    fn test_escape_for_timeout_wrapper_empty() {
+        let escaped = escape_for_timeout_wrapper("");
+        assert_eq!(escaped, "");
+    }
+
+    #[test]
+    fn test_escape_for_timeout_wrapper_multiple_quotes() {
+        let escaped = escape_for_timeout_wrapper("echo 'a' 'b'");
+        assert_eq!(escaped, "echo '\"'\"'a'\"'\"' '\"'\"'b'\"'\"'");
     }
 }

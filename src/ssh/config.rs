@@ -2,6 +2,12 @@
 //!
 //! Configuration for SSH connection parameters including authentication.
 
+/// Seconds to send SIGKILL after SIGTERM when using timeout
+pub const TIMEOUT_KILL_AFTER_SECS: u64 = 2;
+
+/// Timeout for timeout command availability detection (ms)
+pub const TIMEOUT_DETECTION_TIMEOUT_MS: u64 = 5000;
+
 /// SSH connection configuration
 #[derive(Debug, Clone)]
 pub struct SshConfig {

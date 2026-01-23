@@ -11,9 +11,9 @@ pub mod handler;
 pub mod sanitize;
 
 // Re-exports
-pub use command::CommandOutput;
+pub use command::{wrap_command_with_timeout, CommandOutput};
 pub use config::SshConfig;
 pub use connection::SshConnectionManager;
 pub use elevation::{escape_for_shell, sanitize_password, wrap_sudo_command};
 pub use handler::SshHandler;
-pub use sanitize::{escape_command_for_shell, sanitize_command};
+pub use sanitize::{escape_command_for_shell, escape_for_timeout_wrapper, sanitize_command};

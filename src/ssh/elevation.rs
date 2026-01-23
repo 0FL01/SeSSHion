@@ -28,7 +28,7 @@
 ///
 /// // Sudo with password
 /// let cmd = wrap_sudo_command("apt update", Some("mypassword"));
-/// assert_eq!(cmd, "printf '%s\\n' 'mypassword' | sudo -p \"\" -S sh -c 'apt update'");
+/// assert_eq!(cmd, "printf '%s\\n' 'mypassword' | sudo -S sh -c 'apt update'");
 /// ```
 pub fn wrap_sudo_command(command: &str, password: Option<&str>) -> String {
     let escaped_command = escape_for_shell(command);
@@ -43,7 +43,7 @@ pub fn wrap_sudo_command(command: &str, password: Option<&str>) -> String {
             // PTY/stdin handling on the SSH channel and is simpler and more reliable.
             let escaped_pwd = escape_for_shell(pwd);
             format!(
-                "printf '%s\\n' '{}' | sudo -p \"\" -S sh -c '{}'",
+                "printf '%s\\n' '{}' | sudo -S sh -c '{}'",
                 escaped_pwd, escaped_command
             )
         }
@@ -52,10 +52,13 @@ pub fn wrap_sudo_command(command: &str, password: Option<&str>) -> String {
 
 /// Escapes a string for safe use in single-quoted shell contexts.
 ///
-/// Replaces single quotes with the pattern `'\''` which:
+/// Replaces single quotes with the pattern `'"'"'` which:
 /// 1. Ends the current single-quoted string
 /// 2. Adds an escaped single quote
 /// 3. Starts a new single-quoted string
+///
+/// This is the standard POSIX-compliant method for escaping single quotes
+/// within single-quoted strings.
 ///
 /// # Examples
 ///
@@ -116,7 +119,7 @@ mod tests {
         let result = wrap_sudo_command("apt update", Some("secret123"));
         assert_eq!(
             result,
-            "printf '%s\\n' 'secret123' | sudo -p \"\" -S sh -c 'apt update'"
+            "printf '%s\\n' 'secret123' | sudo -S sh -c 'apt update'"
         );
     }
 
@@ -131,7 +134,7 @@ mod tests {
         let result = wrap_sudo_command("apt update", Some("pass'word"));
         assert_eq!(
             result,
-            "printf '%s\\n' 'pass'\"'\"'word' | sudo -p \"\" -S sh -c 'apt update'"
+            "printf '%s\\n' 'pass'\"'\"'word' | sudo -S sh -c 'apt update'"
         );
     }
 
@@ -140,7 +143,7 @@ mod tests {
         let result = wrap_sudo_command("cat /etc/shadow | grep root", Some("admin123"));
         assert_eq!(
             result,
-            "printf '%s\\n' 'admin123' | sudo -p \"\" -S sh -c 'cat /etc/shadow | grep root'"
+            "printf '%s\\n' 'admin123' | sudo -S sh -c 'cat /etc/shadow | grep root'"
         );
     }
 

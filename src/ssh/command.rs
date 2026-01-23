@@ -54,6 +54,9 @@ impl CommandOutput {
 ///
 /// Creates a wrapper command: `timeout -k {kill_after}s {duration}s sh -lc '{command}'`
 ///
+/// The use of `sh -lc` ensures a login shell is used, which properly loads
+/// environment variables like PATH from ~/.profile or /etc/profile.
+///
 /// # Arguments
 /// * `command` - The command to wrap (should be pre-escaped)
 /// * `duration_secs` - Timeout duration in seconds
@@ -61,11 +64,10 @@ impl CommandOutput {
 /// # Returns
 /// A wrapped command string that includes timeout logic
 pub fn wrap_command_with_timeout(command: &str, duration_secs: u64) -> String {
+    let escaped_command = escape_for_timeout_wrapper(command);
     format!(
         "timeout -k {}s {}s sh -lc '{}'",
-        TIMEOUT_KILL_AFTER_SECS,
-        duration_secs,
-        escape_for_timeout_wrapper(command)
+        TIMEOUT_KILL_AFTER_SECS, duration_secs, escaped_command
     )
 }
 
@@ -500,7 +502,7 @@ mod tests {
     fn test_wrap_command_with_timeout() {
         let cmd = wrap_command_with_timeout("sleep 10", 2);
         assert!(cmd.contains("timeout -k 2s 2s"));
-        assert!(cmd.contains("sh -lc"));
+        assert!(cmd.contains("sh -lc")); // Uses login shell
         assert!(cmd.contains("sleep 10"));
     }
 
@@ -519,5 +521,14 @@ mod tests {
         assert!(cmd.contains("timeout -k 2s 10s"));
         assert!(cmd.contains("sh -lc"));
         assert!(cmd.contains("echo"));
+    }
+
+    #[test]
+    fn test_wrap_command_with_timeout_with_single_quotes() {
+        let cmd = wrap_command_with_timeout("echo 'hello'", 10);
+        assert!(cmd.contains("timeout -k 2s 10s"));
+        assert!(cmd.contains("sh -lc"));
+        // Single quotes are escaped as '"'"'
+        assert!(cmd.contains("'\"'\"'"));
     }
 }

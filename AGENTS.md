@@ -12,6 +12,9 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 ├── Docs/                 # Additional technical documentation
 │   ├── rmcp-sdk.md       # Notes on the MCP SDK integration
 │   └── russh-library.md  # Notes on the underlying SSH library (russh)
+├── tests/                # Integration and functional tests
+│   ├── integration_test.rs # Command formatting and connection logic tests
+│   └── docker_integration_test.rs # Full E2E tests using Docker containers
 └── src/                  # Source code
     ├── main.rs           # Application entry point
     ├── lib.rs            # Library root

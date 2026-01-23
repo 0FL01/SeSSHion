@@ -11,7 +11,7 @@ fn test_timeout_wrapper_formatting() {
     // Test basic command
     let cmd = wrap_command_with_timeout("echo hello", 10);
     assert!(cmd.contains("timeout -k 2s 10s"));
-    assert!(cmd.contains("sh -lc"));
+    assert!(cmd.contains("sh -lc")); // Login shell
     assert!(cmd.contains("echo hello"));
 
     // Test command with special characters

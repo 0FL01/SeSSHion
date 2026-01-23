@@ -272,6 +272,26 @@ impl SshMcpServer {
     }
 }
 
+impl SshMcpServer {
+    /// Internal method exposed for testing - executes a command directly
+    #[doc(hidden)]
+    pub async fn test_execute_command(
+        &self,
+        command: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_command(command).await
+    }
+
+    /// Internal method exposed for testing - executes a sudo command directly
+    #[doc(hidden)]
+    pub async fn test_execute_sudo_command(
+        &self,
+        command: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_sudo_command(command).await
+    }
+}
+
 impl ServerHandler for SshMcpServer {
     /// Return server information
     fn get_info(&self) -> ServerInfo {

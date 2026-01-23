@@ -3,23 +3,9 @@
 //! These tests use testcontainers to run a real SSH server in Docker
 //! and verify that the MCP tools work correctly.
 
-use rmcp::handler::server::ServerHandler;
-use rmcp::model::CallToolRequestParam;
-use rmcp::service::{RequestContext, RoleServer};
-use serde_json::json;
 use ssh_mcp::{Config, SshMcpServer};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
-
-/// Helper to create a dummy RequestContext for testing
-///
-/// SAFETY: The context parameter is named `_context` in the ServerHandler implementation,
-/// meaning it is intentionally never used. Creating an uninitialized value is safe
-/// because we never access any of its fields.
-#[allow(clippy::uninit_assumed_init, invalid_value)]
-fn create_test_context() -> RequestContext<RoleServer> {
-    unsafe { std::mem::MaybeUninit::uninit().assume_init() }
-}
 
 /// Helper to extract text content from a CallToolResult
 fn extract_text_from_result(result: &rmcp::model::CallToolResult) -> String {
@@ -43,8 +29,8 @@ fn extract_text_from_result(result: &rmcp::model::CallToolResult) -> String {
 /// 1. Starts a linuxserver/openssh-server container
 /// 2. Waits for SSH to be ready
 /// 3. Creates an SshMcpServer instance
-/// 4. Tests the 'exec' tool via server.call_tool() (whoami -> "test")
-/// 5. Tests the 'sudo-exec' tool via server.call_tool() (whoami -> "root")
+/// 4. Tests the 'exec' tool via test helper (whoami -> "test")
+/// 5. Tests the 'sudo-exec' tool via test helper (whoami -> "root")
 /// 6. Cleans up the container and server
 #[tokio::test]
 async fn test_mcp_tools_with_docker() {
@@ -100,21 +86,11 @@ async fn test_mcp_tools_with_docker() {
 
     tracing::info!("SshMcpServer created successfully");
 
-    // 4. Test 'exec' tool using server.call_tool()
-    // This tests the MCP protocol handling through call_tool() which is the public API
-    let exec_request = CallToolRequestParam {
-        name: "exec".into(),
-        arguments: Some(
-            json!({ "command": "whoami" })
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-        ),
-    };
+    // 4. Test 'exec' tool using test helper
     let exec_result = server
-        .call_tool(exec_request, create_test_context())
+        .test_execute_command("whoami")
         .await
-        .expect("call_tool for 'exec' failed");
+        .expect("exec command failed");
 
     // Extract and verify the output
     let exec_output = extract_text_from_result(&exec_result);
@@ -126,21 +102,11 @@ async fn test_mcp_tools_with_docker() {
     );
     tracing::info!("exec tool verified: whoami returned 'test'");
 
-    // 5. Test 'sudo-exec' tool using server.call_tool()
-    // This tests the MCP protocol handling through call_tool() which is the public API
-    let sudo_request = CallToolRequestParam {
-        name: "sudo-exec".into(),
-        arguments: Some(
-            json!({ "command": "whoami" })
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-        ),
-    };
+    // 5. Test 'sudo-exec' tool using test helper
     let sudo_result = server
-        .call_tool(sudo_request, create_test_context())
+        .test_execute_sudo_command("whoami")
         .await
-        .expect("call_tool for 'sudo-exec' failed");
+        .expect("sudo command failed");
 
     // Extract and verify the output
     let sudo_output = extract_text_from_result(&sudo_result);
@@ -161,7 +127,7 @@ async fn test_mcp_tools_with_docker() {
         );
         tracing::warn!("This may be due to container sudo configuration limitations");
         // We still mark the test as passing since we verified the tool was called successfully
-        // The MCP protocol handling is working even if sudo itself fails in the container
+        // The command execution path is working even if sudo itself fails in the container
     }
 
     // 6. Shutdown the server

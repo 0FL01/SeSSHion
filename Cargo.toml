@@ -47,3 +47,14 @@ lto = true
 strip = true
 codegen-units = 1
 opt-level = "z"
+
+[lints.clippy]
+# Safety: Catch uninitialized memory assumptions
+uninit_assumed_init = "deny"
+
+# Safety: Catch other unsafe patterns
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# Code quality - set to lower priority so specific lints can override
+all = { level = "warn", priority = -1 }

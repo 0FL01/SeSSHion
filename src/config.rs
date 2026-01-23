@@ -17,7 +17,7 @@ pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
 /// SSH MCP Server CLI Arguments
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ssh-mcp")]
-#[command(author = "tufantunc")]
+#[command(author = "0FL01")]
 #[command(version = "1.4.0")]
 #[command(about = "MCP server exposing SSH control for Linux systems via Model Context Protocol")]
 pub struct Args {

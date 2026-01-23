@@ -1,6 +1,12 @@
 MIT License
 
+Copyright (c) 2025 Tufan Tunç
 Copyright (c) 2025 0FL01
+
+This project is a Rust port of the original TypeScript SSH MCP Server:
+https://github.com/tufantunc/ssh-mcp
+
+Original code by Tufan Tunç, ported and extended by 0FL01.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

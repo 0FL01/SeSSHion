@@ -11,8 +11,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 ├── AGENTS.md             # LLM-oriented project documentation (this file)
 ├── .github/              # CI/CD and GitHub configuration
 │   └── workflows/        # GitHub Actions definitions
-│       ├── ci.yml        # Build, lint (clippy/fmt), and test pipeline
-│       └── release.yml   # Multi-platform rolling release builder
+│       └── main.yml      # Unified CI/CD pipeline (Test, Lint, Build, Release)
 ├── Docs/                 # Additional technical documentation
 │   ├── rmcp-sdk.md       # Notes on the MCP SDK integration
 │   └── russh-library.md  # Notes on the underlying SSH library (russh)

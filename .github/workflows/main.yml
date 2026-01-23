@@ -1,7 +1,9 @@
-name: Release
+name: CI and Release
 
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
 
 env:
@@ -12,10 +14,56 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --all-features --verbose
 
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run cargo check
+        run: cargo check --all-features --verbose
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     strategy:
       matrix:
         include:
@@ -31,47 +79,29 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: ssh-mcp
             asset_name: ssh-mcp-macos-aarch64
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Install dependencies (Ubuntu)
         if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
-
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
-
       - name: Strip binary (Linux/macOS)
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -82,19 +112,14 @@ jobs:
     name: Create Rolling Release
     runs-on: ubuntu-24.04
     needs: build
-
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
       - name: Set SHORT_SHA env
         run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-
       - name: Prepare assets
         run: |
           mkdir -p dist
@@ -103,13 +128,11 @@ jobs:
             cp "${dir}"* "dist/${dirname}"
           done
           chmod +x dist/*
-
       - name: Delete existing rolling release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete rolling --cleanup-tag --yes || true
-
       - name: Create rolling release
         env:
           GH_TOKEN: ${{ github.token }}

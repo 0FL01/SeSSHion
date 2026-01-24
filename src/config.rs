@@ -138,7 +138,9 @@ fn validate_args(args: &Args) -> Result<()> {
     }
 
     // If key is provided, check if file exists
-    if let Some(ref key_path) = args.key && !key_path.exists() {
+    if let Some(ref key_path) = args.key
+        && !key_path.exists()
+    {
         errors.push(format!("SSH key file not found: {}", key_path.display()));
     }
 

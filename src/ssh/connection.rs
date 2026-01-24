@@ -639,4 +639,5 @@ mod tests {
         let result = manager.open_channel().await;
         assert!(result.is_err());
     }
+
 }

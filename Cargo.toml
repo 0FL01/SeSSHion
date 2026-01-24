@@ -1,7 +1,7 @@
 [package]
 name = "ssh-mcp"
 version = "1.4.0"
-edition = "2021"
+edition = "2024"
 authors = ["0FL01"]
 description = "MCP server exposing SSH control for Linux systems via Model Context Protocol"
 license = "MIT"

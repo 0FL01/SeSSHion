@@ -3,13 +3,13 @@
 //! Provides persistent SSH connection handling with automatic reconnection,
 //! concurrent access protection, and optional privilege elevation via `su`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use russh::Channel;
 use russh::client::{self, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
-use russh::Channel;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -639,5 +639,4 @@ mod tests {
         let result = manager.open_channel().await;
         assert!(result.is_err());
     }
-
 }

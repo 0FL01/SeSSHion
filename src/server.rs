@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::{
+    ErrorData as McpError,
     handler::server::ServerHandler,
     model::*,
     service::{RequestContext, RoleServer},
-    ErrorData as McpError,
 };
 use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
-use crate::ssh::{sanitize_command, wrap_sudo_command, SshConfig, SshConnectionManager};
+use crate::ssh::{SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command};
 
 /// SSH MCP Server
 ///

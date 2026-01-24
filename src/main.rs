@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use rmcp::service::ServiceExt;
-use tracing::{error, info, Level};
+use tracing::{Level, error, info};
 use tracing_subscriber::FmtSubscriber;
 
 use ssh_mcp::config::{Args, Config};

@@ -38,14 +38,12 @@ pub fn sanitize_command(command: &str, max_chars: Option<usize>) -> Result<Strin
     }
 
     // Check length limit
-    if let Some(max) = max_chars {
-        if trimmed.len() > max {
-            return Err(SshMcpError::invalid_params(format!(
-                "Command is too long (max {} characters, got {})",
-                max,
-                trimmed.len()
-            )));
-        }
+    if let Some(max) = max_chars && trimmed.len() > max {
+        return Err(SshMcpError::invalid_params(format!(
+            "Command is too long (max {} characters, got {})",
+            max,
+            trimmed.len()
+        )));
     }
 
     Ok(trimmed.to_string())

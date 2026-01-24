@@ -122,10 +122,8 @@ impl SshMcpServer {
         }
 
         // If su elevation is configured and available, ensure we're elevated
-        if self.connection.get_su_password().is_some() {
-            if let Err(e) = self.connection.ensure_elevated().await {
-                debug!("Elevation failed, will run as normal user: {}", e);
-            }
+        if self.connection.get_su_password().is_some() && let Err(e) = self.connection.ensure_elevated().await {
+            debug!("Elevation failed, will run as normal user: {}", e);
         }
 
         // Execute the command

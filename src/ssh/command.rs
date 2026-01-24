@@ -168,10 +168,8 @@ impl SshConnectionManager {
         };
 
         let result = loop {
-            if let Some(deadline_ref) = deadline {
-                if tokio::time::Instant::now() > deadline_ref {
-                    break Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
-                }
+            if let Some(deadline_ref) = deadline && tokio::time::Instant::now() > deadline_ref {
+                break Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
             }
 
             let wait_result =

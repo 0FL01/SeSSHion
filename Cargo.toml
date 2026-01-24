@@ -37,10 +37,12 @@ schemars = "1.2"
 
 # Tracing/Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 [dev-dependencies]
 testcontainers = "0.26"
+tempfile = "3"
 
 [profile.release]
 lto = true

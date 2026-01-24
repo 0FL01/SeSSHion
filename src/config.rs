@@ -62,6 +62,22 @@ pub struct Args {
     /// Disable the sudo-exec tool
     #[arg(long, default_value = "false", env = "SSH_MCP_DISABLE_SUDO")]
     pub disable_sudo: bool,
+
+    /// Logging level: trace, debug, info, warn, error
+    #[arg(long, default_value = "info", env = "SSH_MCP_LOG_LEVEL", value_parser = clap::builder::PossibleValuesParser::new(["trace", "debug", "info", "warn", "error"]))]
+    pub log_level: String,
+
+    /// Log file path (default: stdout only)
+    #[arg(long, env = "SSH_MCP_LOG_FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Log format: text or json
+    #[arg(long, default_value = "text", env = "SSH_MCP_LOG_FORMAT", value_parser = clap::builder::PossibleValuesParser::new(["text", "json"]))]
+    pub log_format: String,
+
+    /// Log rotation strategy: daily, hourly, never
+    #[arg(long, default_value = "daily", env = "SSH_MCP_LOG_ROTATION", value_parser = clap::builder::PossibleValuesParser::new(["daily", "hourly", "never"]))]
+    pub log_rotation: String,
 }
 
 /// Parsed and validated configuration

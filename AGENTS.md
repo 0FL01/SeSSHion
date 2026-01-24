@@ -24,6 +24,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
     ├── server.rs         # MCP protocol server implementation
     ├── config.rs         # Configuration and CLI argument parsing
     ├── error.rs          # Centralized error handling
+    ├── logging.rs        # Logging configuration and initialization
     ├── ssh/              # SSH core logic
     │   ├── mod.rs        # SSH module definition
     │   ├── connection.rs # SSH session and connection management
@@ -34,4 +35,46 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
     │   └── config.rs     # SSH-specific configuration structures
     └── tools/            # MCP tool definitions
         └── mod.rs        # Tool registration and dispatch
+```
+
+## Architecture
+
+### Logging Module (`src/logging.rs`)
+
+Provides enterprise-grade logging configuration:
+- **File logging**: Rolling file appender with daily/hourly rotation
+- **JSON format**: Structured logs for log aggregation (ELK, Splunk)
+- **Dual output**: Text to stderr for development, JSON to file for production
+- **Tracing integration**: Uses `tracing` crate for structured logging
+
+**Key functions:**
+- `init_logging(args: &Args) -> Result<Option<WorkerGuard>>` - Initialize logging
+
+**Usage:**
+```rust
+let _guard = init_logging(&args)?;
+// _guard must be kept in scope to flush logs on shutdown
+```
+
+**Environment Variables:**
+- `SSH_MCP_LOG_LEVEL`: trace/debug/info/warn/error
+- `SSH_MCP_LOG_FILE`: Path to log file
+- `SSH_MCP_LOG_FORMAT`: text/json
+- `SSH_MCP_LOG_ROTATION`: daily/hourly/never
+
+**Tracing Usage Patterns:**
+```rust
+use tracing::{info, error, debug, instrument};
+
+#[instrument(skip(conn))]
+async fn execute_command(conn: &mut Connection, cmd: &str) -> Result<()> {
+    debug!("Executing command: {}", cmd);
+    // ... implementation ...
+    info!("Command completed");
+    Ok(())
+}
+
+error!("Failed to connect: {}", err);
+```
+
 ```

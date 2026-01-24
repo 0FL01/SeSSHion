@@ -6,24 +6,20 @@
 
 use clap::Parser;
 use rmcp::service::ServiceExt;
-use tracing::{Level, error, info};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info};
 
 use ssh_mcp::config::{Args, Config};
 use ssh_mcp::error::Result;
+use ssh_mcp::logging::init_logging;
 use ssh_mcp::server::SshMcpServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing/logging to stderr (stdout is for MCP JSON-RPC)
-    FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-
     // Parse CLI arguments
     let args = Args::parse();
+
+    // Initialize logging (JSON to file if specified, text to stderr)
+    let _guard = init_logging(&args)?;
 
     // Validate and create config
     let config = Config::from_args(args)?;

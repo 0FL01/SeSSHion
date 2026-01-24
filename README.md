@@ -105,6 +105,67 @@ The server is configured via CLI arguments or environment variables.
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 60000) |
 | `--maxChars` | `SSH_MCP_MAX_CHARS` | Output limit (default: 1000, "none" to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo-exec` tool |
+| `--log-level` | `SSH_MCP_LOG_LEVEL` | Log level: trace, debug, info, warn, error (default: info) |
+| `--log-file` | `SSH_MCP_LOG_FILE` | Path to log file (writes JSON format) |
+| `--log-format` | `SSH_MCP_LOG_FORMAT` | Log file format: text, json (default: text) |
+| `--log-rotation` | `SSH_MCP_LOG_ROTATION` | Log rotation: daily, hourly, never (default: daily) |
+
+## 💡 Usage Examples
+
+### Basic Usage (stderr logging)
+```bash
+./ssh-mcp --host=192.168.1.10 --user=admin --password=secret
+```
+
+### Debug Logging
+```bash
+./ssh-mcp --host=192.168.1.10 --user=admin --log-level=debug
+```
+
+### File Logging (JSON format)
+```bash
+./ssh-mcp \
+  --host=prod-server \
+  --user=admin \
+  --log-file=/var/log/ssh-mcp/app.log \
+  --log-format=json \
+  --log-rotation=daily
+```
+
+### Environment Variables
+```bash
+export SSH_MCP_HOST=prod-server
+export SSH_MCP_USER=admin
+export SSH_MCP_LOG_LEVEL=warn
+export SSH_MCP_LOG_FILE=/var/log/ssh-mcp/app.log
+export SSH_MCP_LOG_FORMAT=json
+
+./ssh-mcp --password=secret
+```
+
+### With SSH Key
+```bash
+./ssh-mcp \
+  --host=192.168.1.10 \
+  --user=agent \
+  --key=/home/agent/.ssh/id_rsa \
+  --log-level=debug
+```
+
+## 📝 JSON Log Format
+
+When `--log-file` is specified with `--log-format=json`, logs are written in structured JSON format:
+
+```json
+{"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v1.4.0 starting...","target":"ssh_mcp"}
+{"timestamp":"2024-01-24T10:15:23.458Z","level":"INFO","message":"Connecting to admin@prod-server:22","target":"ssh_mcp"}
+{"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 60000ms","target":"ssh_mcp::command"}
+```
+
+Use `jq` for pretty printing:
+```bash
+tail -f /var/log/ssh-mcp/app.log | jq
+```
 
 ## 🚀 Adding to MCP Clients
 

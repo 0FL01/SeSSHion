@@ -73,11 +73,7 @@ async fn test_logging_file_integration() {
     drop(_guard);
 
     // Verify log file was created
-    assert!(
-        log_file.exists(),
-        "Log file not found at {:?}",
-        log_file
-    );
+    assert!(log_file.exists(), "Log file not found at {:?}", log_file);
 
     // Verify log file contains JSON
     let contents = std::fs::read_to_string(&log_file).unwrap();

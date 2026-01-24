@@ -184,7 +184,10 @@ Add this to your `claude_desktop_config.json`:
         "--user=agent-nc",
         "--key=/path/to/private/key",
         "--timeout=30000",
-        "--maxChars=1000"
+        "--maxChars=1000",
+        "--log-file=logs/ssh-mcp.log",
+        "--log-format=json",
+        "--log-rotation=daily"
       ]
     }
   }

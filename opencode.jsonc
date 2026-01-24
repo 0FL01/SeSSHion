@@ -9,9 +9,12 @@
         "--port=2222",
         "--user=test",
         "--password=secret",
-        "--timeout=60000"
+        "--timeout=60000",
+        "--log-file=logs/ssh-mcp.log",
+        "--log-format=json",
+        "--log-rotation=daily"
       ],
-      "enabled": false
+      "enabled": true
     }
   }
 }

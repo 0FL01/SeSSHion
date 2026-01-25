@@ -3,6 +3,9 @@
   "mcp": {
     "ssh-test-env": {
       "type": "local",
+      // NOTE: With --log-rotation=daily/hourly, the actual log file name is suffixed,
+      // e.g. logs/ssh-mcp.log.YYYY-MM-DD (daily) or logs/ssh-mcp.log.YYYY-MM-DD-HH (hourly).
+      // If you want to write exactly to logs/ssh-mcp.log, use --log-rotation=never.
       "command": [
         "./target/release/ssh-mcp",
         "--host=127.0.0.1",
@@ -18,4 +21,3 @@
     }
   }
 }
-

@@ -106,7 +106,7 @@ The server is configured via CLI arguments or environment variables.
 | `--maxChars` | `SSH_MCP_MAX_CHARS` | Output limit (default: 1000, "none" to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo-exec` tool |
 | `--log-level` | `SSH_MCP_LOG_LEVEL` | Log level: trace, debug, info, warn, error (default: info) |
-| `--log-file` | `SSH_MCP_LOG_FILE` | Path to log file (writes JSON format) |
+| `--log-file` | `SSH_MCP_LOG_FILE` | Log file path (base name; daily/hourly adds date suffix) |
 | `--log-format` | `SSH_MCP_LOG_FORMAT` | Log file format: text, json (default: text) |
 | `--log-rotation` | `SSH_MCP_LOG_ROTATION` | Log rotation: daily, hourly, never (default: daily) |
 
@@ -131,6 +131,9 @@ The server is configured via CLI arguments or environment variables.
   --log-format=json \
   --log-rotation=daily
 ```
+
+Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
+Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
 
 ### Environment Variables
 ```bash
@@ -164,7 +167,11 @@ When `--log-file` is specified with `--log-format=json`, logs are written in str
 
 Use `jq` for pretty printing:
 ```bash
-tail -f /var/log/ssh-mcp/app.log | jq
+# Daily rotation writes to a date-suffixed filename
+tail -f "/var/log/ssh-mcp/app.log.$(date +%Y-%m-%d)" | jq
+
+# Or disable rotation for a stable filename
+# tail -f /var/log/ssh-mcp/app.log | jq
 ```
 
 ## 🚀 Adding to MCP Clients
@@ -193,6 +200,8 @@ Add this to your `claude_desktop_config.json`:
   }
 }
 ```
+
+With `--log-rotation=daily`, the file will be created as `logs/ssh-mcp.log.YYYY-MM-DD`.
 
 ## 🛠 Tools
 

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tracing::info;
 use tracing_appender::{non_blocking, non_blocking::WorkerGuard, rolling};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Args;
 use crate::error::{Result, SshMcpError};

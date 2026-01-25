@@ -88,41 +88,6 @@ pub fn init_logging(args: &Args) -> Result<Option<WorkerGuard>> {
     Ok(guard)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_setup_file_logging_creates_dirs() {
-        let temp_dir = TempDir::new().unwrap();
-        let log_file = temp_dir.path().join("a").join("b").join("test.log");
-
-        let result = setup_file_logging(&log_file, "never");
-        assert!(result.is_ok());
-
-        assert!(log_file.parent().unwrap().exists());
-        assert!(log_file.exists());
-    }
-
-    #[test]
-    fn test_setup_file_logging_append_mode() {
-        let temp_dir = TempDir::new().unwrap();
-        let log_file = temp_dir.path().join("test.log");
-
-        // Create file with some content
-        std::fs::write(&log_file, "initial content\n").unwrap();
-
-        {
-            let (_writer, _guard) = setup_file_logging(&log_file, "never").unwrap();
-            // Writer is non-blocking, but we just want to check if it truncated
-        }
-
-        let contents = std::fs::read_to_string(&log_file).unwrap();
-        assert_eq!(contents, "initial content\n");
-    }
-}
-
 /// Set up file logging with rotation configuration.
 ///
 /// Returns a tuple of (non_blocking_writer, worker_guard) where:
@@ -178,5 +143,40 @@ fn setup_file_logging(
             let appender = rolling::daily(&log_dir, log_name);
             Ok(non_blocking(appender))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_setup_file_logging_creates_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_file = temp_dir.path().join("a").join("b").join("test.log");
+
+        let result = setup_file_logging(&log_file, "never");
+        assert!(result.is_ok());
+
+        assert!(log_file.parent().unwrap().exists());
+        assert!(log_file.exists());
+    }
+
+    #[test]
+    fn test_setup_file_logging_append_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_file = temp_dir.path().join("test.log");
+
+        // Create file with some content
+        std::fs::write(&log_file, "initial content\n").unwrap();
+
+        {
+            let (_writer, _guard) = setup_file_logging(&log_file, "never").unwrap();
+            // Writer is non-blocking, but we just want to check if it truncated
+        }
+
+        let contents = std::fs::read_to_string(&log_file).unwrap();
+        assert_eq!(contents, "initial content\n");
     }
 }

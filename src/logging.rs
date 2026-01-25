@@ -4,10 +4,12 @@
 //! It supports multiple log levels, file logging with rotation, and different
 //! output formats (text or JSON).
 
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 
+use tracing::info;
 use tracing_appender::{non_blocking, non_blocking::WorkerGuard, rolling};
-use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 use crate::config::Args;
 use crate::error::{Result, SshMcpError};
@@ -65,7 +67,60 @@ pub fn init_logging(args: &Args) -> Result<Option<WorkerGuard>> {
         }
     }
 
+    // Emit startup log message explaining configuration and file naming
+    if let Some(log_file) = &args.log_file {
+        let rotation_note = match args.log_rotation.as_str() {
+            "daily" => format!(" (actual file: {}.YYYY-MM-DD)", log_file.display()),
+            "hourly" => format!(" (actual file: {}.YYYY-MM-DD-HH)", log_file.display()),
+            _ => "".to_string(),
+        };
+        info!(
+            "Logging initialized: file={}, format={}, rotation={}{}",
+            log_file.display(),
+            args.log_format,
+            args.log_rotation,
+            rotation_note
+        );
+    } else {
+        info!("Logging initialized: stderr only, level={}", args.log_level);
+    }
+
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_setup_file_logging_creates_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_file = temp_dir.path().join("a").join("b").join("test.log");
+
+        let result = setup_file_logging(&log_file, "never");
+        assert!(result.is_ok());
+
+        assert!(log_file.parent().unwrap().exists());
+        assert!(log_file.exists());
+    }
+
+    #[test]
+    fn test_setup_file_logging_append_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_file = temp_dir.path().join("test.log");
+
+        // Create file with some content
+        std::fs::write(&log_file, "initial content\n").unwrap();
+
+        {
+            let (_writer, _guard) = setup_file_logging(&log_file, "never").unwrap();
+            // Writer is non-blocking, but we just want to check if it truncated
+        }
+
+        let contents = std::fs::read_to_string(&log_file).unwrap();
+        assert_eq!(contents, "initial content\n");
+    }
 }
 
 /// Set up file logging with rotation configuration.
@@ -80,6 +135,17 @@ fn setup_file_logging(
     // Determine directory and file name for rolling logs
     let log_dir = log_file.parent().unwrap_or(Path::new(".")).to_path_buf();
 
+    // Ensure parent directory exists for file logging
+    if !log_dir.as_os_str().is_empty() && !log_dir.exists() {
+        fs::create_dir_all(&log_dir).map_err(|e| {
+            SshMcpError::Config(format!(
+                "Failed to create log directory {}: {}",
+                log_dir.display(),
+                e
+            ))
+        })?;
+    }
+
     let log_name = log_file
         .file_name()
         .ok_or_else(|| SshMcpError::Config("Log file path has no file name".to_string()))?
@@ -93,7 +159,18 @@ fn setup_file_logging(
             Ok(non_blocking(appender))
         }
         "never" => {
-            let file = std::fs::File::create(log_file)?;
+            // Use OpenOptions with append(true) to avoid truncation and ensure file creation
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)
+                .map_err(|e| {
+                    SshMcpError::Config(format!(
+                        "Failed to open log file {}: {}",
+                        log_file.display(),
+                        e
+                    ))
+                })?;
             Ok(non_blocking(file))
         }
         _ => {

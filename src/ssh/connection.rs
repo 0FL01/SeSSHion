@@ -10,7 +10,7 @@ use std::time::Duration;
 use russh::Channel;
 use russh::client::{self, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +19,9 @@ use super::handler::SshHandler;
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
 use russh::ChannelMsg;
+
+/// Default capacity for the channel semaphore (max concurrent commands)
+pub const CHANNEL_SEMAPHORE_CAPACITY: usize = 8;
 
 /// SSH Connection Manager
 ///
@@ -37,15 +40,23 @@ pub struct SshConnectionManager {
     /// Flag to prevent concurrent connection attempts
     is_connecting: AtomicBool,
 
+    /// Notification for waiters when connection attempt completes
+    connect_notify: Arc<Notify>,
+
     /// Elevated shell channel (when using su)
     /// Made pub(crate) to allow access from command.rs
     pub(crate) su_channel: Arc<Mutex<Option<Channel<client::Msg>>>>,
 
     /// Flag indicating whether we're running as root via su
-    is_elevated: AtomicBool,
+    /// Made pub(crate) to allow access from command.rs for su state reset
+    pub(crate) is_elevated: AtomicBool,
 
     /// Cached availability of the `timeout` command on the remote system
     has_timeout_cmd: AtomicBool,
+
+    /// Semaphore to limit concurrent command execution
+    /// Made pub(crate) to allow access from command.rs
+    pub(crate) channel_semaphore: Arc<Semaphore>,
 }
 
 impl SshConnectionManager {
@@ -58,9 +69,11 @@ impl SshConnectionManager {
             config,
             session: Arc::new(Mutex::new(None)),
             is_connecting: AtomicBool::new(false),
+            connect_notify: Arc::new(Notify::new()),
             su_channel: Arc::new(Mutex::new(None)),
             is_elevated: AtomicBool::new(false),
             has_timeout_cmd: AtomicBool::new(false),
+            channel_semaphore: Arc::new(Semaphore::new(CHANNEL_SEMAPHORE_CAPACITY)),
         }
     }
 
@@ -82,13 +95,8 @@ impl SshConnectionManager {
             .is_err()
         {
             debug!("Another connection attempt in progress, waiting...");
-            // Wait for the other connection attempt
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if !self.is_connecting.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
+            // Wait for the other connection attempt to complete using Notify
+            self.connect_notify.notified().await;
             return if self.is_connected().await {
                 Ok(())
             } else {
@@ -99,8 +107,9 @@ impl SshConnectionManager {
         // Perform connection with timeout
         let result = self.do_connect().await;
 
-        // Reset connecting flag
+        // Reset connecting flag and notify all waiters
         self.is_connecting.store(false, Ordering::SeqCst);
+        self.connect_notify.notify_waiters();
 
         result
     }
@@ -595,6 +604,47 @@ impl SshConnectionManager {
         }
 
         info!("SSH connection closed");
+    }
+
+    /// Invalidate the current session and clear elevation state
+    ///
+    /// This clears the session handle, su_channel, and resets elevation state.
+    /// Used when a connection is detected as broken and needs reconnection.
+    pub async fn invalidate_session(&self, reason: &str) {
+        warn!("Invalidating SSH session: {}", reason);
+
+        // Take channel out of mutex before awaiting to avoid deadlock
+        let channel = {
+            let mut channel_guard = self.su_channel.lock().await;
+            channel_guard.take()
+        };
+
+        // Drop lock before awaiting EOF
+        if let Some(ch) = channel {
+            let _ = ch.eof().await;
+        }
+        self.is_elevated.store(false, Ordering::SeqCst);
+
+        // Clear main session without graceful disconnect (it's already broken)
+        {
+            let mut session_guard = self.session.lock().await;
+            if session_guard.is_some() {
+                session_guard.take();
+            }
+        }
+
+        debug!("Session invalidated: {}", reason);
+    }
+
+    /// Force a reconnection by invalidating the current session and reconnecting
+    ///
+    /// This is used when the connection is known to be broken and a fresh
+    /// connection is required. It clears all session state and performs
+    /// a new connection attempt.
+    pub async fn reconnect(&self) -> Result<()> {
+        self.invalidate_session("explicit reconnect requested")
+            .await;
+        self.connect().await
     }
 }
 

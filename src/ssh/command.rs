@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use russh::ChannelMsg;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
@@ -71,6 +72,29 @@ pub fn wrap_command_with_timeout(command: &str, duration_secs: u64) -> String {
     )
 }
 
+/// Errors that can occur before exec is successfully sent.
+/// These errors are retryable since the command has not started executing yet.
+enum PreExecError {
+    ChannelOpen(String),
+    ExecSend(String),
+}
+
+impl PreExecError {
+    /// Convert the pre-exec error into an SSH connection error.
+    fn into_ssh_error(self) -> SshMcpError {
+        match self {
+            PreExecError::ChannelOpen(msg) => SshMcpError::connection(msg),
+            PreExecError::ExecSend(msg) => SshMcpError::connection(msg),
+        }
+    }
+}
+
+/// Errors that can occur when sending command to su shell channel.
+/// These errors are retryable since the command has not started executing yet.
+enum SuSendError {
+    SendFailed(String),
+}
+
 impl SshConnectionManager {
     /// Execute a command over SSH
     ///
@@ -94,6 +118,16 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
+        // Acquire semaphore permit to limit concurrent command execution
+        let _permit: OwnedSemaphorePermit = self
+            .channel_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                SshMcpError::connection(format!("Failed to acquire command slot: {}", e))
+            })?;
+
         // Ensure we're connected
         self.ensure_connected().await?;
 
@@ -109,6 +143,10 @@ impl SshConnectionManager {
     }
 
     /// Execute command via the elevated su shell (PTY)
+    ///
+    /// Implements deterministic one-shot retry for pre-send failures:
+    /// - If sending command to su channel fails: reset su state, re-elevate, retry once
+    /// - If failure occurs after command is sent: no retry, reset su state and invalidate session
     async fn exec_via_su_shell(
         &self,
         command: &str,
@@ -121,14 +159,6 @@ impl SshConnectionManager {
                 "duration must be > 0".to_string(),
             ));
         }
-
-        // Take the channel from the mutex (we'll put it back after)
-        let mut channel = {
-            let mut guard = self.su_channel.lock().await;
-            guard
-                .take()
-                .ok_or_else(|| SshMcpError::connection("No su channel available"))?
-        };
 
         // Check timeout availability lazily on first use (same as exec_via_channel)
         let use_wrapper = if self.use_timeout_wrapper() {
@@ -147,18 +177,158 @@ impl SshConnectionManager {
 
         debug!("Executing elevated command: {}", wrapped_cmd);
 
-        // Send command
-        if let Err(e) = channel.data(format!("{}\n", wrapped_cmd).as_bytes()).await {
-            // Put channel back before returning error
+        // Attempt #1: try to send command via existing su channel
+        let mut channel = match self.try_take_su_channel().await {
+            Some(ch) => ch,
+            None => {
+                // No channel available - try to elevate and retry once
+                warn!("No su channel available, attempting elevation");
+                self.reset_su_state().await;
+                self.ensure_elevated().await?;
+                match self.try_take_su_channel().await {
+                    Some(ch) => ch,
+                    None => {
+                        return Err(SshMcpError::connection(
+                            "No su channel available after elevation",
+                        ));
+                    }
+                }
+            }
+        };
+
+        // Try to send the command
+        match self
+            .try_send_to_su_channel(&mut channel, &wrapped_cmd)
+            .await
+        {
+            Ok(()) => {
+                // Command sent successfully - collect output
+                let result = self
+                    .collect_su_output(&mut channel, timeout_duration, use_wrapper)
+                    .await;
+
+                // Put the channel back (even if collection failed)
+                {
+                    let mut guard = self.su_channel.lock().await;
+                    *guard = Some(channel);
+                }
+
+                // Handle post-send failure: reset su state and invalidate session, no retry
+                if let Err(ref e) = result {
+                    warn!("su channel failed after command sent: {}", e);
+                    self.reset_su_state().await;
+                    self.invalidate_session("su channel failed after send")
+                        .await;
+                }
+
+                result
+            }
+            Err(SuSendError::SendFailed(e)) => {
+                // Pre-send failure: command was NOT sent
+                // Drop the bad channel (don't put it back)
+                drop(channel);
+
+                // Reset su state and re-elevate once
+                warn!(
+                    "su channel send failed (pre-send), resetting and re-elevating: {}",
+                    e
+                );
+                self.reset_su_state().await;
+                self.ensure_elevated().await?;
+
+                // Attempt #2: take new channel and send
+                let mut channel = match self.try_take_su_channel().await {
+                    Some(ch) => ch,
+                    None => {
+                        return Err(SshMcpError::connection(
+                            "No su channel available after re-elevation",
+                        ));
+                    }
+                };
+
+                // Try to send again - if this fails, no more retries
+                if let Err(SuSendError::SendFailed(e2)) = self
+                    .try_send_to_su_channel(&mut channel, &wrapped_cmd)
+                    .await
+                {
+                    // Second failure - drop channel, reset state, return error
+                    drop(channel);
+                    self.reset_su_state().await;
+                    return Err(SshMcpError::connection(format!(
+                        "Failed to send command to su channel after retry: {}",
+                        e2
+                    )));
+                }
+
+                // Second attempt succeeded - collect output
+                let result = self
+                    .collect_su_output(&mut channel, timeout_duration, use_wrapper)
+                    .await;
+
+                // Put the channel back
+                {
+                    let mut guard = self.su_channel.lock().await;
+                    *guard = Some(channel);
+                }
+
+                // Handle post-send failure: reset su state and invalidate session, no retry
+                if let Err(ref e) = result {
+                    warn!("su channel failed after command sent (retry): {}", e);
+                    self.reset_su_state().await;
+                    self.invalidate_session("su channel failed after send (retry)")
+                        .await;
+                }
+
+                result
+            }
+        }
+    }
+
+    /// Try to take the su channel from the mutex
+    async fn try_take_su_channel(&self) -> Option<russh::Channel<russh::client::Msg>> {
+        let mut guard = self.su_channel.lock().await;
+        guard.take()
+    }
+
+    /// Reset su state (clear channel and elevation flag)
+    async fn reset_su_state(&self) {
+        // Take channel out of mutex before awaiting to avoid deadlock
+        let channel = {
             let mut guard = self.su_channel.lock().await;
-            *guard = Some(channel);
-            return Err(SshMcpError::connection(format!(
-                "Failed to send command: {}",
-                e
-            )));
+            guard.take()
+        };
+
+        // Drop lock before awaiting EOF
+        if let Some(ch) = channel {
+            // Try to close gracefully, but don't wait
+            let _ = ch.eof().await;
         }
 
-        // Collect output until we see a root prompt (#)
+        use std::sync::atomic::Ordering;
+        self.is_elevated.store(false, Ordering::SeqCst);
+        debug!("su state reset: channel cleared, is_elevated=false");
+    }
+
+    /// Try to send command to su channel
+    /// Returns Ok(()) if sent successfully, Err(SuSendError) if send failed
+    async fn try_send_to_su_channel(
+        &self,
+        channel: &mut russh::Channel<russh::client::Msg>,
+        command: &str,
+    ) -> std::result::Result<(), SuSendError> {
+        channel
+            .data(format!("{}\n", command).as_bytes())
+            .await
+            .map_err(|e| SuSendError::SendFailed(e.to_string()))
+    }
+
+    /// Collect output from su channel until root prompt or error
+    async fn collect_su_output(
+        &self,
+        channel: &mut russh::Channel<russh::client::Msg>,
+        timeout_duration: Duration,
+        use_wrapper: bool,
+    ) -> Result<CommandOutput> {
         let mut buffer = String::new();
         // When using wrapper, timeout is handled remotely - no local deadline needed
         let deadline = if use_wrapper {
@@ -167,11 +337,11 @@ impl SshConnectionManager {
             Some(tokio::time::Instant::now() + timeout_duration)
         };
 
-        let result = loop {
+        loop {
             if let Some(deadline_ref) = deadline
                 && tokio::time::Instant::now() > deadline_ref
             {
-                break Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
+                return Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
             }
 
             let wait_result =
@@ -196,7 +366,7 @@ impl SshConnectionManager {
                                     String::new()
                                 };
 
-                                break Ok(CommandOutput {
+                                return Ok(CommandOutput {
                                     stdout: if output.is_empty() {
                                         output
                                     } else {
@@ -208,7 +378,7 @@ impl SshConnectionManager {
                             }
                         }
                         ChannelMsg::Close => {
-                            break Err(SshMcpError::connection(
+                            return Err(SshMcpError::connection(
                                 "Channel closed during command execution",
                             ));
                         }
@@ -218,7 +388,7 @@ impl SshConnectionManager {
                     }
                 }
                 Ok(None) => {
-                    break Err(SshMcpError::connection(
+                    return Err(SshMcpError::connection(
                         "Channel ended during command execution",
                     ));
                 }
@@ -227,18 +397,17 @@ impl SshConnectionManager {
                     continue;
                 }
             }
-        };
-
-        // Put the channel back
-        {
-            let mut guard = self.su_channel.lock().await;
-            *guard = Some(channel);
         }
-
-        result
     }
 
     /// Execute command via a new exec channel
+    ///
+    /// Implements deterministic one-shot retry for pre-exec failures:
+    /// - Channel open failure: reconnect and retry once
+    /// - channel.exec() send failure: reconnect and retry once
+    /// - Failures after exec starts (output collection, Close/Eof): no retry,
+    ///   just invalidate session so next command reconnects
+    /// - Timeout errors: no retry (command may have partially run)
     async fn exec_via_channel(
         &self,
         command: &str,
@@ -251,8 +420,6 @@ impl SshConnectionManager {
                 "duration must be > 0".to_string(),
             ));
         }
-
-        let channel = self.open_channel().await?;
 
         // Wrap command with timeout if available
         // Check timeout availability lazily on first use
@@ -272,16 +439,41 @@ impl SshConnectionManager {
             command.to_string()
         };
 
-        debug!("Executing command: {}", wrapped_cmd);
-        channel
-            .exec(true, wrapped_cmd.as_str())
-            .await
-            .map_err(|e| SshMcpError::connection(format!("Failed to exec command: {}", e)))?;
+        // Attempt #1: open channel and exec
+        let (channel, _exec_sent) = match self.try_open_and_exec(&wrapped_cmd).await {
+            Ok(result) => result,
+            Err(PreExecError::ChannelOpen(e)) => {
+                // Channel open failed - reconnect and retry once (Attempt #2)
+                warn!("Channel open failed, attempting reconnect and retry: {}", e);
+                self.reconnect().await?;
+                match self.try_open_and_exec(&wrapped_cmd).await {
+                    Ok(result) => result,
+                    Err(retry_err) => {
+                        // Return the retry error (second failure is the one we report)
+                        return Err(retry_err.into_ssh_error());
+                    }
+                }
+            }
+            Err(PreExecError::ExecSend(e)) => {
+                // Exec send failed - reconnect and retry once (Attempt #2)
+                warn!("Exec send failed, attempting reconnect and retry: {}", e);
+                self.reconnect().await?;
+                match self.try_open_and_exec(&wrapped_cmd).await {
+                    Ok(result) => result,
+                    Err(retry_err) => {
+                        // Return the retry error (second failure is the one we report)
+                        return Err(retry_err.into_ssh_error());
+                    }
+                }
+            }
+        };
 
-        // Collect output with appropriate timeout strategy
-        let output = if use_wrapper {
+        // At this point, exec has been sent successfully.
+        // Collect output with appropriate timeout strategy.
+        // Failures here do NOT trigger retry - we just invalidate the session.
+        let output_result = if use_wrapper {
             // When using wrapper, timeout is handled remotely - no tokio timeout needed
-            self.collect_channel_output(channel).await?
+            self.collect_channel_output(channel).await
         } else {
             // Fall back: use tokio timeout + pkill for abort
             let result = timeout(timeout_duration, self.collect_channel_output(channel)).await;
@@ -297,7 +489,19 @@ impl SshConnectionManager {
                     self.abort_command(command).await;
                     return Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
                 }
-            }?
+            }
+        };
+
+        let output = match output_result {
+            Ok(out) => out,
+            Err(e) => {
+                // Failure after exec started - invalidate session, no retry
+                // Do not retry: command may have partially executed
+                if !matches!(e, SshMcpError::Timeout(_)) {
+                    self.invalidate_session("channel failed after exec").await;
+                }
+                return Err(e);
+            }
         };
 
         // Check if timeout command failed (e.g., not found) when using wrapper
@@ -314,10 +518,22 @@ impl SshConnectionManager {
                 self.disable_timeout_wrapper();
 
                 // Execute the command again using fallback method (tokio timeout + pkill)
-                let channel = self.open_channel().await?;
-                channel.exec(true, command).await.map_err(|e| {
-                    SshMcpError::connection(format!("Failed to exec command: {}", e))
-                })?;
+                // Note: This is a feature fallback, not a connection retry
+                let (channel, _) = match self.try_open_and_exec(command).await {
+                    Ok(result) => result,
+                    Err(PreExecError::ChannelOpen(e)) => {
+                        return Err(SshMcpError::connection(format!(
+                            "Failed to open channel (fallback): {}",
+                            e
+                        )));
+                    }
+                    Err(PreExecError::ExecSend(e)) => {
+                        return Err(SshMcpError::connection(format!(
+                            "Failed to exec command (fallback): {}",
+                            e
+                        )));
+                    }
+                };
 
                 let result = timeout(timeout_duration, self.collect_channel_output(channel)).await;
 
@@ -343,6 +559,28 @@ impl SshConnectionManager {
         }
 
         Ok(output)
+    }
+
+    /// Try to open a channel and send exec command
+    ///
+    /// Returns the channel and a boolean indicating exec was sent successfully.
+    /// Separates pre-exec failures (which can be retried) from post-exec state.
+    async fn try_open_and_exec(
+        &self,
+        command: &str,
+    ) -> std::result::Result<(russh::Channel<russh::client::Msg>, bool), PreExecError> {
+        let channel = self
+            .open_channel()
+            .await
+            .map_err(|e| PreExecError::ChannelOpen(e.to_string()))?;
+
+        debug!("Executing command: {}", command);
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| PreExecError::ExecSend(format!("Failed to exec command: {}", e)))?;
+
+        Ok((channel, true))
     }
 
     /// Collect output from a channel until it closes

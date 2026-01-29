@@ -6,6 +6,19 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Тип релиза'
+        required: true
+        default: 'rolling'
+        type: choice
+        options:
+          - rolling
+          - stable
+      version:
+        description: 'Версия для stable релиза (например: 1.2.3). Игнорируется для rolling.'
+        required: false
+        type: string
   schedule:
     - cron: '0 0 * * *'
 
@@ -111,11 +124,11 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
-  release:
-    name: Create Rolling Release
+  release-rolling:
+    name: Create Rolling Release (Pre-release)
     runs-on: ubuntu-24.04
     needs: build
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'rolling')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -143,5 +156,79 @@ jobs:
           gh release create rolling \
             --target ${{ github.sha }} \
             --title "Rolling Release (${{ env.SHORT_SHA }})" \
-            --notes "Latest rolling build from commit ${{ env.SHORT_SHA }}. Built from branch \`main\`." \
+            --notes "Latest rolling build from commit ${{ env.SHORT_SHA }}. Built from branch \`main\`.
+
+          ⚠️ WARNING: This is a pre-release build and may not be stable. Use at your own risk." \
+            --prerelease \
+            dist/*
+
+  release-stable:
+    name: Create Stable Release
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'stable'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Validate version input
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ -z "$VERSION" ]; then
+            echo "Error: version input is required for stable releases"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: version must be in semver format (e.g., 1.2.3)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+      - name: Prepare assets
+        run: |
+          mkdir -p dist
+          for dir in artifacts/*/; do
+            dirname=$(basename "$dir")
+            cp "${dir}"* "dist/${dirname}"
+          done
+          chmod +x dist/*
+      - name: Check if tag exists
+        id: check_tag
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Create git tag
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+      - name: Check if release exists
+        id: check_release
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create stable release
+        if: steps.check_release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ env.VERSION }}
+        run: |
+          gh release create "v${VERSION}" \
+            --title "Release v${VERSION}" \
+            --notes "Stable release v${VERSION}. This is a production-ready build." \
+            --latest \
             dist/*

@@ -139,8 +139,10 @@ impl SshConnectionManager {
 
         let connection_timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
 
-        // Create russh config with defaults
-        let ssh_config = client::Config::default();
+        // Create russh config with keepalive to mimic human behavior
+        let mut ssh_config = client::Config::default();
+        ssh_config.keepalive_interval = Some(Duration::from_secs(self.config.keepalive_interval));
+        ssh_config.keepalive_max = self.config.keepalive_max as usize;
         let ssh_config = Arc::new(ssh_config);
 
         // Connect with timeout

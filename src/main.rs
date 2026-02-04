@@ -36,6 +36,10 @@ async fn main() -> Result<()> {
             .max_chars
             .map_or("unlimited".to_string(), |n| n.to_string())
     );
+    info!(
+        "Keepalive: interval={}s, max_failures={}",
+        config.keepalive_interval, config.keepalive_max
+    );
 
     if config.disable_sudo {
         info!("sudo-exec tool is disabled");

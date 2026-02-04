@@ -78,6 +78,16 @@ pub struct Args {
     /// Log rotation strategy: daily, hourly, never
     #[arg(long, default_value = "daily", env = "SSH_MCP_LOG_ROTATION", value_parser = clap::builder::PossibleValuesParser::new(["daily", "hourly", "never"]))]
     pub log_rotation: String,
+
+    /// Keepalive interval in seconds (default: 30)
+    /// Sends keepalive packets to maintain connection like a human user
+    #[arg(long, default_value = "30", env = "SSH_MCP_KEEPALIVE_INTERVAL")]
+    pub keepalive_interval: u64,
+
+    /// Maximum keepalive failures before disconnecting (default: 3)
+    /// Total idle timeout = keepalive_interval * keepalive_max
+    #[arg(long, default_value = "3", env = "SSH_MCP_KEEPALIVE_MAX")]
+    pub keepalive_max: u64,
 }
 
 /// Parsed and validated configuration
@@ -112,6 +122,12 @@ pub struct Config {
 
     /// Whether sudo-exec tool is disabled
     pub disable_sudo: bool,
+
+    /// Keepalive interval in seconds
+    pub keepalive_interval: u64,
+
+    /// Maximum keepalive failures before disconnecting
+    pub keepalive_max: u64,
 }
 
 impl Config {
@@ -132,6 +148,8 @@ impl Config {
             timeout_ms: args.timeout,
             max_chars,
             disable_sudo: args.disable_sudo,
+            keepalive_interval: args.keepalive_interval,
+            keepalive_max: args.keepalive_max,
         })
     }
 }

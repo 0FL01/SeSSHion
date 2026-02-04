@@ -31,6 +31,14 @@ pub struct SshConfig {
 
     /// Password for `sudo` commands (if different from su_password)
     pub sudo_password: Option<String>,
+
+    /// Keepalive interval in seconds (default: 30s)
+    /// Sends keepalive packets to maintain connection like a human user
+    pub keepalive_interval: u64,
+
+    /// Maximum keepalive failures before disconnecting (default: 3)
+    /// How many keepalive packets can be missed before connection drops
+    pub keepalive_max: u64,
 }
 
 impl SshConfig {
@@ -44,6 +52,8 @@ impl SshConfig {
             private_key: None,
             su_password: None,
             sudo_password: None,
+            keepalive_interval: 30,
+            keepalive_max: 3,
         }
     }
 
@@ -74,6 +84,22 @@ impl SshConfig {
     /// Set sudo password for sudo commands
     pub fn with_sudo_password(mut self, password: impl Into<String>) -> Self {
         self.sudo_password = Some(password.into());
+        self
+    }
+
+    /// Set keepalive interval in seconds (default: 30s)
+    /// Lower values = more frequent keepalives (detect dead connections faster)
+    /// Higher values = less network overhead (more like idle human session)
+    pub fn with_keepalive_interval(mut self, secs: u64) -> Self {
+        self.keepalive_interval = secs;
+        self
+    }
+
+    /// Set maximum keepalive failures before disconnecting (default: 3)
+    /// Total idle timeout = keepalive_interval * keepalive_max
+    /// Example: 30s * 3 = 90s of inactivity before disconnect
+    pub fn with_keepalive_max(mut self, max: u64) -> Self {
+        self.keepalive_max = max;
         self
     }
 }

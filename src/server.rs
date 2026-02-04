@@ -68,6 +68,11 @@ impl SshMcpServer {
             ssh_config = ssh_config.with_sudo_password(sudo_password);
         }
 
+        // Add keepalive settings for human-like connection persistence
+        ssh_config = ssh_config
+            .with_keepalive_interval(config.keepalive_interval)
+            .with_keepalive_max(config.keepalive_max);
+
         // Create connection manager
         let connection = Arc::new(SshConnectionManager::new(ssh_config).await);
 

@@ -13,9 +13,11 @@
         "--user=test",
         "--password=secret",
         "--timeout=60000",
-        "--log-file=logs/ssh-mcp.log",
-        "--log-format=json",
-        "--log-rotation=daily"
+        "--keepalive-interval=30",
+        "--keepalive-max=3"
+ //       "--log-file=logs/ssh-mcp.log",
+ //       "--log-format=json",
+ //       "--log-rotation=daily"
       ],
       "enabled": true
     }

@@ -2,6 +2,15 @@
 
 A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server. This tool enables AI models to securely interact with remote Linux systems via SSH, providing persistent connections, command execution, and root elevation capabilities.
 
+## Available MCP Tools
+
+This server provides the following tools for AI agents:
+
+- **`ssh-test-env_exec`** - Execute shell commands on the remote SSH server
+- **`ssh-test-env_sudo-exec`** - Execute shell commands with sudo privileges (if passwordless sudo is configured)
+
+> **Note:** These MCP tools are intended for testing the SSH MCP server binary itself. Do not use them unless explicitly requested.
+
 ## Repository Structure
 
 ```text

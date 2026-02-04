@@ -22,6 +22,7 @@ use russh::ChannelMsg;
 
 /// Default capacity for the channel semaphore (max concurrent commands)
 pub const CHANNEL_SEMAPHORE_CAPACITY: usize = 8;
+const AUTH_TIMEOUT_SECS: u64 = 20;
 
 /// SSH Connection Manager
 ///
@@ -187,10 +188,18 @@ impl SshConnectionManager {
                 "Attempting password authentication for user '{}'",
                 self.config.username
             );
-            let auth_result = session
-                .authenticate_password(&self.config.username, password)
-                .await
-                .map_err(|e| SshMcpError::auth(e.to_string()))?;
+            let auth_result = timeout(
+                Duration::from_secs(AUTH_TIMEOUT_SECS),
+                session.authenticate_password(&self.config.username, password),
+            )
+            .await
+            .map_err(|_| {
+                SshMcpError::auth(format!(
+                    "Authentication timed out after {}s",
+                    AUTH_TIMEOUT_SECS
+                ))
+            })?
+            .map_err(|e| SshMcpError::auth(e.to_string()))?;
 
             if auth_result.success() {
                 info!("Password authentication successful");
@@ -214,10 +223,18 @@ impl SshConnectionManager {
             // Wrap in PrivateKeyWithHashAlg (None for non-RSA or default hash)
             let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), None);
 
-            let auth_result = session
-                .authenticate_publickey(&self.config.username, key_with_alg)
-                .await
-                .map_err(|e| SshMcpError::auth(e.to_string()))?;
+            let auth_result = timeout(
+                Duration::from_secs(AUTH_TIMEOUT_SECS),
+                session.authenticate_publickey(&self.config.username, key_with_alg),
+            )
+            .await
+            .map_err(|_| {
+                SshMcpError::auth(format!(
+                    "Authentication timed out after {}s",
+                    AUTH_TIMEOUT_SECS
+                ))
+            })?
+            .map_err(|e| SshMcpError::auth(e.to_string()))?;
 
             if auth_result.success() {
                 info!("Key authentication successful");

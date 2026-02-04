@@ -23,6 +23,7 @@ use russh::ChannelMsg;
 /// Default capacity for the channel semaphore (max concurrent commands)
 pub const CHANNEL_SEMAPHORE_CAPACITY: usize = 8;
 const AUTH_TIMEOUT_SECS: u64 = 20;
+const CONNECT_WAIT_TIMEOUT_SECS: u64 = CONNECTION_TIMEOUT_SECS + AUTH_TIMEOUT_SECS;
 
 /// SSH Connection Manager
 ///
@@ -97,7 +98,21 @@ impl SshConnectionManager {
         {
             debug!("Another connection attempt in progress, waiting...");
             // Wait for the other connection attempt to complete using Notify
-            self.connect_notify.notified().await;
+            let wait_result = timeout(
+                Duration::from_secs(CONNECT_WAIT_TIMEOUT_SECS),
+                self.connect_notify.notified(),
+            )
+            .await;
+            if wait_result.is_err() {
+                warn!(
+                    "Timed out waiting for in-flight connection attempt after {}s",
+                    CONNECT_WAIT_TIMEOUT_SECS
+                );
+                return Err(SshMcpError::connection(format!(
+                    "Timed out waiting for in-flight connection attempt after {}s",
+                    CONNECT_WAIT_TIMEOUT_SECS
+                )));
+            }
             return if self.is_connected().await {
                 Ok(())
             } else {

@@ -16,7 +16,9 @@ use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
-use crate::ssh::{SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command};
+use crate::ssh::{
+    CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
+};
 
 /// SSH MCP Server
 ///
@@ -106,15 +108,9 @@ impl SshMcpServer {
         debug!("exec tool called with command: {}", command);
 
         // Sanitize the command
-        let sanitized = match sanitize_command(command, self.max_chars) {
+        let sanitized = match self.sanitize_or_tool_error(command) {
             Ok(cmd) => cmd,
-            Err(e) => {
-                error!("Command sanitization failed: {}", e);
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    e
-                ))]));
-            }
+            Err(result) => return Ok(result),
         };
 
         // Ensure connection is established
@@ -135,23 +131,7 @@ impl SshMcpServer {
 
         // Execute the command
         match self.connection.exec_command(&sanitized, self.timeout).await {
-            Ok(output) => {
-                // Combine stdout and stderr for the response
-                let mut result_text = output.stdout;
-                if !output.stderr.is_empty() {
-                    if !result_text.is_empty() {
-                        result_text.push_str("\n--- stderr ---\n");
-                    }
-                    result_text.push_str(&output.stderr);
-                }
-
-                // Check for error exit code
-                if output.exit_code.map(|code| code != 0).unwrap_or(false) {
-                    Ok(CallToolResult::error(vec![Content::text(result_text)]))
-                } else {
-                    Ok(CallToolResult::success(vec![Content::text(result_text)]))
-                }
-            }
+            Ok(output) => Ok(Self::calltool_from_command_output(output)),
             Err(e) => {
                 error!("Command execution failed: {}", e);
                 Ok(CallToolResult::error(vec![Content::text(format!(
@@ -170,15 +150,9 @@ impl SshMcpServer {
         debug!("sudo-exec tool called with command: {}", command);
 
         // Sanitize the command
-        let sanitized = match sanitize_command(command, self.max_chars) {
+        let sanitized = match self.sanitize_or_tool_error(command) {
             Ok(cmd) => cmd,
-            Err(e) => {
-                error!("Command sanitization failed: {}", e);
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    e
-                ))]));
-            }
+            Err(result) => return Ok(result),
         };
 
         // Ensure connection is established
@@ -203,23 +177,7 @@ impl SshMcpServer {
             .exec_command(&wrapped_command, self.timeout)
             .await
         {
-            Ok(output) => {
-                // Combine stdout and stderr for the response
-                let mut result_text = output.stdout;
-                if !output.stderr.is_empty() {
-                    if !result_text.is_empty() {
-                        result_text.push_str("\n--- stderr ---\n");
-                    }
-                    result_text.push_str(&output.stderr);
-                }
-
-                // Check for error exit code
-                if output.exit_code.map(|code| code != 0).unwrap_or(false) {
-                    Ok(CallToolResult::error(vec![Content::text(result_text)]))
-                } else {
-                    Ok(CallToolResult::success(vec![Content::text(result_text)]))
-                }
-            }
+            Ok(output) => Ok(Self::calltool_from_command_output(output)),
             Err(e) => {
                 error!("Sudo command execution failed: {}", e);
                 Ok(CallToolResult::error(vec![Content::text(format!(
@@ -230,14 +188,42 @@ impl SshMcpServer {
         }
     }
 
-    /// Build exec tool definition
-    fn exec_tool() -> Tool {
+    fn sanitize_or_tool_error(&self, command: &str) -> std::result::Result<String, CallToolResult> {
+        sanitize_command(command, self.max_chars).map_err(|e| {
+            error!("Command sanitization failed: {}", e);
+            CallToolResult::error(vec![Content::text(format!("Error: {}", e))])
+        })
+    }
+
+    fn calltool_from_command_output(output: CommandOutput) -> CallToolResult {
+        // Combine stdout and stderr for the response
+        let mut result_text = output.stdout;
+        if !output.stderr.is_empty() {
+            if !result_text.is_empty() {
+                result_text.push_str("\n--- stderr ---\n");
+            }
+            result_text.push_str(&output.stderr);
+        }
+
+        // Check for error exit code
+        if output.exit_code.map(|code| code != 0).unwrap_or(false) {
+            CallToolResult::error(vec![Content::text(result_text)])
+        } else {
+            CallToolResult::success(vec![Content::text(result_text)])
+        }
+    }
+
+    fn command_tool(
+        name: &'static str,
+        tool_description: &'static str,
+        command_description: &'static str,
+    ) -> Tool {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Shell command to execute on the remote SSH server"
+                    "description": command_description
                 }
             },
             "required": ["command"]
@@ -246,33 +232,24 @@ impl SshMcpServer {
         // Convert Value to JsonObject (Map<String, Value>)
         let schema_obj = schema.as_object().cloned().unwrap_or_default();
 
-        Tool::new(
+        Tool::new(name, tool_description, Arc::new(schema_obj))
+    }
+
+    /// Build exec tool definition
+    fn exec_tool() -> Tool {
+        Self::command_tool(
             "exec",
             "Execute a shell command on the remote SSH server and return the output.",
-            Arc::new(schema_obj),
+            "Shell command to execute on the remote SSH server",
         )
     }
 
     /// Build sudo-exec tool definition
     fn sudo_exec_tool() -> Tool {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute with sudo on the remote SSH server"
-                }
-            },
-            "required": ["command"]
-        });
-
-        // Convert Value to JsonObject (Map<String, Value>)
-        let schema_obj = schema.as_object().cloned().unwrap_or_default();
-
-        Tool::new(
+        Self::command_tool(
             "sudo-exec",
             "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
-            Arc::new(schema_obj),
+            "Shell command to execute with sudo on the remote SSH server",
         )
     }
 }

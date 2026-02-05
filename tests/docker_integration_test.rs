@@ -77,6 +77,8 @@ async fn test_mcp_tools_with_docker() {
         timeout_ms: 30000,
         max_chars: Some(1000),
         disable_sudo: false,
+        keepalive_interval: 30,
+        keepalive_max: 3,
     };
 
     // 3. Create SshMcpServer instance

@@ -161,12 +161,7 @@ impl SshConnectionManager {
         }
 
         // Check timeout availability lazily on first use (same as exec_via_channel)
-        let use_wrapper = if self.use_timeout_wrapper() {
-            true
-        } else {
-            let _ = self.check_timeout_availability().await;
-            self.use_timeout_wrapper()
-        };
+        let use_wrapper = self.determine_timeout_wrapper_usage().await;
 
         // Wrap command with timeout if available
         let wrapped_cmd = if use_wrapper {
@@ -423,14 +418,7 @@ impl SshConnectionManager {
 
         // Wrap command with timeout if available
         // Check timeout availability lazily on first use
-        let use_wrapper = if self.use_timeout_wrapper() {
-            // Already cached as available
-            true
-        } else {
-            // Try detection - if it becomes available after check, use wrapper
-            let _ = self.check_timeout_availability().await;
-            self.use_timeout_wrapper()
-        };
+        let use_wrapper = self.determine_timeout_wrapper_usage().await;
 
         let wrapped_cmd = if use_wrapper {
             wrap_command_with_timeout(command, duration_secs)

@@ -71,17 +71,22 @@ pub fn sanitize_command(command: &str, max_chars: Option<usize>) -> Result<Strin
 /// let escaped = escape_command_for_shell("echo 'hello' | cat");
 /// assert_eq!(escaped, "echo '\"'\"'hello'\"'\"' \\| cat");
 /// ```
+fn escape_single_quotes(s: &str) -> String {
+    s.replace('\'', "'\"'\"'")
+}
+
 pub fn escape_command_for_shell(command: &str) -> String {
     // Escape order matters for backslash - we escape it first
     // to avoid double-escaping subsequent characters
-    command
-        .replace('\\', "\\\\")
-        .replace('$', "\\$")
-        .replace('`', "\\`")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
-        .replace('|', "\\|")
-        .replace('\'', "'\"'\"'")
+    escape_single_quotes(
+        &command
+            .replace('\\', "\\\\")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+            .replace('(', "\\(")
+            .replace(')', "\\)")
+            .replace('|', "\\|"),
+    )
 }
 
 /// Escapes a command for safe inclusion inside single quotes in timeout wrapper
@@ -116,7 +121,7 @@ pub fn escape_for_timeout_wrapper(command: &str) -> String {
     // First escape backslashes, then single quotes
     // This order is important: we need to preserve backslash escaping
     // for the shell while also escaping single quotes
-    command.replace('\\', "\\\\").replace('\'', "'\"'\"'")
+    escape_single_quotes(&command.replace('\\', "\\\\"))
 }
 
 #[cfg(test)]

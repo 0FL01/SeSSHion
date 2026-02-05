@@ -140,9 +140,11 @@ impl SshConnectionManager {
         let connection_timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
 
         // Create russh config with keepalive to mimic human behavior
-        let mut ssh_config = client::Config::default();
-        ssh_config.keepalive_interval = Some(Duration::from_secs(self.config.keepalive_interval));
-        ssh_config.keepalive_max = self.config.keepalive_max as usize;
+        let ssh_config = client::Config {
+            keepalive_interval: Some(Duration::from_secs(self.config.keepalive_interval)),
+            keepalive_max: self.config.keepalive_max as usize,
+            ..Default::default()
+        };
         let ssh_config = Arc::new(ssh_config);
 
         // Connect with timeout
@@ -331,6 +333,19 @@ impl SshConnectionManager {
     pub fn disable_timeout_wrapper(&self) {
         self.has_timeout_cmd.store(false, Ordering::SeqCst);
         warn!("timeout wrapper disabled due to errors, falling back to pkill");
+    }
+
+    /// Lazily check and return whether to use the remote timeout wrapper
+    ///
+    /// This performs a one-time remote detection on first need and then returns
+    /// the cached decision for the lifetime of the connection.
+    pub(crate) async fn determine_timeout_wrapper_usage(&self) -> bool {
+        if self.use_timeout_wrapper() {
+            return true;
+        }
+
+        let _ = self.check_timeout_availability().await;
+        self.use_timeout_wrapper()
     }
 
     /// Detect whether the `timeout` command is available on the remote system

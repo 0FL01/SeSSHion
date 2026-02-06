@@ -25,6 +25,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 | **RAM (RSS)** | ~82.5 MB | ~5.4 MB | **~15x more efficient** |
 | **CPU Time (Start)** | 0.55s | 0.01s | **Near-zero overhead** |
 | **Response Speed** | Instant | Instant | Limited by SSH latency |
+| **Context Usage** | ~800 tokens | ~800 tokens | Fixed server schema overhead |
 
 ### 🛠️ Test Methodology
 
@@ -210,13 +211,30 @@ The server exposes the following MCP tools:
 ### `exec`
 Execute a shell command as the connected user.
 - **Arguments**:
-  - `command` (string): The shell command to execute.
+  - `command` (string, required): The shell command to execute.
+  - `background` (boolean, default: false): If true, start the command detached via nohup and return immediately with a JSON response containing `{job_id, pid, log_path}`. Recommended for long-running operations to avoid client timeouts.
+  - `timeout_ms` (integer, optional): Override the default command timeout (ms). If the foreground command exceeds this timeout, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`.
+  - `log_path` (string, optional): Custom remote log path for background mode. Defaults to `/tmp/ssh-mcp/<job_id>.log`.
 
 ### `sudo-exec`
 Execute a command with root privileges using `sudo`.
 - **Arguments**:
-  - `command` (string): The shell command to execute with sudo.
+  - `command` (string, required): The shell command to execute with sudo.
+  - `background` (boolean, default: false): Same behavior as `exec` - detach long-running commands.
+  - `timeout_ms` (integer, optional): Override timeout (ms). Same auto-detach behavior on timeout.
+  - `log_path` (string, optional): Custom log path for background mode.
 - **Note**: This tool uses the `--sudo-password` provided at startup.
+
+### Monitoring Background Jobs
+When using `background=true` or when a command auto-detaches on timeout:
+- The response includes `{job_id, pid, log_path}` and a `hint` field with monitoring guidance.
+- **Recommended approach**: Sleep between checks instead of tight polling.
+  - Start with 2-5s intervals, then use 10-30s for longer-running jobs.
+- Check progress with:
+  ```bash
+  ps -p <pid> -o pid,etime,cmd
+  tail -n 50 -- '<log_path>'
+  ```
 
 ## 🔒 Security
 

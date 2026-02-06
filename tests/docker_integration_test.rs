@@ -104,6 +104,65 @@ async fn test_mcp_tools_with_docker() {
     );
     tracing::info!("exec tool verified: whoami returned 'test'");
 
+    // 4b. Foreground timeout should auto-detach without killing remote command.
+    // We use a small timeout to force the detach path.
+    let timeout_result = server
+        .test_execute_command_with_timeout_ms("sleep 2; echo done", 200)
+        .await
+        .expect("exec command with timeout override failed");
+
+    let timeout_text = extract_text_from_result(&timeout_result);
+    let timeout_json: serde_json::Value = serde_json::from_str(timeout_text.trim())
+        .expect("timeout->detach response should be valid JSON");
+
+    assert_eq!(
+        timeout_json.get("ok").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        timeout_json.get("timeout").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        timeout_json.get("background").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(
+        timeout_json.get("hint").and_then(|v| v.as_str()).is_some(),
+        "timeout->detach response should include a pragmatic hint"
+    );
+    let log_path = timeout_json
+        .get("log_path")
+        .and_then(|v| v.as_str())
+        .expect("timeout->detach response should include log_path");
+
+    // Poll for completion (no fixed sleeps) to avoid flakes on slow CI.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let poll_interval = tokio::time::Duration::from_millis(250);
+    let mut last_log_text = String::new();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "detached job log did not contain 'done' within deadline; last log: '{}'",
+                last_log_text
+            );
+        }
+
+        let log_result = server
+            .test_execute_command(&format!("cat -- '{}'", log_path))
+            .await
+            .expect("failed to read detached job log");
+        let log_text = extract_text_from_result(&log_result);
+        last_log_text = log_text.clone();
+
+        if log_text.contains("done") {
+            break;
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
     // 5. Test 'sudo-exec' tool using test helper
     let sudo_result = server
         .test_execute_sudo_command("whoami")

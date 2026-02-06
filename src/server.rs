@@ -23,6 +23,10 @@ use crate::ssh::{
 };
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
+const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
+const FOREGROUND_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const FOREGROUND_EXIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const FOREGROUND_LOG_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -60,9 +64,10 @@ fn build_background_wrapper_script(job_id: &str, user_command: &str, log_path: &
     // Any error output should go to stderr.
     format!(
         "LOG='{escaped_log_path}'; \
+ EXIT=\"$LOG.exit\"; export EXIT; \
  log_dir=\"$(dirname -- \"$LOG\")\" || {{ printf '%s\n' \"__SSH_MCP_ERR=dirname_failed\" >&2; exit 1; }}; \
  mkdir -p -- \"$log_dir\" || {{ printf '%s\n' \"__SSH_MCP_ERR=mkdir_failed\" >&2; exit 1; }}; \
- nohup sh -lc '{escaped_user_command}' >\"$LOG\" 2>&1 </dev/null & pid=$!; \
+ nohup sh -lc '{escaped_user_command}; ec=$?; printf %s\\n \"$ec\" >\"$EXIT\"' >\"$LOG\" 2>&1 </dev/null & pid=$!; \
  printf '%s\n' \"__SSH_MCP_JOB_ID={job_id}\"; \
  printf '%s\n' \"__SSH_MCP_PID=$pid\"; \
  printf '%s\n' \"__SSH_MCP_LOG=$LOG\"",
@@ -133,6 +138,13 @@ fn parse_background_markers(
     })
 }
 
+fn truncate_with_flag(input: &str, limit_chars: usize) -> (String, bool) {
+    let mut iter = input.chars();
+    let snippet: String = iter.by_ref().take(limit_chars).collect();
+    let truncated = iter.next().is_some();
+    (snippet, truncated)
+}
+
 fn background_json_ok(markers: BackgroundMarkers) -> CallToolResult {
     let body = serde_json::json!({
         "ok": true,
@@ -146,20 +158,69 @@ fn background_json_ok(markers: BackgroundMarkers) -> CallToolResult {
     CallToolResult::success(vec![Content::text(body)])
 }
 
-fn background_json_err(job_id: &str, log_path: &str, error: &str, stderr: &str) -> CallToolResult {
-    // Keep the payload deterministic and single-line. Avoid echoing the original command.
-    let stderr_snippet: String = stderr.chars().take(2048).collect();
-    let error_snippet: String = error.chars().take(2048).collect();
-
+fn background_json_timeout(markers: BackgroundMarkers) -> CallToolResult {
+    let hint = "Command timed out; job continues in background. Hint: use JSON fields pid/log_path; check progress with: ps -p <pid> -o pid,etime,cmd; tail -n 50 -- '<log_path>'";
     let body = serde_json::json!({
         "ok": false,
+        "timeout": true,
         "background": true,
-        "job_id": job_id,
-        "log_path": log_path,
-        "error": error_snippet,
-        "stderr": stderr_snippet,
+        "job_id": markers.job_id,
+        "pid": markers.pid,
+        "log_path": markers.log_path,
+        "hint": hint,
     })
     .to_string();
+
+    CallToolResult::success(vec![Content::text(body)])
+}
+
+fn background_json_err(job_id: &str, log_path: &str, error: &str, stderr: &str) -> CallToolResult {
+    // Keep the payload deterministic and single-line. Avoid echoing the original command.
+    let (error_snippet, error_truncated) =
+        truncate_with_flag(error, BACKGROUND_JSON_SNIPPET_LIMIT_CHARS);
+    let (stderr_snippet, stderr_truncated) =
+        truncate_with_flag(stderr, BACKGROUND_JSON_SNIPPET_LIMIT_CHARS);
+
+    let truncated = error_truncated || stderr_truncated;
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("ok".to_string(), serde_json::Value::Bool(false));
+    obj.insert("background".to_string(), serde_json::Value::Bool(true));
+    obj.insert(
+        "job_id".to_string(),
+        serde_json::Value::String(job_id.to_string()),
+    );
+    obj.insert(
+        "log_path".to_string(),
+        serde_json::Value::String(log_path.to_string()),
+    );
+    obj.insert(
+        "error".to_string(),
+        serde_json::Value::String(error_snippet),
+    );
+    obj.insert(
+        "stderr".to_string(),
+        serde_json::Value::String(stderr_snippet),
+    );
+    obj.insert("truncated".to_string(), serde_json::Value::Bool(truncated));
+    obj.insert(
+        "truncated_fields".to_string(),
+        serde_json::json!({
+            "error": error_truncated,
+            "stderr": stderr_truncated,
+        }),
+    );
+    if truncated {
+        obj.insert(
+            "hint".to_string(),
+            serde_json::Value::String(format!(
+                "Response fields were truncated to {} chars. Hint: inspect full output using the JSON log_path field; tail -n 50 -- '<log_path>'",
+                BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
+            )),
+        );
+    }
+
+    let body = serde_json::Value::Object(obj).to_string();
 
     CallToolResult::success(vec![Content::text(body)])
 }
@@ -278,14 +339,141 @@ impl SshMcpServer {
             debug!("Elevation failed, will run as normal user: {}", e);
         }
 
-        // Execute the command
-        match self.connection.exec_command(&sanitized, timeout).await {
-            Ok(output) => Ok(Self::calltool_from_command_output(output)),
+        // Foreground execution is detachable-by-design:
+        // - Start the command immediately using the background wrapper (nohup + log + pid markers)
+        // - Poll for an exit-code file until timeout
+        // - If timeout elapses, return a deterministic single-line JSON payload and keep the job running
+
+        let job_id = make_job_id();
+        let final_log_path = format!("/tmp/ssh-mcp/{}.log", job_id);
+        let exit_path = format!("{}.exit", final_log_path);
+
+        let wrapper = build_background_wrapper_script(&job_id, &sanitized, &final_log_path);
+        let start_output = match self
+            .connection
+            .exec_command(&wrapper, BACKGROUND_START_TIMEOUT)
+            .await
+        {
+            Ok(out) => out,
             Err(e) => {
-                error!("Command execution failed: {}", e);
-                Ok(CallToolResult::error(vec![Content::text(format!(
+                error!("Failed to start detached foreground command: {}", e);
+                return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error: {}",
                     e
+                ))]));
+            }
+        };
+
+        let markers = match parse_background_markers(&start_output.stdout, &job_id, &final_log_path)
+        {
+            Ok(m) => m,
+            Err(parse_err) => {
+                let mut msg = format!("Failed to parse background markers: {parse_err}");
+                if let Some(code) = start_output.exit_code {
+                    msg.push_str(&format!("; exit_code={}", code));
+                }
+                if !start_output.stderr.is_empty() {
+                    let stderr_snippet: String = start_output.stderr.chars().take(2048).collect();
+                    msg.push_str("; stderr=");
+                    msg.push_str(&stderr_snippet);
+                }
+                error!("{}", msg);
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: {}",
+                    msg
+                ))]));
+            }
+        };
+
+        let start = tokio::time::Instant::now();
+        let mut last_probe_error: Option<String> = None;
+
+        let exit_code: u32 = loop {
+            if start.elapsed() >= timeout {
+                return Ok(background_json_timeout(markers));
+            }
+
+            let escaped_exit_path = crate::ssh::escape_for_shell(&exit_path);
+            let probe_cmd = format!("cat -- '{escaped_exit_path}'");
+
+            match self
+                .connection
+                .exec_command(&probe_cmd, FOREGROUND_EXIT_PROBE_TIMEOUT)
+                .await
+            {
+                Ok(out) => {
+                    let trimmed = out.stdout.trim();
+                    if trimmed.is_empty() {
+                        // Not ready yet (or remote cat produced no stdout).
+                        // Keep polling until the effective timeout.
+                    } else {
+                        match trimmed.parse::<u32>() {
+                            Ok(code) => break code,
+                            Err(e) => {
+                                last_probe_error =
+                                    Some(format!("failed to parse exit code '{trimmed}': {e}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_probe_error = Some(e.to_string());
+                }
+            }
+
+            tokio::time::sleep(FOREGROUND_EXIT_POLL_INTERVAL).await;
+        };
+
+        let escaped_log_path = crate::ssh::escape_for_shell(&final_log_path);
+        let read_log_cmd = format!("cat -- '{escaped_log_path}'");
+        let log_output = self
+            .connection
+            .exec_command(&read_log_cmd, FOREGROUND_LOG_READ_TIMEOUT)
+            .await;
+
+        match log_output {
+            Ok(out) => {
+                // Treat log read failures as tool errors. `exec_command` returns Ok(CommandOutput)
+                // even for non-zero exit codes, so we must inspect the result.
+                if out.exit_code.is_some_and(|code| code != 0) || !out.stderr.is_empty() {
+                    let mut msg = format!(
+                        "Command finished (exit_code={}), but reading log failed: cat_exit_code={:?}",
+                        exit_code, out.exit_code
+                    );
+                    if let Some(probe_err) = last_probe_error {
+                        msg.push_str(&format!("; last_probe_error={probe_err}"));
+                    }
+                    let combined = out.combined_output();
+                    if !combined.is_empty() {
+                        msg.push_str("; cat_output=");
+                        msg.push_str(&combined);
+                    }
+                    error!("{}", msg);
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: {}",
+                        msg
+                    ))]));
+                }
+
+                let output = CommandOutput {
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    exit_code: Some(exit_code),
+                };
+                Ok(Self::calltool_from_command_output(output))
+            }
+            Err(e) => {
+                let mut msg = format!(
+                    "Command finished (exit_code={}), but reading log failed: {}",
+                    exit_code, e
+                );
+                if let Some(probe_err) = last_probe_error {
+                    msg.push_str(&format!("; last_probe_error={probe_err}"));
+                }
+                error!("{}", msg);
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: {}",
+                    msg
                 ))]))
             }
         }
@@ -416,10 +604,13 @@ impl SshMcpServer {
             Ok(output) => Ok(Self::calltool_from_command_output(output)),
             Err(e) => {
                 error!("Sudo command execution failed: {}", e);
-                Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    e
-                ))]))
+                let mut msg = format!("Error: {}", e);
+                if matches!(e, SshMcpError::Timeout(_)) {
+                    msg.push_str(
+                        "\nHint: rerun with background=true; watch log_path (e.g. tail -n 50 <log_path>).",
+                    );
+                }
+                Ok(CallToolResult::error(vec![Content::text(msg)]))
             }
         }
     }
@@ -545,7 +736,7 @@ impl SshMcpServer {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "If true, start the command detached via nohup and return immediately to avoid client timeouts. The tool response is a single-line deterministic JSON object: {ok,background,job_id,pid,log_path}. Command output is written to log_path.",
+                    "description": "If true, start the command detached via nohup and return immediately to avoid client timeouts. The tool response is a single-line deterministic JSON object: {ok,background,job_id,pid,log_path}. If background=false and the command exceeds the effective timeout, it auto-detaches and returns {ok:false,timeout:true,background:true,job_id,pid,log_path}. Command output is written to log_path.",
                     "default": false
                 },
                 "timeout_ms": {
@@ -593,6 +784,17 @@ impl SshMcpServer {
         command: &str,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_command(command).await
+    }
+
+    /// Internal method exposed for testing - executes a command with a timeout override
+    #[doc(hidden)]
+    pub async fn test_execute_command_with_timeout_ms(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_command_with_timeout(command, Duration::from_millis(timeout_ms))
+            .await
     }
 
     /// Internal method exposed for testing - executes a sudo command directly
@@ -804,6 +1006,15 @@ impl ServerHandler for SshMcpServer {
 mod tests {
     use super::*;
 
+    fn extract_text_from_result(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.raw.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     // Note: Real tests would require a mock SSH server or testcontainers
     // These are placeholder tests
 
@@ -834,7 +1045,7 @@ mod tests {
             "echo 'hello world'",
             "/tmp/ssh-mcp/job-1.log",
         );
-        assert!(script.contains("nohup sh -lc 'echo '\"'\"'hello world'\"'\"''"));
+        assert!(script.contains("nohup sh -lc 'echo '\"'\"'hello world'\"'\"'; ec=$?;"));
     }
 
     #[test]
@@ -849,6 +1060,95 @@ mod tests {
                 pid: 456,
                 log_path: "/tmp/ssh-mcp/abc.log".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn test_background_json_err_sets_truncation_flag_and_hint() {
+        let long_error = "e".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
+        let long_stderr = "s".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
+
+        let result =
+            background_json_err("job-1", "/tmp/ssh-mcp/job-1.log", &long_error, &long_stderr);
+        let text = extract_text_from_result(&result);
+
+        let value: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("background_json_err should return JSON");
+
+        assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            value.get("background").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(value.get("truncated").and_then(|v| v.as_bool()), Some(true));
+
+        let fields = value
+            .get("truncated_fields")
+            .expect("expected truncated_fields");
+        assert_eq!(fields.get("error").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(fields.get("stderr").and_then(|v| v.as_bool()), Some(true));
+
+        let hint = value
+            .get("hint")
+            .and_then(|v| v.as_str())
+            .expect("expected hint when truncated");
+        assert!(
+            hint.contains("tail -n 50 -- '<log_path>'"),
+            "hint should include a safe tail snippet with a placeholder path; got: '{hint}'"
+        );
+
+        let error_snippet = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("expected error field");
+        assert_eq!(
+            error_snippet.chars().count(),
+            BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
+        );
+        let stderr_snippet = value
+            .get("stderr")
+            .and_then(|v| v.as_str())
+            .expect("expected stderr field");
+        assert_eq!(
+            stderr_snippet.chars().count(),
+            BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
+        );
+    }
+
+    #[test]
+    fn test_background_json_timeout_hint_uses_placeholders_not_marker_values() {
+        let markers = BackgroundMarkers {
+            job_id: "job-42".to_string(),
+            pid: 4242,
+            log_path: "/tmp/ssh-mcp/VERY_DISTINCT_LOG_PATH_9b9e3c.log".to_string(),
+        };
+
+        let result = background_json_timeout(markers.clone());
+        let text = extract_text_from_result(&result);
+
+        let value: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("background_json_timeout should return JSON");
+
+        assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(value.get("timeout").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(value.get("background").and_then(|v| v.as_bool()), Some(true));
+
+        let hint = value
+            .get("hint")
+            .and_then(|v| v.as_str())
+            .expect("expected hint field");
+
+        assert!(
+            hint.contains("<pid>"),
+            "hint should reference pid placeholder; got: '{hint}'"
+        );
+        assert!(
+            hint.contains("<log_path>"),
+            "hint should reference log_path placeholder; got: '{hint}'"
+        );
+        assert!(
+            !hint.contains(&markers.log_path),
+            "hint should not contain concrete log_path marker value; got: '{hint}'"
         );
     }
 }

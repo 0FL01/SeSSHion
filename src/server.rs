@@ -1131,7 +1131,10 @@ mod tests {
 
         assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(value.get("timeout").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(value.get("background").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            value.get("background").and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         let hint = value
             .get("hint")

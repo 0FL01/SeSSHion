@@ -2,3 +2,4 @@ target/
 logs/
 *.log
 .ruff_cache
+sshd_config

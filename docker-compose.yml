@@ -8,9 +8,6 @@ services:
       - SUDO_ACCESS=true
     ports:
       - "127.0.0.1:2222:2222"
-    volumes:
-      - ./logs:/config/logs
-      - ./sshd_config/custom-init.sh:/custom-cont-init.d/99-custom.sh
     logging:
       driver: "json-file"
       options:

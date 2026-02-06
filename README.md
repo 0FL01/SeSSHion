@@ -236,6 +236,22 @@ When using `background=true` or when a command auto-detaches on timeout:
   tail -n 50 -- '<log_path>'
   ```
 
+### When to Use Background Mode
+
+**Typical long-running tasks:**
+- Database exports/imports (`mysqldump`, `pg_dump`, `pg_restore`)
+- Large file transfers (`rsync`, `scp`)
+- Build processes (`cargo build`, `make`, `npm install`)
+- Container operations (`docker build`, `docker compose up`)
+- System maintenance (`apt update`, `yum update`, log rotation)
+
+**Agent workflow:**
+1. Start command with `background=true` or let it auto-detach on timeout
+2. Get `{job_id, pid, log_path}` immediately
+3. Sleep 2-5s, then check status with `ps` and `tail`
+4. For long jobs, increase interval to 10-30s
+5. Confirm completion when `ps` no longer lists the PID
+
 ## 🔒 Security
 
 - **Stdio Transport**: Communicates using JSON-RPC over stdin/stdout, ensuring no exposed ports.

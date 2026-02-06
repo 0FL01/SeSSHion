@@ -736,16 +736,16 @@ impl SshMcpServer {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "If true, start the command detached via nohup and return immediately to avoid client timeouts. The tool response is a single-line deterministic JSON object: {ok,background,job_id,pid,log_path}. If background=false and the command exceeds the effective timeout, it auto-detaches and returns {ok:false,timeout:true,background:true,job_id,pid,log_path}. Command output is written to log_path. Monitoring guidance: after starting a background job, don't poll continuously. Prefer sleeping between checks (start with 2-5s, then 10-30s). Check progress with `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 -- '<log_path>'`",
+                    "description": "Detach via nohup and return immediately with JSON {ok,background,job_id,pid,log_path}. Use for multi-minute tasks (RPC clients may time out even with large timeout_ms). If background=false and the command exceeds the effective timeout, it auto-detaches and returns {ok:false,timeout:true,background:true,job_id,pid,log_path}. Output goes to log_path. Monitoring: sleep between checks (2-5s, then 10-30s); use `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 -- '<log_path>'`",
                     "default": false
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Optional timeout override in milliseconds for foreground execution (waits for completion). Ignored when background=true."
+                    "description": "Optional foreground wait limit in milliseconds. Note: RPC clients may still time out; for long jobs prefer background=true. Ignored when background=true."
                 },
                 "log_path": {
                     "type": "string",
-                    "description": "Optional remote log path for background mode. Defaults to /tmp/ssh-mcp/<job_id>.log. Use `tail -n 50 -- '<log_path>'` to view progress."
+                    "description": "Optional remote log path for background mode. Defaults to /tmp/ssh-mcp/<job_id>.log. View progress with `tail -n 50 -- '<log_path>'`."
                 }
             },
             "required": ["command"]
@@ -761,7 +761,7 @@ impl SshMcpServer {
     fn exec_tool() -> Tool {
         Self::command_tool(
             "exec",
-            "Execute a shell command on the remote SSH server and return the output. For long-running commands, set background=true to detach and avoid client timeouts; you will get a deterministic JSON response with {job_id,pid,log_path}. Monitoring guidance: after starting a background job, don't poll continuously. Prefer sleeping between checks (start with 2-5s, then 10-30s). Check progress with `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 -- '<log_path>'`",
+            "Execute a shell command. For multi-minute tasks, use background=true (RPC clients may time out; avoid duplicate re-runs). Background returns JSON {job_id,pid,log_path}. Monitoring: sleep 2-5s, then 10-30s; use `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 -- '<log_path>'`",
             "Shell command to execute on the remote SSH server",
         )
     }
@@ -770,7 +770,7 @@ impl SshMcpServer {
     fn sudo_exec_tool() -> Tool {
         Self::command_tool(
             "sudo-exec",
-            "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo. For long-running commands, set background=true to detach and avoid client timeouts; you will get a deterministic JSON response with {job_id,pid,log_path}. Monitoring guidance: after starting a background job, don't poll continuously. Prefer sleeping between checks (start with 2-5s, then 10-30s). Check progress with `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 -- '<log_path>'`",
+            "Execute a shell command via sudo. For multi-minute tasks, use background=true (RPC clients may time out; avoid duplicate re-runs). Background returns JSON {job_id,pid,log_path}. Monitoring: sleep 2-5s, then 10-30s; use `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 -- '<log_path>'`",
             "Shell command to execute with sudo on the remote SSH server",
         )
     }

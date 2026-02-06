@@ -26,7 +26,8 @@ This server provides the following tools for AI agents:
 │   └── russh-library.md  # Notes on the underlying SSH library (russh)
 ├── tests/                # Integration and functional tests
 │   ├── integration_test.rs # Command formatting and connection logic tests
-│   └── docker_integration_test.rs # Full E2E tests using Docker containers
+│   ├── docker_integration_test.rs # Full E2E tests using Docker containers
+│   └── logging_test.rs      # Logging configuration and initialization tests
 └── src/                  # Source code
     ├── main.rs           # Application entry point
     ├── lib.rs            # Library root

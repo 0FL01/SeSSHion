@@ -88,8 +88,6 @@ cd ssh-mcp-rs
 cargo build --release
 ```
 
-The binary will be available at `./target/release/ssh-mcp`.
-
 ## ⚙️ Configuration
 
 The server is configured via CLI arguments or environment variables.
@@ -111,50 +109,8 @@ The server is configured via CLI arguments or environment variables.
 | `--log-format` | `SSH_MCP_LOG_FORMAT` | Log file format: text, json (default: text) |
 | `--log-rotation` | `SSH_MCP_LOG_ROTATION` | Log rotation: daily, hourly, never (default: daily) |
 
-## 💡 Usage Examples
-
-### Basic Usage (stderr logging)
-```bash
-./ssh-mcp --host=192.168.1.10 --user=admin --password=secret
-```
-
-### Debug Logging
-```bash
-./ssh-mcp --host=192.168.1.10 --user=admin --log-level=debug
-```
-
-### File Logging (JSON format)
-```bash
-./ssh-mcp \
-  --host=prod-server \
-  --user=admin \
-  --log-file=/var/log/ssh-mcp/app.log \
-  --log-format=json \
-  --log-rotation=daily
-```
-
 Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
 Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
-
-### Environment Variables
-```bash
-export SSH_MCP_HOST=prod-server
-export SSH_MCP_USER=admin
-export SSH_MCP_LOG_LEVEL=warn
-export SSH_MCP_LOG_FILE=/var/log/ssh-mcp/app.log
-export SSH_MCP_LOG_FORMAT=json
-
-./ssh-mcp --password=secret
-```
-
-### With SSH Key
-```bash
-./ssh-mcp \
-  --host=192.168.1.10 \
-  --user=agent \
-  --key=/home/agent/.ssh/id_rsa \
-  --log-level=debug
-```
 
 ## 📝 JSON Log Format
 
@@ -192,10 +148,7 @@ Add this to your `claude_desktop_config.json`:
         "--user=agent-nc",
         "--key=/path/to/private/key",
         "--timeout=30000",
-        "--maxChars=1000",
-        "--log-file=logs/ssh-mcp.log",
-        "--log-format=json",
-        "--log-rotation=daily"
+        "--maxChars=1000"
       ]
     }
   }

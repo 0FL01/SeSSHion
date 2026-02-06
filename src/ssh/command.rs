@@ -170,7 +170,12 @@ impl SshConnectionManager {
             command.to_string()
         };
 
-        debug!("Executing elevated command: {}", wrapped_cmd);
+        debug!(
+            "Executing elevated command: cmd_len={}, wrapped_len={}, timeout_wrapped={}",
+            command.len(),
+            wrapped_cmd.len(),
+            use_wrapper
+        );
 
         // Attempt #1: try to send command via existing su channel
         let mut channel = match self.try_take_su_channel().await {
@@ -562,7 +567,7 @@ impl SshConnectionManager {
             .await
             .map_err(|e| PreExecError::ChannelOpen(e.to_string()))?;
 
-        debug!("Executing command: {}", command);
+        debug!("Executing command: cmd_len={}", command.len());
         channel
             .exec(true, command)
             .await
@@ -635,7 +640,11 @@ impl SshConnectionManager {
             escaped_command
         );
 
-        debug!("Sending abort command: {}", abort_cmd);
+        debug!(
+            "Sending abort command: pattern_len={}, abort_len={}",
+            command.len(),
+            abort_cmd.len()
+        );
 
         if let Err(e) = channel.exec(true, abort_cmd.as_str()).await {
             error!("Failed to exec abort command: {}", e);

@@ -178,6 +178,49 @@ Execute a command with root privileges using `sudo`.
   - `log_path` (string, optional): Custom log path for background mode.
 - **Note**: This tool uses the `--sudo-password` provided at startup.
 
+### `transfer`
+Transfer a file or directory over SSH.
+
+- **Authentication**: key-only. If the server is configured to authenticate with a password, `transfer` returns an error (this tool does not support password auth).
+- **Local root**: all `local_path` values are interpreted relative to `local_root` (the server's current working directory at startup). Absolute paths, `..`, and paths that normalize to `.` are rejected.
+- **Remote path validation**: `remote_path` must be non-empty, must not contain control characters, must not have leading/trailing whitespace, must not contain NUL, and must not start with `-`.
+- **Transport**:
+  - `transport=auto`: attempts `sftp`, then `scp`, then falls back to `exec-raw` deterministically.
+  - `transport=sftp` / `transport=scp`: use local OpenSSH client binaries (`sftp` / `scp`).
+  - `transport=exec-raw`: uses streaming stdin/stdout over the existing SSH session (tar streaming for directories).
+  - **Note**: `sftp`/`scp` require the server to be started with a private key path (`--key=/path/to/key`). Password auth is not supported for `transfer`.
+
+**Directory transfer (tar)**
+
+- Directory transfers use a streamed POSIX `ustar` archive.
+- Each tar header is validated (ustar magic/version + checksum). Invalid archives are rejected.
+- Entry path rules:
+  - must be relative
+  - must be non-empty and must not normalize to `.`
+  - must not contain `..`
+- Supported entry types: regular files and directories only. Symlinks, device nodes, hardlinks, FIFOs, etc. are rejected.
+- Remote requirements: the remote host must provide `tar` (or `busybox tar`) in `PATH`.
+
+**Overwrite semantics**
+
+- `overwrite=true` (default)
+  - `put file`: stream to a staging file and `mv` into place.
+  - `get file`: stream to a local staging file and `rename` into place (best-effort replacement on platforms where rename does not replace).
+  - `put dir`: extract a streamed tar into a staging directory, then `mv` into place; if the destination existed it may be moved to a backup path during the swap.
+  - `get dir`: extract a streamed tar into a local staging directory, then swap into place via rename; if the destination existed it is first renamed to a sibling backup path.
+
+- `overwrite=false`
+  - `put file`: requires sibling staging and installs the final file via a hard-link (`ln`) to avoid replacement. This requires hard-link support on the remote filesystem; if unavailable the tool fails.
+  - `get file`: installs the final file via a local hard-link (`fs::hard_link`). This requires hard-link support on the local filesystem; if unavailable the tool fails.
+  - `put dir`: fails if the destination exists; creates the destination directory and extracts directly into it.
+  - `get dir`: fails if the destination exists; creates the destination directory and extracts directly into it.
+
+**Staging behavior (no /tmp)**
+
+- Remote staging prefers a sibling path under the destination parent for better atomicity.
+- If that location is not writable, `overwrite=true` operations fall back to `$HOME/.ssh-mcp/staging/<id>/...` and then move into place.
+- For `overwrite=false` file transfers, fallback staging is not allowed because the finalize step requires a sibling hard-link install; the tool fails if sibling staging is not writable.
+
 ### Monitoring Background Jobs
 When using `background=true` or when a command auto-detaches on timeout:
 - The response includes `{job_id, pid, log_path}` and a `hint` field with monitoring guidance.

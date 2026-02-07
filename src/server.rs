@@ -22,6 +22,7 @@ use crate::error::{Result, SshMcpError};
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
+use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
@@ -368,6 +369,8 @@ pub struct SshMcpServer {
 
     detach_mode: Arc<AtomicU8>,
     detach_mode_lock: Arc<Mutex<()>>,
+
+    transfer: TransferEngine,
 }
 
 impl SshMcpServer {
@@ -376,6 +379,8 @@ impl SshMcpServer {
     /// This sets up the SSH connection manager based on the provided configuration.
     /// Connection is not established until a tool is actually used.
     pub async fn new(config: Config) -> Result<Self> {
+        let local_root = std::env::current_dir()?;
+
         // Build SSH configuration
         let mut ssh_config = SshConfig::new(&config.host, &config.user).with_port(config.port);
 
@@ -419,6 +424,7 @@ impl SshMcpServer {
             max_chars,
             detach_mode: Arc::new(AtomicU8::new(DetachMode::Unknown.as_u8())),
             detach_mode_lock: Arc::new(Mutex::new(())),
+            transfer: TransferEngine::new(local_root),
         })
     }
 
@@ -1047,6 +1053,55 @@ impl SshMcpServer {
             "Shell command to execute with sudo on the remote SSH server",
         )
     }
+
+    fn transfer_tool() -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["put", "get"],
+                    "description": "put: local -> remote, get: remote -> local"
+                },
+                "local_path": {
+                    "type": "string",
+                    "description": "Local path relative to local_root. For put: local source path. For get: local destination path. Absolute paths, '..', and paths that normalize to '.' are rejected."
+                },
+                "remote_path": {
+                    "type": "string",
+                    "description": "For put: remote destination path. For get: remote source path. Paths starting with '-' or containing NUL are rejected."
+                },
+                 "transport": {
+                      "type": "string",
+                      "enum": ["auto", "exec-raw", "sftp", "scp"],
+                      "default": "auto",
+                      "description": "Transport selection. auto attempts SFTP, then SCP, then exec-raw (streaming) deterministically. sftp/scp require local OpenSSH binaries and a configured SSH key path (--key)."
+                  },
+                "kind": {
+                    "type": "string",
+                    "enum": ["file", "directory"],
+                    "description": "Optional explicit kind. If omitted, the server auto-detects (local metadata for put; remote probe for get)."
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Whether overwriting an existing destination is allowed. For file transfers, overwrite=false installs via hard-link and requires hard-link support on the destination filesystem (remote for put, local for get)."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional transfer timeout override in milliseconds."
+                }
+            },
+            "required": ["operation", "local_path", "remote_path"]
+        });
+
+        let schema_obj = schema.as_object().cloned().unwrap_or_default();
+        Tool::new(
+            "transfer",
+            "Transfer files or directories via SSH. auto attempts SFTP -> SCP -> exec-raw. Enforces key-only SSH auth (requires --key path) and local_root safety for both put and get.",
+            Arc::new(schema_obj),
+        )
+    }
 }
 
 impl SshMcpServer {
@@ -1078,6 +1133,45 @@ impl SshMcpServer {
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_sudo_command(command).await
     }
+
+    #[doc(hidden)]
+    pub async fn test_transfer(
+        &self,
+        params: crate::transfer::TransferParams,
+    ) -> crate::transfer::TransferResponse {
+        let timeout = params
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout);
+
+        let auth_key_only = self.config.password.is_none();
+        let key_path = self.config.key.clone();
+
+        if let Err(e) = self.connection.ensure_connected().await {
+            return crate::transfer::TransferResponse::error(
+                params,
+                self.transfer.local_root(),
+                &format!("SSH connection error: {e}"),
+            );
+        }
+
+        self.transfer
+            .run(
+                &self.connection,
+                params,
+                TransferRunContext {
+                    timeout,
+                    auth_key_only,
+                    ssh: TransferSshOptions {
+                        host: self.config.host.clone(),
+                        port: self.config.port,
+                        user: self.config.user.clone(),
+                        key_path,
+                    },
+                },
+            )
+            .await
+    }
 }
 
 impl ServerHandler for SshMcpServer {
@@ -1106,6 +1200,8 @@ impl ServerHandler for SshMcpServer {
         debug!("list_tools called");
 
         let mut tools = vec![Self::exec_tool()];
+
+        tools.push(Self::transfer_tool());
 
         // Add sudo-exec tool if enabled
         if !self.config.disable_sudo {
@@ -1251,6 +1347,56 @@ impl ServerHandler for SshMcpServer {
                     self.execute_sudo_command_with_timeout(&parsed.command, timeout)
                         .await
                 }
+            }
+            "transfer" => {
+                let params: TransferParams =
+                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
+                        McpError::invalid_params(format!("invalid transfer params: {e}"), None)
+                    })?;
+
+                let timeout = params
+                    .timeout_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(self.timeout);
+
+                // Transfer enforces key-only auth.
+                let auth_key_only = self.config.password.is_none();
+                let key_path = self.config.key.clone();
+
+                // Ensure connection is established (so errors are deterministic).
+                if let Err(e) = self.connection.ensure_connected().await {
+                    let resp = crate::transfer::TransferResponse::error(
+                        params,
+                        self.transfer.local_root(),
+                        &format!("SSH connection error: {e}"),
+                    );
+                    let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
+                        "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
+                    });
+                    return Ok(CallToolResult::success(vec![Content::text(body)]));
+                }
+
+                let resp = self
+                    .transfer
+                    .run(
+                        &self.connection,
+                        params,
+                        TransferRunContext {
+                            timeout,
+                            auth_key_only,
+                            ssh: TransferSshOptions {
+                                host: self.config.host.clone(),
+                                port: self.config.port,
+                                user: self.config.user.clone(),
+                                key_path,
+                            },
+                        },
+                    )
+                    .await;
+                let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
+                    "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
+                });
+                Ok(CallToolResult::success(vec![Content::text(body)]))
             }
             _ => Err(McpError::invalid_params(
                 format!("Unknown tool: {}", tool_name),

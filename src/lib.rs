@@ -36,6 +36,7 @@ pub mod logging;
 pub mod server;
 pub mod ssh;
 pub mod tools;
+pub mod transfer;
 
 // Re-exports for convenience
 pub use config::{Args, Config};

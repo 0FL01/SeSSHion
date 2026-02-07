@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use russh::ChannelMsg;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
@@ -25,6 +26,24 @@ pub struct CommandOutput {
     pub stderr: String,
 
     /// Exit code of the command (if available)
+    pub exit_code: Option<u32>,
+}
+
+/// Output from a raw streaming command execution.
+///
+/// This is intended for binary-safe stdin/stdout streaming (e.g. file transfer).
+#[derive(Debug, Clone, Default)]
+pub struct TransferRawOutput {
+    /// Total bytes written to remote stdout (as received).
+    pub stdout_bytes: u64,
+
+    /// Total bytes written to remote stdin.
+    pub stdin_bytes: u64,
+
+    /// Collected stderr (lossy UTF-8).
+    pub stderr: String,
+
+    /// Exit code of the remote command (if provided).
     pub exit_code: Option<u32>,
 }
 
@@ -666,6 +685,251 @@ impl SshConnectionManager {
 
         debug!("Abort command completed");
     }
+
+    /// Execute a command over SSH with binary-safe streaming.
+    ///
+    /// This method is designed for use-cases like file transfer where stdout must
+    /// be treated as bytes and forwarded to a sink without UTF-8 decoding.
+    ///
+    /// Notes:
+    /// - This does not use the interactive su shell.
+    /// - Timeouts are enforced locally via tokio timeout.
+    pub async fn exec_raw_streaming<R, W>(
+        &self,
+        command: &str,
+        mut stdin: Option<&mut R>,
+        mut stdout: Option<&mut W>,
+        timeout_duration: Duration,
+    ) -> Result<TransferRawOutput>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let _permit: OwnedSemaphorePermit = self
+            .channel_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| SshMcpError::connection(format!("Failed to acquire command slot: {e}")))?;
+
+        self.ensure_connected().await?;
+
+        // Raw transfers must not reuse the PTY/su channel.
+        let fut = async {
+            let channel = self.open_channel().await?;
+            channel
+                .exec(true, command)
+                .await
+                .map_err(|e| SshMcpError::connection(format!("Failed to exec command: {e}")))?;
+
+            // Prevent deadlocks by pumping stdin and stdout/stderr concurrently.
+            // stdin/stdout are borrowed, so we keep IO in this task and run the SSH channel
+            // event loop in a spawned task (owned channel).
+            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RawStreamEvent>(8);
+
+            let task_guard = JoinAbortGuard::new(tokio::spawn(async move {
+                raw_channel_task(channel, &mut stdin_rx, out_tx).await
+            }));
+
+            let mut output = TransferRawOutput::default();
+            let mut stdin_done = stdin.is_none();
+            let mut stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> =
+                if stdin_done { None } else { Some(stdin_tx) };
+            let mut channel_closed = false;
+
+            let mut buf = vec![0u8; 32 * 1024];
+
+            loop {
+                if stdin_done && channel_closed {
+                    break;
+                }
+
+                tokio::select! {
+                    read_res = async {
+                        match stdin.as_mut() {
+                            Some(r) => r.read(&mut buf).await,
+                            None => Ok(0),
+                        }
+                    }, if !stdin_done => {
+                        let n = read_res?;
+                        if n == 0 {
+                            stdin_done = true;
+                            stdin_tx = None; // drop -> EOF
+                        } else {
+                            let chunk = buf[..n].to_vec();
+                            match stdin_tx.as_mut() {
+                                Some(tx) => {
+                                    tx.send(chunk).await.map_err(|_| {
+                                        SshMcpError::connection("raw channel task ended while sending stdin".to_string())
+                                    })?;
+                                    output.stdin_bytes += n as u64;
+                                }
+                                None => {
+                                    return Err(SshMcpError::connection(
+                                        "raw stdin channel closed unexpectedly".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    maybe_evt = out_rx.recv() => {
+                        match maybe_evt {
+                            Some(RawStreamEvent::Stdout(data)) => {
+                                output.stdout_bytes += data.len() as u64;
+                                if let Some(writer) = stdout.as_mut() {
+                                    writer.write_all(&data).await?;
+                                }
+                            }
+                            Some(RawStreamEvent::Stderr(data)) => {
+                                output.stderr.push_str(&String::from_utf8_lossy(&data));
+                            }
+                            Some(RawStreamEvent::ExitStatus(code)) => {
+                                output.exit_code = Some(code);
+                            }
+                            Some(RawStreamEvent::Closed) => {
+                                channel_closed = true;
+                            }
+                            None => {
+                                channel_closed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(writer) = stdout.as_mut() {
+                writer.flush().await?;
+            }
+
+            let join_handle = match task_guard.into_handle() {
+                Some(h) => h,
+                None => {
+                    return Err(SshMcpError::connection(
+                        "raw channel task handle missing".to_string(),
+                    ));
+                }
+            };
+
+            match join_handle.await {
+                Ok(Ok(())) => Ok(output),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(SshMcpError::connection(format!(
+                    "raw channel task join failed: {e}"
+                ))),
+            }
+        };
+
+        match timeout(timeout_duration, fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                self.invalidate_session("raw command timed out").await;
+                Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RawStreamEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ExitStatus(u32),
+    Closed,
+}
+
+struct JoinAbortGuard<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> JoinAbortGuard<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn into_handle(mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.handle.take()
+    }
+}
+
+impl<T> Drop for JoinAbortGuard<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+async fn raw_channel_task(
+    mut channel: russh::Channel<russh::client::Msg>,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    out_tx: tokio::sync::mpsc::Sender<RawStreamEvent>,
+) -> Result<()> {
+    let mut stdin_closed = false;
+    loop {
+        tokio::select! {
+            maybe_chunk = stdin_rx.recv(), if !stdin_closed => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                        channel.data(chunk.as_slice()).await.map_err(|e| {
+                            SshMcpError::connection(format!("Failed to send stdin: {e}"))
+                        })?;
+                    }
+                    None => {
+                        stdin_closed = true;
+                        let _ = channel.eof().await;
+                    }
+                }
+            }
+            maybe_msg = channel.wait() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        let send_evt = |evt: RawStreamEvent| async {
+                            out_tx.send(evt).await.map_err(|_| ())
+                        };
+
+                        match msg {
+                            ChannelMsg::Data { data } => {
+                                let bytes = data.as_ref().to_vec();
+                                if send_evt(RawStreamEvent::Stdout(bytes)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            ChannelMsg::ExtendedData { data, ext } => {
+                                let bytes = data.as_ref().to_vec();
+                                let evt = if ext == 1 {
+                                    RawStreamEvent::Stderr(bytes)
+                                } else {
+                                    RawStreamEvent::Stdout(bytes)
+                                };
+                                if send_evt(evt).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            ChannelMsg::ExitStatus { exit_status } => {
+                                if send_evt(RawStreamEvent::ExitStatus(exit_status)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            ChannelMsg::Close | ChannelMsg::Eof => {
+                                let _ = send_evt(RawStreamEvent::Closed).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        let _ = out_tx.send(RawStreamEvent::Closed).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

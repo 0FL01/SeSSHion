@@ -63,10 +63,16 @@ async fn main() -> Result<()> {
             _ = async {
                 #[cfg(unix)]
                 {
-                    let mut sigterm = tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::terminate()
-                    ).expect("Failed to register SIGTERM handler");
-                    sigterm.recv().await;
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(mut sigterm) => {
+                            sigterm.recv().await;
+                        }
+                        Err(e) => {
+                            error!("Failed to register SIGTERM handler: {}", e);
+                            std::future::pending::<()>().await;
+                        }
+                    }
                 }
                 #[cfg(not(unix))]
                 {

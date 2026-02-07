@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use russh::Channel;
 use russh::client::{self, Handle};
-use russh::keys::PrivateKeyWithHashAlg;
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -236,31 +236,49 @@ impl SshConnectionManager {
             );
 
             // Parse the private key using russh::keys
-            let key = russh::keys::PrivateKey::from_openssh(key_content.as_bytes())
-                .map_err(|e| SshMcpError::SshKey(format!("Failed to parse private key: {}", e)))?;
+            let key = Arc::new(
+                russh::keys::PrivateKey::from_openssh(key_content.as_bytes()).map_err(|e| {
+                    SshMcpError::SshKey(format!("Failed to parse private key: {}", e))
+                })?,
+            );
 
-            // Wrap in PrivateKeyWithHashAlg (None for non-RSA or default hash)
-            let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-
-            let auth_result = timeout(
-                Duration::from_secs(AUTH_TIMEOUT_SECS),
-                session.authenticate_publickey(&self.config.username, key_with_alg),
-            )
-            .await
-            .map_err(|_| {
-                SshMcpError::auth(format!(
-                    "Authentication timed out after {}s",
-                    AUTH_TIMEOUT_SECS
-                ))
-            })?
-            .map_err(|e| SshMcpError::auth(e.to_string()))?;
-
-            if auth_result.success() {
-                info!("Key authentication successful");
-                return Ok(());
+            // For RSA, try modern rsa-sha2-256/512 first, then legacy ssh-rsa (SHA-1) as fallback.
+            // For non-RSA keys, the hash algorithm is ignored by russh.
+            let hash_attempts: &[Option<HashAlg>] = if key.algorithm().is_rsa() {
+                &[Some(HashAlg::Sha256), Some(HashAlg::Sha512), None]
             } else {
-                return Err(SshMcpError::auth("Key authentication rejected"));
+                &[None]
+            };
+
+            for hash_alg in hash_attempts {
+                debug!(
+                    alg = %key.algorithm(),
+                    ?hash_alg,
+                    "Attempting publickey authentication"
+                );
+
+                let key_with_alg = PrivateKeyWithHashAlg::new(Arc::clone(&key), *hash_alg);
+
+                let auth_result = timeout(
+                    Duration::from_secs(AUTH_TIMEOUT_SECS),
+                    session.authenticate_publickey(&self.config.username, key_with_alg),
+                )
+                .await
+                .map_err(|_| {
+                    SshMcpError::auth(format!(
+                        "Authentication timed out after {}s",
+                        AUTH_TIMEOUT_SECS
+                    ))
+                })?
+                .map_err(|e| SshMcpError::auth(e.to_string()))?;
+
+                if auth_result.success() {
+                    info!("Key authentication successful");
+                    return Ok(());
+                }
             }
+
+            return Err(SshMcpError::auth("Key authentication rejected"));
         }
 
         Err(SshMcpError::auth(

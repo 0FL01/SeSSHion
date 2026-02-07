@@ -1144,7 +1144,6 @@ impl SshMcpServer {
             .map(Duration::from_millis)
             .unwrap_or(self.timeout);
 
-        let auth_key_only = self.config.password.is_none();
         let key_path = self.config.key.clone();
 
         if let Err(e) = self.connection.ensure_connected().await {
@@ -1161,7 +1160,6 @@ impl SshMcpServer {
                 params,
                 TransferRunContext {
                     timeout,
-                    auth_key_only,
                     ssh: TransferSshOptions {
                         host: self.config.host.clone(),
                         port: self.config.port,
@@ -1359,8 +1357,6 @@ impl ServerHandler for SshMcpServer {
                     .map(Duration::from_millis)
                     .unwrap_or(self.timeout);
 
-                // Transfer enforces key-only auth.
-                let auth_key_only = self.config.password.is_none();
                 let key_path = self.config.key.clone();
 
                 // Ensure connection is established (so errors are deterministic).
@@ -1383,7 +1379,6 @@ impl ServerHandler for SshMcpServer {
                         params,
                         TransferRunContext {
                             timeout,
-                            auth_key_only,
                             ssh: TransferSshOptions {
                                 host: self.config.host.clone(),
                                 port: self.config.port,

@@ -41,7 +41,7 @@ struct StepCtx<'a> {
 struct OpenSshContext<'a> {
     conn: &'a SshConnectionManager,
     remote_home: &'a str,
-    key_path: &'a Path,
+    key_path: Option<&'a Path>,
     ssh: &'a TransferSshOptions,
     id: u64,
     timeout: Duration,
@@ -66,7 +66,6 @@ pub struct TransferEngine {
 #[derive(Clone, Debug)]
 pub struct TransferRunContext {
     pub timeout: Duration,
-    pub auth_key_only: bool,
     pub ssh: TransferSshOptions,
 }
 
@@ -100,24 +99,7 @@ impl TransferEngine {
         params: TransferParams,
         ctx: TransferRunContext,
     ) -> TransferResponse {
-        if !ctx.auth_key_only {
-            return TransferResponse::error(
-                params,
-                self.local_root(),
-                "transfer requires SSH key authentication (password auth is not supported for this tool)",
-            );
-        }
-
-        let key_path = match ctx.ssh.key_path.clone() {
-            Some(p) => p,
-            None => {
-                return TransferResponse::error(
-                    params,
-                    self.local_root(),
-                    "transfer requires a configured SSH private key path (start the server with --key=/path/to/private_key)",
-                );
-            }
-        };
+        let key_path_opt = ctx.ssh.key_path.clone();
 
         let started_at = Instant::now();
         let id = self.next_id();
@@ -176,7 +158,7 @@ impl TransferEngine {
                         OpenSshContext {
                             conn,
                             remote_home: &remote_home,
-                            key_path: &key_path,
+                            key_path: key_path_opt.as_deref(),
                             ssh: &ctx.ssh,
                             id,
                             timeout: ctx.timeout,
@@ -194,7 +176,7 @@ impl TransferEngine {
                         OpenSshContext {
                             conn,
                             remote_home: &remote_home,
-                            key_path: &key_path,
+                            key_path: key_path_opt.as_deref(),
                             ssh: &ctx.ssh,
                             id,
                             timeout: ctx.timeout,
@@ -385,6 +367,19 @@ impl TransferEngine {
         ctx: OpenSshContext<'_>,
         op: OpenSshOperation<'_>,
     ) -> std::result::Result<(), TransportAttemptError> {
+        let key_path = match ctx.key_path {
+            Some(p) => p,
+            None => {
+                return Err(TransportAttemptError::Unsupported {
+                    transport: match op.transport {
+                        openssh::OpenSshTransport::Sftp => TransferTransport::Sftp,
+                        openssh::OpenSshTransport::Scp => TransferTransport::Scp,
+                    },
+                    reason: "SSH key required for OpenSSH transports (sftp/scp)".to_string(),
+                });
+            }
+        };
+
         let kind = op.kind;
         let response = op.response;
 
@@ -428,7 +423,7 @@ impl TransferEngine {
             host: ctx.ssh.host.clone(),
             port: ctx.ssh.port,
             user: ctx.ssh.user.clone(),
-            key_path: ctx.key_path.to_path_buf(),
+            key_path: key_path.to_path_buf(),
         };
 
         let overwrite = response.params.overwrite;

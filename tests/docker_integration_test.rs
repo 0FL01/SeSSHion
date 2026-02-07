@@ -105,9 +105,9 @@ async fn test_mcp_tools_with_docker() {
     tracing::info!("exec tool verified: whoami returned 'test'");
 
     // 4b. Foreground timeout should auto-detach without killing remote command.
-    // We use a small timeout to force the detach path.
+    // We use a small timeout (>= 1s) to force the detach path.
     let timeout_result = server
-        .test_execute_command_with_timeout_ms("sleep 2; echo done", 200)
+        .test_execute_command_with_timeout_ms("sleep 2; echo done", 1100)
         .await
         .expect("exec command with timeout override failed");
 
@@ -150,7 +150,7 @@ async fn test_mcp_tools_with_docker() {
         }
 
         let log_result = server
-            .test_execute_command(&format!("cat -- '{}'", log_path))
+            .test_execute_command(&format!("cat < '{}'", log_path))
             .await
             .expect("failed to read detached job log");
         let log_text = extract_text_from_result(&log_result);

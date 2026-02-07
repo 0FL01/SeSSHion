@@ -41,7 +41,7 @@ fn test_escape_for_timeout_wrapper() {
         escape_for_timeout_wrapper("echo 'hello'"),
         "echo '\"'\"'hello'\"'\"'"
     );
-    assert_eq!(escape_for_timeout_wrapper(r"echo \$HOME"), r"echo \\$HOME");
+    assert_eq!(escape_for_timeout_wrapper(r"echo \$HOME"), r"echo \$HOME");
     assert_eq!(escape_for_timeout_wrapper("echo `date`"), "echo `date`");
 }
 

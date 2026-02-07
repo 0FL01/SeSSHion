@@ -94,10 +94,6 @@ pub fn escape_command_for_shell(command: &str) -> String {
 /// This function escapes characters that would break out of single quotes
 /// when used inside the timeout wrapper: `timeout -k 2s 10s sh -lc '{cmd}'`
 ///
-/// The escaping order is important:
-/// 1. First escape backslashes (so `\$HOME` becomes `\\$HOME`)
-/// 2. Then escape single quotes (so `'` becomes `'"'"'`)
-///
 /// # Arguments
 /// * `command` - The raw command string
 ///
@@ -115,13 +111,12 @@ pub fn escape_command_for_shell(command: &str) -> String {
 /// assert_eq!(escape_for_timeout_wrapper("echo 'hello'"), "echo '\"'\"'hello'\"'\"'");
 ///
 /// // Command with backslashes
-/// assert_eq!(escape_for_timeout_wrapper(r"echo \$HOME"), r"echo \\$HOME");
+/// assert_eq!(escape_for_timeout_wrapper(r"echo \$HOME"), r"echo \$HOME");
 /// ```
 pub fn escape_for_timeout_wrapper(command: &str) -> String {
-    // First escape backslashes, then single quotes
-    // This order is important: we need to preserve backslash escaping
-    // for the shell while also escaping single quotes
-    escape_single_quotes(&command.replace('\\', "\\\\"))
+    // The command is placed inside single quotes, so backslashes are already preserved.
+    // We only need to escape single quotes to keep the wrapper syntax valid.
+    escape_single_quotes(command)
 }
 
 #[cfg(test)]
@@ -253,7 +248,7 @@ mod tests {
     #[test]
     fn test_escape_for_timeout_wrapper_with_backslashes() {
         let escaped = escape_for_timeout_wrapper("echo \\$HOME");
-        assert_eq!(escaped, "echo \\\\$HOME");
+        assert_eq!(escaped, "echo \\$HOME");
     }
 
     #[test]

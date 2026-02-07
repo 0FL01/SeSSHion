@@ -14,6 +14,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 - **Auto-Reconnect**: Automatically restores the connection if it drops.
 - **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.
 - **Sudo Integration**: Provides a `sudo-exec` tool with password wrapping.
+- **File Transfer**: Upload/download files and directories via SFTP, SCP, or streaming (works with both key and password auth).
 - **Command Sanitization**: Built-in safety checks for command inputs.
 - **Output Control**: Configurable output length limits to prevent token overflow.
 - **Cross-Platform**: Compiled binary runs on any system with SSH access.
@@ -137,6 +138,7 @@ tail -f "/var/log/ssh-mcp/app.log.$(date +%Y-%m-%d)" | jq
 
 Add this to your `claude_desktop_config.json`:
 
+**With SSH key (recommended for best transfer performance):**
 ```json
 {
   "mcpServers": {
@@ -147,6 +149,25 @@ Add this to your `claude_desktop_config.json`:
         "--port=22",
         "--user=agent-nc",
         "--key=/path/to/private/key",
+        "--timeout=30000",
+        "--maxChars=1000"
+      ]
+    }
+  }
+}
+```
+
+**With password (file transfer uses exec-raw transport):**
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "/absolute/path/to/ssh-mcp",
+      "args": [
+        "--host=192.168.1.10",
+        "--port=22",
+        "--user=agent-nc",
+        "--password=your-password",
         "--timeout=30000",
         "--maxChars=1000"
       ]
@@ -181,14 +202,14 @@ Execute a command with root privileges using `sudo`.
 ### `transfer`
 Transfer a file or directory over SSH.
 
-- **Authentication**: key-only. If the server is configured to authenticate with a password, `transfer` returns an error (this tool does not support password auth).
+- **Authentication**: Supports both SSH key and password authentication. When using password auth, the `exec-raw` transport is used automatically.
 - **Local root**: all `local_path` values are interpreted relative to `local_root` (the server's current working directory at startup). Absolute paths, `..`, and paths that normalize to `.` are rejected.
 - **Remote path validation**: `remote_path` must be non-empty, must not contain control characters, must not have leading/trailing whitespace, must not contain NUL, and must not start with `-`.
 - **Transport**:
   - `transport=auto`: attempts `sftp`, then `scp`, then falls back to `exec-raw` deterministically.
   - `transport=sftp` / `transport=scp`: use local OpenSSH client binaries (`sftp` / `scp`).
   - `transport=exec-raw`: uses streaming stdin/stdout over the existing SSH session (tar streaming for directories).
-  - **Note**: `sftp`/`scp` require the server to be started with a private key path (`--key=/path/to/key`). Password auth is not supported for `transfer`.
+  - **Note**: `sftp`/`scp` transports require the server to be started with a private key path (`--key=/path/to/key`). When using password authentication, the `exec-raw` transport is used automatically (streaming over the existing SSH session).
 
 **Directory transfer (tar)**
 

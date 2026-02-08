@@ -489,7 +489,7 @@ pub async fn get_dir_exec_raw(
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 return Err(SshMcpError::invalid_params(
-                    "local destination exists and overwrite=false",
+                    "local destination exists and overwrite=false. Use overwrite=true to replace it.",
                 ));
             }
             Err(e) => return Err(SshMcpError::Io(e)),
@@ -599,7 +599,7 @@ fn ensure_remote_success(what: &str, out: &TransferRawOutput) -> Result<()> {
                 match err.trim() {
                     "destination_exists" => {
                         return Err(SshMcpError::invalid_params(
-                            "destination exists and overwrite=false",
+                            "destination exists and overwrite=false. Use overwrite=true to replace it.",
                         ));
                     }
                     "destination_is_directory" => {
@@ -737,7 +737,7 @@ pub(crate) async fn atomic_install_file_overwrite_false(
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(staging).await;
             Err(SshMcpError::invalid_params(
-                "local destination exists and overwrite=false",
+                "local destination exists and overwrite=false. Use overwrite=true to replace it.",
             ))
         }
         Err(e) if e.kind() == ErrorKind::Unsupported => {

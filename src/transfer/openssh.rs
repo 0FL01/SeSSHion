@@ -332,7 +332,7 @@ fn ensure_remote_exec_success(what: &str, out: &crate::ssh::CommandOutput) -> Re
                 match err.trim() {
                     "destination_exists" => {
                         return Err(SshMcpError::invalid_params(
-                            "destination exists and overwrite=false",
+                            "destination exists and overwrite=false. Use overwrite=true to replace it.",
                         ));
                     }
                     "destination_is_directory" => {
@@ -877,7 +877,9 @@ async fn get_dir(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(super::TransportAttemptError::Other(
-                    SshMcpError::invalid_params("local destination exists and overwrite=false"),
+                    SshMcpError::invalid_params(
+                        "local destination exists and overwrite=false. Use overwrite=true to replace it.",
+                    ),
                 ));
             }
             Err(e) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),

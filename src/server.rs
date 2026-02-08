@@ -422,7 +422,7 @@ PARAMETERS:
 - remote_path (string, required): Absolute remote path
 - transport (string): "auto" (default), "sftp", "scp", or "exec-raw"
 - kind (string): "file" or "directory" (auto-detected if omitted)
-- overwrite (boolean): Allow overwriting destination (default: true)
+- overwrite (boolean): Allow overwriting destination (default: false)
 - timeout_ms (integer): Transfer timeout override
 
 TRANSPORTS:
@@ -1142,7 +1142,7 @@ impl SshMcpServer {
                 },
                 "overwrite": {
                     "type": "boolean",
-                    "default": true
+                    "default": false
                 },
                 "timeout_ms": {
                     "type": "integer"

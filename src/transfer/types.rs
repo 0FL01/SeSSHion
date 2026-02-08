@@ -71,7 +71,7 @@ fn default_transport() -> TransferTransport {
 }
 
 fn default_overwrite() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

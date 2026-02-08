@@ -737,11 +737,12 @@ impl SshConnectionManager {
             let mut stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> =
                 if stdin_done { None } else { Some(stdin_tx) };
             let mut channel_closed = false;
+            let mut out_rx_closed = false;
 
             let mut buf = vec![0u8; 32 * 1024];
 
             loop {
-                if stdin_done && channel_closed {
+                if stdin_done && channel_closed && out_rx_closed {
                     break;
                 }
 
@@ -791,7 +792,7 @@ impl SshConnectionManager {
                                 channel_closed = true;
                             }
                             None => {
-                                channel_closed = true;
+                                out_rx_closed = true;
                             }
                         }
                     }

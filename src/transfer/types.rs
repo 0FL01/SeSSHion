@@ -16,6 +16,7 @@ pub enum TransferTransport {
     ExecRaw,
     Sftp,
     Scp,
+    Rsync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,41 @@ pub enum TransferTransport {
 pub enum TransferKind {
     File,
     Directory,
+}
+
+/// Rsync-specific options for fine-tuning transfer behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RsyncOptions {
+    /// Verify file integrity using checksums after transfer (deterministic, safe).
+    #[serde(default = "default_true")]
+    pub checksum: bool,
+    /// Compress data during transfer (optional optimization).
+    #[serde(default = "default_false")]
+    pub compress: bool,
+    /// Delete files on destination not present on source (potentially dangerous).
+    #[serde(default = "default_false")]
+    pub delete: bool,
+    /// Update destination files in-place (safe and efficient).
+    #[serde(default = "default_true")]
+    pub inplace: bool,
+    /// Keep partially transferred files for resume (safe, enables resume).
+    #[serde(default = "default_true")]
+    pub partial: bool,
+    /// Bandwidth limit in KB/s (optional, None means unlimited).
+    pub bwlimit: Option<u32>,
+}
+
+impl Default for RsyncOptions {
+    fn default() -> Self {
+        Self {
+            checksum: true,
+            compress: false,
+            delete: false,
+            inplace: true,
+            partial: true,
+            bwlimit: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +100,18 @@ pub struct TransferParams {
     /// When false or omitted, return compact response with only essential fields.
     #[serde(default)]
     pub verbose: bool,
+
+    /// Rsync-specific options. Only used when transport is `Rsync`.
+    #[serde(default)]
+    pub rsync_options: RsyncOptions,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_transport() -> TransferTransport {
@@ -72,6 +120,22 @@ fn default_transport() -> TransferTransport {
 
 fn default_overwrite() -> bool {
     false
+}
+
+impl Default for TransferParams {
+    fn default() -> Self {
+        Self {
+            operation: TransferOperation::Put,
+            local_path: String::new(),
+            remote_path: String::new(),
+            transport: default_transport(),
+            kind: None,
+            overwrite: default_overwrite(),
+            timeout_ms: None,
+            verbose: false,
+            rsync_options: RsyncOptions::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

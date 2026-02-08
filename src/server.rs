@@ -420,14 +420,14 @@ PARAMETERS:
 - operation (string, required): "put" (local→remote) or "get" (remote→local)
 - local_path (string, required): Local file path (relative to local_root or absolute path within local_root)
 - remote_path (string, required): Absolute remote path
-- transport (string): "auto" (default), "sftp", "scp", or "exec-raw"
+- transport (string): "auto" (default), "sftp", "scp", "rsync", or "exec-raw"
 - kind (string): "file" or "directory" (auto-detected if omitted)
 - overwrite (boolean): Allow overwriting destination (default: false)
 - timeout_ms (integer): Transfer timeout override
 
 TRANSPORTS:
-- auto: Tries sftp → scp → exec-raw in order
-- sftp/scp: Require local OpenSSH binaries and --key
+- auto: Tries rsync → sftp → scp → exec-raw in order
+- sftp/scp/rsync: Require local OpenSSH binaries and --key
 - exec-raw: Streaming via SSH exec (no OpenSSH needed)
 
 SAFETY:
@@ -1133,8 +1133,9 @@ impl SshMcpServer {
                 },
                 "transport": {
                     "type": "string",
-                    "enum": ["auto", "exec-raw", "sftp", "scp"],
-                    "default": "auto"
+                    "enum": ["auto", "exec-raw", "sftp", "scp", "rsync"],
+                    "default": "auto",
+                    "description": "Transfer method: auto (fallback chain), sftp/scp/rsync (need --key), exec-raw (pure SSH)"
                 },
                 "kind": {
                     "type": "string",
@@ -1154,7 +1155,7 @@ impl SshMcpServer {
         let schema_obj = schema.as_object().cloned().unwrap_or_default();
         Tool::new(
             "transfer",
-            "Transfer files via SSH (put/get). Requires --key for sftp/scp.",
+            "Transfer files via SSH. Supports: auto/sftp/scp/rsync/exec-raw. Requires --key for sftp/scp/rsync.",
             Arc::new(schema_obj),
         )
     }

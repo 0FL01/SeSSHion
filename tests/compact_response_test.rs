@@ -21,6 +21,7 @@ fn sample_params() -> TransferParams {
         overwrite: true,
         timeout_ms: Some(30000),
         verbose: false,
+        ..Default::default()
     }
 }
 

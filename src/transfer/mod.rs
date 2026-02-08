@@ -9,13 +9,14 @@
 mod exec_raw;
 mod local_root;
 mod openssh;
+mod rsync;
 mod tar;
 mod types;
 
 pub use types::{
-    CompactTransferResponse, ResolvedPaths, StagingLocal, StagingRemote, TransferCounts,
-    TransferKind, TransferOperation, TransferParams, TransferResponse, TransferStaging,
-    TransferTransport,
+    CompactTransferResponse, ResolvedPaths, RsyncOptions, StagingLocal, StagingRemote,
+    TransferCounts, TransferKind, TransferOperation, TransferParams, TransferResponse,
+    TransferStaging, TransferTransport,
 };
 
 use std::path::{Path, PathBuf};
@@ -136,9 +137,10 @@ impl TransferEngine {
         let transports = match response.params.transport {
             TransferTransport::Auto => {
                 vec![
-                    TransferTransport::Sftp,
-                    TransferTransport::Scp,
-                    TransferTransport::ExecRaw,
+                    TransferTransport::Rsync,   // Try rsync first (most efficient)
+                    TransferTransport::Sftp,    // Fallback to sftp
+                    TransferTransport::Scp,     // Fallback to scp
+                    TransferTransport::ExecRaw, // Last resort
                 ]
             }
             other => vec![other],
@@ -193,6 +195,21 @@ impl TransferEngine {
                     Err(TransportAttemptError::Other(SshMcpError::connection(
                         "internal error: transport=auto should have been expanded",
                     )))
+                }
+                TransferTransport::Rsync => {
+                    self.run_rsync(
+                        OpenSshContext {
+                            conn,
+                            remote_home: &remote_home,
+                            key_path: key_path_opt.as_deref(),
+                            ssh: &ctx.ssh,
+                            id,
+                            timeout: ctx.timeout,
+                        },
+                        kind,
+                        &mut response,
+                    )
+                    .await
                 }
             };
 
@@ -443,6 +460,84 @@ impl TransferEngine {
         };
 
         let (staging, counts) = openssh::run_transfer(endpoint, openssh_args).await?;
+        response.staging = Some(staging);
+        response.counts = Some(counts);
+        if kind == TransferKind::Directory {
+            response.semantics = Some(match operation {
+                TransferOperation::Put => "directory transfer stages into a sibling temp dir under the remote destination parent when possible for atomic rename; if that staging location is not writable it falls back to $HOME/.ssh-mcp/staging and then moves into place; if the destination existed, it may be moved aside to a backup path which is removed on success (backup may remain if swap fails)".to_string(),
+                TransferOperation::Get => "directory transfer writes into a sibling staging dir under local_root, then swaps into place via rename; local_path must not normalize to '.'; if the destination existed, it is first renamed to a sibling backup path and removed after the swap (backup may remain if swap fails)".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn run_rsync(
+        &self,
+        ctx: OpenSshContext<'_>,
+        kind: TransferKind,
+        response: &mut TransferResponse,
+    ) -> std::result::Result<(), TransportAttemptError> {
+        let resolved = self
+            .resolve_and_validate_local_paths(&response.params, kind)
+            .await
+            .map_err(TransportAttemptError::Other)?;
+        response.resolved_paths = Some(resolved.clone());
+
+        // If the client explicitly provided a kind for get, validate the remote path kind
+        // before invoking rsync.
+        let (operation, remote_path, kind_override) = {
+            let params = &response.params;
+            (params.operation, params.remote_path.clone(), params.kind)
+        };
+
+        if matches!(operation, TransferOperation::Get) && kind_override.is_some() {
+            let remote_kind = exec_raw::probe_remote_kind(exec_raw::ProbeRemoteKindArgs {
+                ctx: exec_raw::ExecRawCtx {
+                    conn: ctx.conn,
+                    id: ctx.id,
+                    timeout: ctx.timeout,
+                },
+                remote_path: &remote_path,
+            })
+            .await
+            .map_err(TransportAttemptError::Other)?;
+
+            if remote_kind != kind {
+                let msg = match kind {
+                    TransferKind::File => "remote_path is not a file",
+                    TransferKind::Directory => "remote_path is not a directory",
+                };
+                return Err(TransportAttemptError::Other(SshMcpError::invalid_params(
+                    msg,
+                )));
+            }
+        }
+
+        let endpoint = rsync::RsyncEndpoint {
+            host: ctx.ssh.host.clone(),
+            port: ctx.ssh.port,
+            user: ctx.ssh.user.clone(),
+            key_path: ctx.key_path.map(|p| p.to_path_buf()),
+        };
+
+        let overwrite = response.params.overwrite;
+        let rsync_options = response.params.rsync_options.clone();
+
+        let rsync_args = rsync::RsyncTransferArgs {
+            conn: ctx.conn,
+            remote_home: ctx.remote_home,
+            local_root: self.local_root(),
+            id: ctx.id,
+            timeout: ctx.timeout,
+            operation,
+            kind,
+            local_path: &resolved.local_path,
+            remote_path: &remote_path,
+            overwrite,
+            rsync_options,
+        };
+
+        let (staging, counts) = rsync::run_transfer(endpoint, rsync_args).await?;
         response.staging = Some(staging);
         response.counts = Some(counts);
         if kind == TransferKind::Directory {

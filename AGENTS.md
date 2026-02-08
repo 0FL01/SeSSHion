@@ -2,15 +2,6 @@
 
 A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server. This tool enables AI models to securely interact with remote Linux systems via SSH, providing persistent connections, command execution, and root elevation capabilities.
 
-## Available MCP Tools (ONLY FOR TESTING)
-
-This server provides the following tools for AI agents:
-
-- **`ssh-test-env_exec`** - Execute shell commands on the remote SSH server
-- **`ssh-test-env_sudo-exec`** - Execute shell commands with sudo privileges (if passwordless sudo is configured)
-
-> **Note:** These MCP tools are intended for testing the SSH MCP server binary itself. Do not use them unless explicitly requested.
-
 ## Repository Structure
 
 ```text
@@ -26,9 +17,17 @@ This server provides the following tools for AI agents:
 │   └── russh-library.md  # Notes on the underlying SSH library (russh)
 ├── tests/                # Integration and functional tests
 │   ├── integration_test.rs       # Command formatting and connection logic tests
-│   ├── docker_integration_test.rs # Full E2E tests using Docker containers
-│   │                               # Covers: Alpine/BusyBox + Debian/GNU tar environments
 │   ├── logging_test.rs           # Logging configuration and initialization tests
+│   ├── docker_integration/       # Modular E2E tests using Docker containers
+│   │   ├── mod.rs                # Module exports
+│   │   ├── common.rs             # Shared test utilities and helpers
+│   │   ├── exec_raw_tests.rs     # ExecRaw transport tests
+│   │   ├── sftp_tests.rs         # SFTP transport tests
+│   │   ├── scp_tests.rs          # SCP transport tests
+│   │   ├── rsync_tests.rs        # Rsync transport tests
+│   │   ├── overwrite_tests.rs    # File overwrite behavior tests
+│   │   ├── fallback_tests.rs     # Transport fallback chain tests
+│   │   └── auth_tests.rs         # Authentication method tests
 │   └── fixtures/                 # Test fixtures and Docker images
 │       └── debian-sshd/          # Custom Debian SSHD image for E2E tests
 │           ├── Dockerfile        # Lightweight debian:trixie-slim with GNU tar
@@ -55,6 +54,7 @@ This server provides the following tools for AI agents:
 │       ├── exec_raw.rs         # Raw command execution for transfers
 │       ├── openssh.rs          # OpenSSH compatibility layer
 │       ├── tar.rs              # TAR archive operations
+│       ├── rsync.rs            # Rsync transfer implementation with delta sync support
 │       ├── types.rs            # Transfer type definitions
 │       └── local_root.rs       # Local filesystem root operations
 ```

@@ -26,7 +26,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 | **RAM (RSS)** | ~82.5 MB | ~5.4 MB | **~15x more efficient** |
 | **CPU Time (Start)** | 0.55s | 0.01s | **Near-zero overhead** |
 | **Response Speed** | Instant | Instant | Limited by SSH latency |
-| **Context Usage** | ~800 tokens | ~50 tokens | **~16x more efficient** (compact tool definitions) |
+| **Context Usage** | ~800 tokens | ~500 tokens | **~1.6x more efficient** (compact tool definitions) |
 
 ### 🛠️ Test Methodology
 

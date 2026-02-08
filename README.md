@@ -26,7 +26,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 | **RAM (RSS)** | ~82.5 MB | ~5.4 MB | **~15x more efficient** |
 | **CPU Time (Start)** | 0.55s | 0.01s | **Near-zero overhead** |
 | **Response Speed** | Instant | Instant | Limited by SSH latency |
-| **Context Usage** | ~800 tokens | ~800 tokens | Fixed server schema overhead |
+| **Context Usage** | ~800 tokens | ~50 tokens | **~16x more efficient** (compact tool definitions) |
 
 ### 🛠️ Test Methodology
 
@@ -203,7 +203,7 @@ Execute a command with root privileges using `sudo`.
 Transfer a file or directory over SSH.
 
 - **Authentication**: Supports both SSH key and password authentication. When using password auth, the `exec-raw` transport is used automatically.
-- **Local root**: all `local_path` values are interpreted relative to `local_root` (the server's current working directory at startup). Absolute paths, `..`, and paths that normalize to `.` are rejected.
+- **Local root**: `local_path` can be relative to `local_root` (the server's current working directory at startup) or an absolute path within `local_root`. Paths outside `local_root`, `..` components, and paths that normalize to `.` are rejected.
 - **Remote path validation**: `remote_path` must be non-empty, must not contain control characters, must not have leading/trailing whitespace, must not contain NUL, and must not start with `-`.
 - **Transport**:
   - `transport=auto`: attempts `sftp`, then `scp`, then falls back to `exec-raw` deterministically.
@@ -224,17 +224,17 @@ Transfer a file or directory over SSH.
 
 **Overwrite semantics**
 
-- `overwrite=true` (default)
+- `overwrite=false` (default - safer)
+  - `put file`: requires sibling staging and installs the final file via a hard-link (`ln`) to avoid replacement. This requires hard-link support on the remote filesystem; if unavailable the tool fails with an error suggesting to use `overwrite=true`.
+  - `get file`: installs the final file via a local hard-link (`fs::hard_link`). This requires hard-link support on the local filesystem; if unavailable the tool fails with an error suggesting to use `overwrite=true`.
+  - `put dir`: fails if the destination exists with a clear error message; use `overwrite=true` to replace existing directories.
+  - `get dir`: fails if the destination exists with a clear error message; use `overwrite=true` to replace existing directories.
+
+- `overwrite=true` (explicit opt-in for replacement)
   - `put file`: stream to a staging file and `mv` into place.
   - `get file`: stream to a local staging file and `rename` into place (best-effort replacement on platforms where rename does not replace).
   - `put dir`: extract a streamed tar into a staging directory, then `mv` into place; if the destination existed it may be moved to a backup path during the swap.
   - `get dir`: extract a streamed tar into a local staging directory, then swap into place via rename; if the destination existed it is first renamed to a sibling backup path.
-
-- `overwrite=false`
-  - `put file`: requires sibling staging and installs the final file via a hard-link (`ln`) to avoid replacement. This requires hard-link support on the remote filesystem; if unavailable the tool fails.
-  - `get file`: installs the final file via a local hard-link (`fs::hard_link`). This requires hard-link support on the local filesystem; if unavailable the tool fails.
-  - `put dir`: fails if the destination exists; creates the destination directory and extracts directly into it.
-  - `get dir`: fails if the destination exists; creates the destination directory and extracts directly into it.
 
 **Staging behavior (no /tmp)**
 

@@ -1359,6 +1359,9 @@ impl ServerHandler for SshMcpServer {
 
                 let key_path = self.config.key.clone();
 
+                // Store verbose flag before params is moved
+                let verbose = params.verbose;
+
                 // Ensure connection is established (so errors are deterministic).
                 if let Err(e) = self.connection.ensure_connected().await {
                     let resp = crate::transfer::TransferResponse::error(
@@ -1366,7 +1369,7 @@ impl ServerHandler for SshMcpServer {
                         self.transfer.local_root(),
                         &format!("SSH connection error: {e}"),
                     );
-                    let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
+                    let body = resp.to_json(verbose).unwrap_or_else(|_| {
                         "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
                     });
                     return Ok(CallToolResult::success(vec![Content::text(body)]));
@@ -1388,7 +1391,7 @@ impl ServerHandler for SshMcpServer {
                         },
                     )
                     .await;
-                let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
+                let body = resp.to_json(verbose).unwrap_or_else(|_| {
                     "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
                 });
                 Ok(CallToolResult::success(vec![Content::text(body)]))

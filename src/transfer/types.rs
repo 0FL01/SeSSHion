@@ -59,6 +59,11 @@ pub struct TransferParams {
 
     /// Optional timeout override for this transfer.
     pub timeout_ms: Option<u64>,
+
+    /// When true, return full diagnostic response including staging details.
+    /// When false or omitted, return compact response with only essential fields.
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_transport() -> TransferTransport {
@@ -175,5 +180,41 @@ impl TransferResponse {
     pub fn set_error(&mut self, msg: &str) {
         self.ok = false;
         self.error = Some(msg.to_string());
+    }
+}
+
+/// Compact transfer response for non-verbose mode.
+/// Contains only essential fields that agents need.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactTransferResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub kind: Option<TransferKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts: Option<TransferCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+impl TransferResponse {
+    /// Convert to compact representation for non-verbose responses.
+    pub fn to_compact(&self) -> CompactTransferResponse {
+        CompactTransferResponse {
+            ok: self.ok,
+            error: self.error.clone(),
+            kind: self.kind,
+            counts: self.counts.clone(),
+            elapsed_ms: self.elapsed_ms,
+        }
+    }
+
+    /// Serialize to JSON, using compact format unless verbose is true.
+    pub fn to_json(&self, verbose: bool) -> Result<String, serde_json::Error> {
+        if verbose {
+            serde_json::to_string(self)
+        } else {
+            serde_json::to_string(&self.to_compact())
+        }
     }
 }

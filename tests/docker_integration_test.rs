@@ -398,6 +398,7 @@ AAAEDCxgrF63olxn5oZkm+x+wntKjbSB9nWO+mazmilqLU5pntvVTUo53qNWwM84VBkVWi\n\
                 kind: Some(TransferKind::File),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -436,6 +437,7 @@ AAAEDCxgrF63olxn5oZkm+x+wntKjbSB9nWO+mazmilqLU5pntvVTUo53qNWwM84VBkVWi\n\
                 kind: Some(TransferKind::Directory),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
         assert!(
@@ -526,6 +528,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::File),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -630,6 +633,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::File),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -720,6 +724,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::Directory),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -815,6 +820,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::Directory),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -1006,6 +1012,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::File),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -1104,6 +1111,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::File),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -1194,6 +1202,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::Directory),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 
@@ -1289,6 +1298,7 @@ mod exec_raw_transfer_tests {
                 kind: Some(TransferKind::Directory),
                 overwrite: true,
                 timeout_ms: Some(30000),
+                verbose: false,
             })
             .await;
 

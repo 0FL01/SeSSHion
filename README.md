@@ -14,7 +14,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 - **Auto-Reconnect**: Automatically restores the connection if it drops.
 - **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.
 - **Sudo Integration**: Provides a `sudo-exec` tool with password wrapping.
-- **File Transfer**: Upload/download files and directories via SFTP, SCP, or streaming (works with both key and password auth).
+- **File Transfer**: Upload/download files and directories via SFTP, SCP, rsync (delta sync), or streaming (works with both key and password auth).
 - **Command Sanitization**: Built-in safety checks for command inputs.
 - **Output Control**: Configurable output length limits to prevent token overflow.
 - **Cross-Platform**: Compiled binary runs on any system with SSH access.
@@ -206,9 +206,10 @@ Transfer a file or directory over SSH.
 - **Local root**: `local_path` can be relative to `local_root` (the server's current working directory at startup) or an absolute path within `local_root`. Paths outside `local_root`, `..` components, and paths that normalize to `.` are rejected.
 - **Remote path validation**: `remote_path` must be non-empty, must not contain control characters, must not have leading/trailing whitespace, must not contain NUL, and must not start with `-`.
 - **Transport**:
-  - `transport=auto`: attempts `sftp`, then `scp`, then falls back to `exec-raw` deterministically.
+  - `transport=auto`: attempts rsync (most efficient), then sftp, then scp, then falls back to exec-raw deterministically.
   - `transport=sftp` / `transport=scp`: use local OpenSSH client binaries (`sftp` / `scp`).
   - `transport=exec-raw`: uses streaming stdin/stdout over the existing SSH session (tar streaming for directories).
+  - `transport=rsync`: uses local rsync binary with SSH transport for efficient delta-sync transfers (requires --key).
   - **Note**: `sftp`/`scp` transports require the server to be started with a private key path (`--key=/path/to/key`). When using password authentication, the `exec-raw` transport is used automatically (streaming over the existing SSH session).
 
 **Directory transfer (tar)**
@@ -241,6 +242,16 @@ Transfer a file or directory over SSH.
 - Remote staging prefers a sibling path under the destination parent for better atomicity.
 - If that location is not writable, `overwrite=true` operations fall back to `$HOME/.ssh-mcp/staging/<id>/...` and then move into place.
 - For `overwrite=false` file transfers, fallback staging is not allowed because the finalize step requires a sibling hard-link install; the tool fails if sibling staging is not writable.
+
+**Rsync Options**
+
+When using `transport=rsync`, you can customize behavior via `rsync_options`:
+- `checksum` (boolean, default: true): Use checksums instead of file times/sizes for file comparison
+- `compress` (boolean, default: false): Compress data during transfer
+- `delete` (boolean, default: false): Delete files on destination that don't exist on source
+- `inplace` (boolean, default: true): Update files in-place instead of creating new files
+- `partial` (boolean, default: true): Keep partially transferred files for resume
+- `bwlimit` (integer, optional): Bandwidth limit in KB/s
 
 ### Monitoring Background Jobs
 When using `background=true` or when a command auto-detaches on timeout:

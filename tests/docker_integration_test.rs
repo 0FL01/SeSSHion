@@ -1342,3 +1342,185 @@ mod exec_raw_transfer_tests {
         let _ = std::fs::remove_dir_all(&local_base);
     }
 }
+
+/// Test that compact response JSON includes paths and excludes verbose fields
+#[tokio::test]
+async fn test_compact_response_has_paths() {
+    // Initialize tracing for test output
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    // Start SSH container with testcontainers
+    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
+        .with_env_var("USER_NAME", "test")
+        .with_env_var("PASSWORD_ACCESS", "true")
+        .with_env_var("USER_PASSWORD", "secret")
+        .with_env_var("SUDO_ACCESS", "true")
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let config = Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: Some("secret".to_string()),
+        key: None,
+        su_password: None,
+        sudo_password: Some("secret".to_string()),
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        disable_sudo: false,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+    };
+
+    let server = SshMcpServer::new(config)
+        .await
+        .expect("Failed to create SshMcpServer");
+
+    // Resolve remote home
+    let home_result = server
+        .test_execute_command(r#"sh -c 'printf %s "$HOME"'"#)
+        .await
+        .expect("failed to resolve remote HOME");
+    let remote_home = extract_text_from_result(&home_result).trim().to_string();
+
+    // Create temp directory with test file
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let temp = std::path::PathBuf::from("target/tmp").join(format!("compact-test-{unique}"));
+    std::fs::create_dir_all(&temp).expect("create temp dir");
+
+    let test_file = temp.join("test.txt");
+    tokio::fs::write(&test_file, "test content for compact response")
+        .await
+        .expect("write test file");
+
+    let local_path_param = test_file.to_string_lossy().to_string();
+    let remote_file = format!("{}/test_compact.txt", remote_home);
+
+    // Test compact response (verbose=false)
+    let resp = server
+        .test_transfer(TransferParams {
+            operation: TransferOperation::Put,
+            local_path: local_path_param.clone(),
+            remote_path: remote_file.clone(),
+            transport: TransferTransport::ExecRaw,
+            kind: Some(TransferKind::File),
+            overwrite: true,
+            timeout_ms: Some(30000),
+            verbose: false, // Compact mode
+        })
+        .await;
+
+    assert!(resp.ok, "transfer should succeed: {:?}", resp.error);
+
+    // Get compact JSON and verify structure
+    let compact_json = resp
+        .to_json(false)
+        .expect("compact JSON serialization failed");
+    let json: serde_json::Value =
+        serde_json::from_str(&compact_json).expect("compact JSON parse failed");
+
+    // Verify compact response has essential fields
+    assert_eq!(json["ok"], true, "compact response should have ok=true");
+    assert_eq!(
+        json["local_path"].as_str().unwrap_or_default(),
+        local_path_param,
+        "compact response should have local_path"
+    );
+    assert_eq!(
+        json["remote_path"].as_str().unwrap_or_default(),
+        remote_file,
+        "compact response should have remote_path"
+    );
+
+    // Verify counts.bytes > 0
+    let bytes = json["counts"]["bytes"].as_u64().unwrap_or(0);
+    assert!(
+        bytes > 0,
+        "compact response should have counts.bytes > 0, got {bytes}"
+    );
+
+    // Verify compact response excludes verbose fields
+    assert!(
+        json["transport_used"].is_null(),
+        "compact response should NOT have transport_used"
+    );
+    assert!(
+        json["staging"].is_null(),
+        "compact response should NOT have staging"
+    );
+    assert!(
+        json["resolved"].is_null(),
+        "compact response should NOT have resolved"
+    );
+
+    // Test verbose response (verbose=true)
+    let verbose_resp = server
+        .test_transfer(TransferParams {
+            operation: TransferOperation::Put,
+            local_path: local_path_param.clone(),
+            remote_path: remote_file.clone(),
+            transport: TransferTransport::ExecRaw,
+            kind: Some(TransferKind::File),
+            overwrite: true,
+            timeout_ms: Some(30000),
+            verbose: true, // Verbose mode
+        })
+        .await;
+
+    assert!(
+        verbose_resp.ok,
+        "verbose transfer should succeed: {:?}",
+        verbose_resp.error
+    );
+
+    // Get verbose JSON and verify structure
+    let verbose_json = verbose_resp
+        .to_json(true)
+        .expect("verbose JSON serialization failed");
+    let json: serde_json::Value =
+        serde_json::from_str(&verbose_json).expect("verbose JSON parse failed");
+
+    // Verify verbose response includes all fields
+    assert_eq!(json["ok"], true, "verbose response should have ok=true");
+    // In verbose mode, paths are inside params object
+    assert_eq!(
+        json["params"]["local_path"].as_str().unwrap_or_default(),
+        local_path_param,
+        "verbose response should have local_path in params"
+    );
+    assert_eq!(
+        json["params"]["remote_path"].as_str().unwrap_or_default(),
+        remote_file,
+        "verbose response should have remote_path in params"
+    );
+    assert!(
+        !json["transport_used"].is_null(),
+        "verbose response should have transport_used"
+    );
+    assert!(
+        !json["params"].is_null(),
+        "verbose response should have params"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&temp);
+}

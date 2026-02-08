@@ -79,7 +79,7 @@ pub struct ResolvedPaths {
     pub local_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransferCounts {
     pub bytes: u64,
     pub files: u64,
@@ -185,12 +185,15 @@ impl TransferResponse {
 
 /// Compact transfer response for non-verbose mode.
 /// Contains only essential fields that agents need.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactTransferResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub kind: Option<TransferKind>,
+    // Paths are always included for DevOps context
+    pub local_path: String,
+    pub remote_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counts: Option<TransferCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -204,6 +207,8 @@ impl TransferResponse {
             ok: self.ok,
             error: self.error.clone(),
             kind: self.kind,
+            local_path: self.params.local_path.clone(),
+            remote_path: self.params.remote_path.clone(),
             counts: self.counts.clone(),
             elapsed_ms: self.elapsed_ms,
         }

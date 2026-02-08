@@ -13,7 +13,9 @@ mod tar;
 mod types;
 
 pub use types::{
-    TransferKind, TransferOperation, TransferParams, TransferResponse, TransferTransport,
+    CompactTransferResponse, ResolvedPaths, StagingLocal, StagingRemote, TransferCounts,
+    TransferKind, TransferOperation, TransferParams, TransferResponse, TransferStaging,
+    TransferTransport,
 };
 
 use std::path::{Path, PathBuf};
@@ -25,8 +27,6 @@ use tokio::time::Instant;
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::SshConnectionManager;
-
-use self::types::ResolvedPaths;
 
 struct StepCtx<'a> {
     conn: &'a SshConnectionManager,

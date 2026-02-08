@@ -418,19 +418,19 @@ async fn run_all_transfer_tests(env: &TestEnvConfig, port: u16) {
 
 #[tokio::test]
 async fn test_exec_raw_transfers_alpine_busybox() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
         .try_init();
 
-    // Start linuxserver/openssh-server (Alpine with BusyBox)
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
+    // Start ssh-mcp-debian-sshd container
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
-        .expect("Failed to start Alpine SSH container");
+        .expect("Failed to start SSH container");
 
     let host = container
         .get_host()
@@ -452,20 +452,19 @@ async fn test_exec_raw_transfers_alpine_busybox() {
 
 #[tokio::test]
 async fn test_exec_raw_transfers_debian_gnu_tar() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
         .try_init();
 
-    // Build the custom Debian SSH image if needed
-    init_test_env().expect("Failed to initialize test environment");
-
-    // Use custom Debian SSH image with test/secret credentials on port 2222
+    // Start ssh-mcp-debian-sshd container
     let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
         .with_exposed_port(2222u16.into())
         .start()
         .await
-        .expect("Failed to start Debian SSH container");
+        .expect("Failed to start SSH container");
 
     let host = container
         .get_host()

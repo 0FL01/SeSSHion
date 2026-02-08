@@ -17,13 +17,12 @@ async fn test_rsync_file_put_with_key_auth() {
         return;
     }
 
-    let (_key_dir, key_path) = setup_test_key();
+    // Build the custom Debian SSH image if needed
+    init_test_env().expect("Failed to build test image");
 
-    // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    // Start SSH container using custom Debian image with password auth
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -37,6 +36,9 @@ async fn test_rsync_file_put_with_key_auth() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Generate test key
+    let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
         host: host.to_string(),
@@ -130,13 +132,12 @@ async fn test_rsync_file_get_with_key_auth() {
         return;
     }
 
-    let (_key_dir, key_path) = setup_test_key();
+    // Build the custom Debian SSH image if needed
+    init_test_env().expect("Failed to build test image");
 
-    // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    // Start SSH container using custom Debian image with password auth
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -150,6 +151,9 @@ async fn test_rsync_file_get_with_key_auth() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Generate test key
+    let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
         host: host.to_string(),
@@ -170,7 +174,7 @@ async fn test_rsync_file_get_with_key_auth() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Resolve remote home and create a file
+    // Resolve remote home
     let home_result = server
         .test_execute_command(r#"sh -c 'printf %s "$HOME"'"#)
         .await
@@ -245,13 +249,12 @@ async fn test_rsync_directory_put_with_key_auth() {
         return;
     }
 
-    let (_key_dir, key_path) = setup_test_key();
+    // Build the custom Debian SSH image if needed
+    init_test_env().expect("Failed to build test image");
 
-    // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    // Start SSH container using custom Debian image with password auth
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -265,6 +268,9 @@ async fn test_rsync_directory_put_with_key_auth() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Generate test key
+    let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
         host: host.to_string(),
@@ -368,13 +374,12 @@ async fn test_rsync_directory_get_with_key_auth() {
         return;
     }
 
-    let (_key_dir, key_path) = setup_test_key();
+    // Build the custom Debian SSH image if needed
+    init_test_env().expect("Failed to build test image");
 
-    // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    // Start SSH container using custom Debian image with password auth
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -388,6 +393,9 @@ async fn test_rsync_directory_get_with_key_auth() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Generate test key
+    let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
         host: host.to_string(),
@@ -408,7 +416,7 @@ async fn test_rsync_directory_get_with_key_auth() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Resolve remote home and create remote directory
+    // Resolve remote home and create a file
     let home_result = server
         .test_execute_command(r#"sh -c 'printf %s "$HOME"'"#)
         .await
@@ -507,13 +515,12 @@ async fn test_auto_transport_prefers_rsync() {
         return;
     }
 
-    let (_key_dir, key_path) = setup_test_key();
+    // Build the custom Debian SSH image if needed
+    init_test_env().expect("Failed to build test image");
 
-    // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    // Start SSH container using custom Debian image with password auth
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -527,6 +534,9 @@ async fn test_auto_transport_prefers_rsync() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Generate test key
+    let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
         host: host.to_string(),
@@ -624,13 +634,12 @@ async fn test_rsync_with_options() {
         return;
     }
 
-    let (_key_dir, key_path) = setup_test_key();
+    // Build the custom Debian SSH image if needed
+    init_test_env().expect("Failed to build test image");
 
-    // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    // Start SSH container using custom Debian image with key auth
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -644,6 +653,9 @@ async fn test_rsync_with_options() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Generate test key
+    let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
         host: host.to_string(),

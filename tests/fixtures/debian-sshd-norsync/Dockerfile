@@ -1,22 +1,26 @@
 FROM debian:trixie-slim
 
-# Install OpenSSH server and GNU tar
+# Install OpenSSH server and client (NO rsync - for fallback testing)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssh-server \
         openssh-client \
-        tar \
-        rsync && \
+        tar && \
     rm -rf /var/lib/apt/lists/*
 
 # Create test user with password
 RUN useradd -m -s /bin/bash test && \
     echo "test:secret" | chpasswd
 
+# Setup SSH directory for test user
+RUN mkdir -p /home/test/.ssh && \
+    chmod 700 /home/test/.ssh && \
+    chown test:test /home/test/.ssh
+
 # Generate SSH host keys
 RUN ssh-keygen -A
 
-# Configure sshd
+# Configure sshd for both password and key auth
 RUN echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config && \
     echo "Port 2222" >> /etc/ssh/sshd_config && \
     echo "UsePAM no" >> /etc/ssh/sshd_config && \

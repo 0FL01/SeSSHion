@@ -12,7 +12,7 @@ pub use docker_integration::common::*;
 /// Integration test that runs an SSH server in Docker and tests MCP tools
 ///
 /// This test:
-/// 1. Starts a linuxserver/openssh-server container
+/// 1. Starts a ssh-mcp-debian-sshd container
 /// 2. Waits for SSH to be ready
 /// 3. Creates an SshMcpServer instance
 /// 4. Tests the 'exec' tool via test helper (whoami -> "test")
@@ -20,6 +20,8 @@ pub use docker_integration::common::*;
 /// 6. Cleans up the container and server
 #[tokio::test]
 async fn test_mcp_tools_with_docker() {
+    init_test_env().expect("Failed to initialize test environment");
+
     // Initialize tracing for test output
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
@@ -27,11 +29,8 @@ async fn test_mcp_tools_with_docker() {
         .try_init();
 
     // 1. Start SSH container with testcontainers
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
-        .with_env_var("SUDO_ACCESS", "true")
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -190,6 +189,8 @@ mod unix_transfer_tests {
 
     #[tokio::test]
     async fn test_transfer_auto_uses_sftp_when_available() {
+        init_test_env().expect("Failed to initialize test environment");
+
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter("ssh_mcp=debug,info")
@@ -219,10 +220,8 @@ mod unix_transfer_tests {
         }
 
         // Start SSH container configured for key auth.
-        let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-            .with_env_var("USER_NAME", "test")
-            .with_env_var("PASSWORD_ACCESS", "false")
-            .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+        let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+            .with_exposed_port(2222u16.into())
             .start()
             .await
             .expect("Failed to start SSH container");
@@ -358,6 +357,8 @@ mod unix_transfer_tests {
 /// Test that compact response JSON includes paths and excludes verbose fields
 #[tokio::test]
 async fn test_compact_response_has_paths() {
+    init_test_env().expect("Failed to initialize test environment");
+
     // Initialize tracing for test output
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
@@ -365,11 +366,8 @@ async fn test_compact_response_has_paths() {
         .try_init();
 
     // Start SSH container with testcontainers
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
-        .with_env_var("SUDO_ACCESS", "true")
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");

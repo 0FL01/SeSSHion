@@ -7,6 +7,8 @@ use std::time::SystemTime;
 
 #[tokio::test]
 async fn test_sftp_file_put_with_key_auth() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -20,10 +22,8 @@ async fn test_sftp_file_put_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -120,6 +120,8 @@ async fn test_sftp_file_put_with_key_auth() {
 
 #[tokio::test]
 async fn test_sftp_file_get_with_key_auth() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -133,10 +135,8 @@ async fn test_sftp_file_get_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -235,6 +235,8 @@ async fn test_sftp_file_get_with_key_auth() {
 
 #[tokio::test]
 async fn test_sftp_directory_put_with_key_auth() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -248,10 +250,8 @@ async fn test_sftp_directory_put_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -358,6 +358,8 @@ async fn test_sftp_directory_put_with_key_auth() {
 
 #[tokio::test]
 async fn test_sftp_directory_get_with_key_auth() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -371,10 +373,8 @@ async fn test_sftp_directory_get_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -497,6 +497,8 @@ async fn test_sftp_directory_get_with_key_auth() {
 
 #[tokio::test]
 async fn test_sftp_overwrite_false() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -510,10 +512,8 @@ async fn test_sftp_overwrite_false() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");

@@ -5,10 +5,12 @@ Lightweight SSH server container for E2E testing based on `debian:trixie-slim`.
 ## Features
 
 - **Base**: `debian:trixie-slim` (minimal Debian image)
-- **Authentication**: Password-based (user: `test`, password: `secret`)
+- **Authentication**: Both password and key authentication supported
+  - Password: user `test`, password `secret`
+  - Key: ED25519 public key pre-configured
 - **Port**: 2222 (non-standard to avoid conflicts)
-- **Security**: No PAM, no root login, no SSH keys
-- **Includes**: GNU tar for file transfer tests
+- **Security**: No PAM, no root login
+- **Includes**: GNU tar and rsync for file transfer tests
 
 ## Build
 
@@ -24,9 +26,36 @@ docker run -d -p 2222:2222 --name sshd-test debian-sshd:latest
 
 ## Connect
 
+### Password Authentication
+
 ```bash
 ssh -p 2222 test@localhost
 # Password: secret
+```
+
+### Key Authentication
+
+A pre-configured ED25519 key is set up in the container. Use the following private key to connect:
+
+```
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACCb7b1U1KOd6jVsDPOFQZFVot4BaNM+2hTy6RiD/Ttc+QAAAJgZQiFhGUIh
+YQAAAAtzc2gtZWQyNTUxOQAAACCb7b1U1KOd6jVsDPOFQZFVot4BaNM+2hTy6RiD/Ttc+Q
+AAAECqgA5qIlPC26PSfCkZa5giqPDXD99R7jM8re7ZwK0yCZvtvVTUo53qNWwM84VBkVWi
+3gFo0z7aFPLpGIP9O1z5AAAAF3Rlc3R1c2VyQGV4YW1wbGUubG9jYWwBAgMEBQYH
+-----END OPENSSH PRIVATE KEY-----
+```
+
+Or use the corresponding public key:
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJntvVTUo53qNWwM84VBkVWi3gFo0z7aFPLpGIP9O1z5 ssh-mcp-test
+```
+
+Save the private key to a file (e.g., `~/.ssh/ssh-mcp-test`) and connect:
+```bash
+chmod 600 ~/.ssh/ssh-mcp-test
+ssh -p 2222 -i ~/.ssh/ssh-mcp-test test@localhost
 ```
 
 ## Cleanup
@@ -40,9 +69,9 @@ docker rm sshd-test
 
 The container runs `sshd` with the following settings:
 - `PasswordAuthentication yes`
+- `PubkeyAuthentication yes`
 - `Port 2222`
 - `UsePAM no`
 - `PermitRootLogin no`
-- `PubkeyAuthentication no`
 
 Host keys are generated at build time. The container runs with a non-root user internally but allows SSH login via the `test` user.

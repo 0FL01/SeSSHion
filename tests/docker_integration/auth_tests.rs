@@ -11,6 +11,8 @@ use std::time::SystemTime;
 /// so key auth should succeed and connection should work.
 #[tokio::test]
 async fn test_key_auth_with_password_fallback() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -19,10 +21,8 @@ async fn test_key_auth_with_password_fallback() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth only
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -76,6 +76,8 @@ async fn test_key_auth_with_password_fallback() {
 /// and a valid password - password should be used as fallback.
 #[tokio::test]
 async fn test_password_auth_with_key_fallback() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -87,10 +89,8 @@ async fn test_password_auth_with_key_fallback() {
     std::fs::write(&invalid_key_path, "invalid key content").expect("write invalid key");
 
     // Start SSH container configured for password auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -143,6 +143,8 @@ async fn test_password_auth_with_key_fallback() {
 /// The system should prefer key authentication (typically faster and more secure).
 #[tokio::test]
 async fn test_both_key_and_password_configured() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -151,11 +153,8 @@ async fn test_both_key_and_password_configured() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for BOTH key and password auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -258,6 +257,8 @@ async fn test_both_key_and_password_configured() {
 /// Container accepts password but not the invalid key we provide.
 #[tokio::test]
 async fn test_key_auth_failure_then_password_success() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -280,10 +281,8 @@ async fn test_key_auth_failure_then_password_success() {
     }
 
     // Start SSH container configured for password auth only
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -337,6 +336,8 @@ async fn test_key_auth_failure_then_password_success() {
 /// Verifies that the system can handle sequential operations with different auth configurations.
 #[tokio::test]
 async fn test_switch_auth_methods_between_transfers() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -345,11 +346,8 @@ async fn test_switch_auth_methods_between_transfers() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for BOTH key and password auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");

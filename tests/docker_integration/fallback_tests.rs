@@ -8,10 +8,12 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 /// Test fallback from rsync to sftp when rsync is not available on remote.
-/// The linuxserver/openssh-server container (Alpine-based) does not include rsync by default,
+/// The ssh-mcp-debian-sshd container does not include rsync by default,
 /// so using Auto transport should fall back from rsync to sftp.
 #[tokio::test]
 async fn test_fallback_from_rsync_to_sftp() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -32,10 +34,8 @@ async fn test_fallback_from_rsync_to_sftp() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container (Alpine-based, no rsync installed)
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -143,6 +143,8 @@ async fn test_fallback_from_rsync_to_sftp() {
 /// causing the system to fall back to scp.
 #[tokio::test]
 async fn test_fallback_from_rsync_to_scp() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -163,10 +165,8 @@ async fn test_fallback_from_rsync_to_scp() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container (Alpine-based, no rsync installed)
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -276,6 +276,8 @@ async fn test_fallback_from_rsync_to_scp() {
 /// This verifies that the system can fall back to scp when sftp subsystem fails.
 #[tokio::test]
 async fn test_fallback_from_sftp_to_scp() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -296,10 +298,8 @@ async fn test_fallback_from_sftp_to_scp() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -411,16 +411,18 @@ async fn test_fallback_from_sftp_to_scp() {
 /// The full chain is tested by using Auto transport and ensuring success.
 #[tokio::test]
 async fn test_fallback_all_the_way_to_execraw() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
         .try_init();
 
-    // Start SSH container with password auth (Alpine-based, no rsync)
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
+    let (_key_dir, key_path) = setup_test_key();
+
+    // Start SSH container with key auth (no rsync)
+    let container = GenericImage::new("ssh-mcp-debian-sshd-norsync", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -439,8 +441,8 @@ async fn test_fallback_all_the_way_to_execraw() {
         host: host.to_string(),
         port,
         user: "test".to_string(),
-        password: Some("secret".to_string()),
-        key: None,
+        password: None,
+        key: Some(key_path),
         su_password: None,
         sudo_password: None,
         timeout_ms: 30000,

@@ -18,7 +18,7 @@ path = "src/main.rs"
 rmcp = { version = "0.13.0", features = ["server", "transport-io"] }
 
 # SSH
-russh = { version = "0.56", features = ["aws-lc-rs"] }
+russh = { version = "0.57", features = ["aws-lc-rs"] }
 
 # Async runtime
 tokio = { version = "1.49", features = ["full", "signal"] }

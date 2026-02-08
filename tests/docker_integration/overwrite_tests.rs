@@ -7,16 +7,16 @@ use std::time::SystemTime;
 
 #[tokio::test]
 async fn test_overwrite_false_prevents_overwrite_execraw() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
         .try_init();
 
     // Start SSH container with password auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -163,6 +163,8 @@ async fn test_overwrite_false_prevents_overwrite_execraw() {
 
 #[tokio::test]
 async fn test_overwrite_false_prevents_overwrite_sftp() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -176,10 +178,8 @@ async fn test_overwrite_false_prevents_overwrite_sftp() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -326,6 +326,8 @@ async fn test_overwrite_false_prevents_overwrite_sftp() {
 
 #[tokio::test]
 async fn test_overwrite_false_prevents_overwrite_scp() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -339,10 +341,8 @@ async fn test_overwrite_false_prevents_overwrite_scp() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -489,6 +489,8 @@ async fn test_overwrite_false_prevents_overwrite_scp() {
 
 #[tokio::test]
 async fn test_overwrite_false_prevents_overwrite_rsync() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -502,10 +504,8 @@ async fn test_overwrite_false_prevents_overwrite_rsync() {
     let (_key_dir, key_path) = setup_test_key();
 
     // Start SSH container configured for key auth
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "false")
-        .with_env_var("PUBLIC_KEY", TEST_PUBLIC_KEY)
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");
@@ -652,16 +652,16 @@ async fn test_overwrite_false_prevents_overwrite_rsync() {
 
 #[tokio::test]
 async fn test_overwrite_false_then_true_succeeds() {
+    init_test_env().expect("Failed to initialize test environment");
+
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
         .try_init();
 
     // Start SSH container with password auth (using ExecRaw for simplicity)
-    let container = GenericImage::new("lscr.io/linuxserver/openssh-server", "latest")
-        .with_env_var("USER_NAME", "test")
-        .with_env_var("PASSWORD_ACCESS", "true")
-        .with_env_var("USER_PASSWORD", "secret")
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
         .start()
         .await
         .expect("Failed to start SSH container");

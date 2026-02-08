@@ -619,7 +619,8 @@ impl SshConnectionManager {
                     output.exit_code = Some(exit_status);
                 }
                 ChannelMsg::Close | ChannelMsg::Eof => {
-                    break;
+                    // Don't break - ExitStatus may arrive after Close/Eof
+                    // Loop will exit naturally when channel.wait() returns None
                 }
                 _ => {
                     // Ignore other messages

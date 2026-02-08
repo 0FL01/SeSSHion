@@ -373,6 +373,71 @@ pub struct SshMcpServer {
     transfer: TransferEngine,
 }
 
+/// Extended documentation for tools (available on-demand to save tokens in tool definitions)
+pub mod tool_docs {
+    /// Documentation for the exec tool
+    pub const EXEC: &str = r#"EXEC TOOL
+Execute shell commands on remote SSH server.
+
+PARAMETERS:
+- command (string, required): Shell command to execute
+- background (boolean): Run via nohup, returns {job_id,pid,log_path}
+- timeout_ms (integer): Wait timeout in milliseconds (ignored if background=true)
+- log_path (string): Custom log path for background mode
+
+BACKGROUND MODE:
+For commands longer than RPC timeout, use background=true:
+1. Command runs detached via nohup
+2. Returns immediately with job_id, pid, and log_path
+3. Monitor: ps -p <pid> -o pid,etime,cmd
+4. View output: tail -n 50 '<log_path>'
+5. Check exit code: cat '<log_path>.exit'
+
+EXAMPLE:
+{"command": "apt update && apt install -y nginx", "background": true}"#;
+
+    /// Documentation for the sudo-exec tool  
+    pub const SUDO_EXEC: &str = r#"SUDO-EXEC TOOL
+Execute shell commands with sudo privileges.
+
+Same parameters and behavior as exec tool, but runs with sudo.
+Requires passwordless sudo or pre-configured sudo password.
+
+PARAMETERS:
+- command (string, required): Shell command to execute with sudo
+- background (boolean): Run via nohup
+- timeout_ms (integer): Wait timeout
+- log_path (string): Custom log path
+
+EXAMPLE:
+{"command": "systemctl restart nginx", "background": false}"#;
+
+    /// Documentation for the transfer tool
+    pub const TRANSFER: &str = r#"TRANSFER TOOL
+Transfer files or directories between local and remote hosts.
+
+PARAMETERS:
+- operation (string, required): "put" (local→remote) or "get" (remote→local)
+- local_path (string, required): Path relative to local_root
+- remote_path (string, required): Absolute remote path
+- transport (string): "auto" (default), "sftp", "scp", or "exec-raw"
+- kind (string): "file" or "directory" (auto-detected if omitted)
+- overwrite (boolean): Allow overwriting destination (default: true)
+- timeout_ms (integer): Transfer timeout override
+
+TRANSPORTS:
+- auto: Tries sftp → scp → exec-raw in order
+- sftp/scp: Require local OpenSSH binaries and --key
+- exec-raw: Streaming via SSH exec (no OpenSSH needed)
+
+SAFETY:
+- local_path resolved within local_root (prevents ../ attacks)
+- remote_path rejects paths starting with '-' or containing NUL
+
+EXAMPLE:
+{"operation": "put", "local_path": "config.yml", "remote_path": "/etc/app/config.yml"}"#;
+}
+
 impl SshMcpServer {
     /// Create a new SSH MCP Server
     ///
@@ -1015,16 +1080,13 @@ impl SshMcpServer {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Detach via nohup and return immediately with JSON {ok,background,job_id,pid,log_path}. Use for multi-minute tasks (RPC clients may time out even with large timeout_ms). If background=false and the command exceeds the effective timeout, it auto-detaches and returns {ok:false,timeout:true,background:true,job_id,pid,log_path}. Output goes to log_path. Monitoring: sleep between checks (2-5s, then 10-30s); use `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 '<log_path>'`",
                     "default": false
                 },
                 "timeout_ms": {
-                    "type": "integer",
-                    "description": "Optional foreground wait limit in milliseconds. Note: RPC clients may still time out; for long jobs prefer background=true. Ignored when background=true."
+                    "type": "integer"
                 },
                 "log_path": {
-                    "type": "string",
-                    "description": "Optional remote log path for background mode. Defaults to /tmp/ssh-mcp/<job_id>.log. View progress with `tail -n 50 '<log_path>'`."
+                    "type": "string"
                 }
             },
             "required": ["command"]
@@ -1036,60 +1098,54 @@ impl SshMcpServer {
         Tool::new(name, tool_description, Arc::new(schema_obj))
     }
 
-    /// Build exec tool definition
+    /// Build exec tool definition (compact)
     fn exec_tool() -> Tool {
         Self::command_tool(
             "exec",
-            "Execute a shell command. For multi-minute tasks, use background=true (RPC clients may time out; avoid duplicate re-runs). Background returns JSON {job_id,pid,log_path}. Monitoring: sleep 2-5s, then 10-30s; use `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 '<log_path>'`",
-            "Shell command to execute on the remote SSH server",
+            "Execute shell command on remote host. Use background=true for long tasks.",
+            "Shell command to execute",
         )
     }
 
-    /// Build sudo-exec tool definition
+    /// Build sudo-exec tool definition (compact)
     fn sudo_exec_tool() -> Tool {
         Self::command_tool(
             "sudo-exec",
-            "Execute a shell command via sudo. For multi-minute tasks, use background=true (RPC clients may time out; avoid duplicate re-runs). Background returns JSON {job_id,pid,log_path}. Monitoring: sleep 2-5s, then 10-30s; use `ps -p <pid> -o pid,etime,cmd` and `tail -n 50 '<log_path>'`",
-            "Shell command to execute with sudo on the remote SSH server",
+            "Execute shell command via sudo. Use background=true for long tasks.",
+            "Shell command to execute with sudo",
         )
     }
 
+    /// Build transfer tool definition (compact)
     fn transfer_tool() -> Tool {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["put", "get"],
-                    "description": "put: local -> remote, get: remote -> local"
+                    "enum": ["put", "get"]
                 },
                 "local_path": {
-                    "type": "string",
-                    "description": "Local path relative to local_root. For put: local source path. For get: local destination path. Absolute paths, '..', and paths that normalize to '.' are rejected."
+                    "type": "string"
                 },
                 "remote_path": {
-                    "type": "string",
-                    "description": "For put: remote destination path. For get: remote source path. Paths starting with '-' or containing NUL are rejected."
+                    "type": "string"
                 },
-                 "transport": {
-                      "type": "string",
-                      "enum": ["auto", "exec-raw", "sftp", "scp"],
-                      "default": "auto",
-                      "description": "Transport selection. auto attempts SFTP, then SCP, then exec-raw (streaming) deterministically. sftp/scp require local OpenSSH binaries and a configured SSH key path (--key)."
-                  },
+                "transport": {
+                    "type": "string",
+                    "enum": ["auto", "exec-raw", "sftp", "scp"],
+                    "default": "auto"
+                },
                 "kind": {
                     "type": "string",
-                    "enum": ["file", "directory"],
-                    "description": "Optional explicit kind. If omitted, the server auto-detects (local metadata for put; remote probe for get)."
+                    "enum": ["file", "directory"]
                 },
                 "overwrite": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Whether overwriting an existing destination is allowed. For file transfers, overwrite=false installs via hard-link and requires hard-link support on the destination filesystem (remote for put, local for get)."
+                    "default": true
                 },
                 "timeout_ms": {
-                    "type": "integer",
-                    "description": "Optional transfer timeout override in milliseconds."
+                    "type": "integer"
                 }
             },
             "required": ["operation", "local_path", "remote_path"]
@@ -1098,9 +1154,22 @@ impl SshMcpServer {
         let schema_obj = schema.as_object().cloned().unwrap_or_default();
         Tool::new(
             "transfer",
-            "Transfer files or directories via SSH. auto attempts SFTP -> SCP -> exec-raw. Enforces key-only SSH auth (requires --key path) and local_root safety for both put and get.",
+            "Transfer files via SSH (put/get). Requires --key for sftp/scp.",
             Arc::new(schema_obj),
         )
+    }
+
+    /// Get extended documentation for a tool by name
+    ///
+    /// Returns the full documentation text that was removed from compact tool definitions
+    /// to save tokens in the MCP protocol.
+    pub fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
+        match tool_name {
+            "exec" => Some(tool_docs::EXEC),
+            "sudo-exec" => Some(tool_docs::SUDO_EXEC),
+            "transfer" => Some(tool_docs::TRANSFER),
+            _ => None,
+        }
     }
 }
 
@@ -1627,5 +1696,71 @@ mod tests {
             !hint.contains(&markers.log_path),
             "hint should not contain concrete log_path marker value; got: '{hint}'"
         );
+    }
+
+    #[test]
+    fn test_tool_documentation_available() {
+        // Verify that extended documentation is available for all tools
+        assert!(SshMcpServer::get_tool_documentation("exec").is_some());
+        assert!(SshMcpServer::get_tool_documentation("sudo-exec").is_some());
+        assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
+        assert!(SshMcpServer::get_tool_documentation("unknown").is_none());
+    }
+
+    #[test]
+    fn test_exec_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("exec").unwrap();
+        assert!(docs.contains("EXEC TOOL"));
+        assert!(docs.contains("PARAMETERS:"));
+        assert!(docs.contains("BACKGROUND MODE:"));
+        assert!(docs.contains("command"));
+        assert!(docs.contains("background"));
+    }
+
+    #[test]
+    fn test_sudo_exec_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("sudo-exec").unwrap();
+        assert!(docs.contains("SUDO-EXEC TOOL"));
+        assert!(docs.contains("sudo"));
+    }
+
+    #[test]
+    fn test_transfer_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("transfer").unwrap();
+        assert!(docs.contains("TRANSFER TOOL"));
+        assert!(docs.contains("put"));
+        assert!(docs.contains("get"));
+        assert!(docs.contains("TRANSPORTS:"));
+    }
+
+    #[test]
+    fn test_compact_tool_descriptions() {
+        // Verify that tool descriptions are compact (not verbose)
+        let exec = SshMcpServer::exec_tool();
+        let sudo_exec = SshMcpServer::sudo_exec_tool();
+        let transfer = SshMcpServer::transfer_tool();
+
+        // Descriptions should be present but concise (under 100 chars)
+        if let Some(desc) = exec.description {
+            assert!(
+                desc.len() < 100,
+                "exec description too long: {} chars",
+                desc.len()
+            );
+        }
+        if let Some(desc) = sudo_exec.description {
+            assert!(
+                desc.len() < 100,
+                "sudo-exec description too long: {} chars",
+                desc.len()
+            );
+        }
+        if let Some(desc) = transfer.description {
+            assert!(
+                desc.len() < 100,
+                "transfer description too long: {} chars",
+                desc.len()
+            );
+        }
     }
 }

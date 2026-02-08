@@ -1,4 +1,4 @@
-# rmcp - Official Rust MCP SDK (v0.12.0)
+# rmcp - Official Rust MCP SDK (v0.13.0)
 
 > Source: https://docs.rs/rmcp/latest/rmcp/
 

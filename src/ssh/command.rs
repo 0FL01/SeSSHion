@@ -869,6 +869,7 @@ async fn raw_channel_task(
     out_tx: tokio::sync::mpsc::Sender<RawStreamEvent>,
 ) -> Result<()> {
     let mut stdin_closed = false;
+    let mut sent_closed = false;
     loop {
         tokio::select! {
             maybe_chunk = stdin_rx.recv(), if !stdin_closed => {
@@ -914,15 +915,43 @@ async fn raw_channel_task(
                                     return Ok(());
                                 }
                             }
+                            ChannelMsg::ExitSignal { signal_name, .. } => {
+                                // Map signal to exit code (128 + signal number)
+                                // Common signals: HUP=1, INT=2, QUIT=3, ILL=4, TRAP=5, ABRT=6, BUS=7, FPE=8, KILL=9
+                                let code = match signal_name {
+                                    russh::Sig::HUP => 129,
+                                    russh::Sig::INT => 130,
+                                    russh::Sig::QUIT => 131,
+                                    russh::Sig::ILL => 132,
+                                    russh::Sig::ABRT => 134,
+                                    russh::Sig::FPE => 136,
+                                    russh::Sig::KILL => 137,
+                                    russh::Sig::USR1 => 138,
+                                    russh::Sig::SEGV => 139,
+                                    russh::Sig::PIPE => 141,
+                                    russh::Sig::ALRM => 142,
+                                    russh::Sig::TERM => 143,
+                                    russh::Sig::Custom(_) => 128,
+                                };
+                                if send_evt(RawStreamEvent::ExitStatus(code)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
                             ChannelMsg::Close | ChannelMsg::Eof => {
-                                let _ = send_evt(RawStreamEvent::Closed).await;
-                                break;
+                                // Send Closed once but keep looping to capture trailing ExitStatus
+                                if !sent_closed {
+                                    sent_closed = true;
+                                    let _ = send_evt(RawStreamEvent::Closed).await;
+                                }
                             }
                             _ => {}
                         }
                     }
                     None => {
-                        let _ = out_tx.send(RawStreamEvent::Closed).await;
+                        // Channel fully closed - ensure we send Closed before exiting
+                        if !sent_closed {
+                            let _ = out_tx.send(RawStreamEvent::Closed).await;
+                        }
                         break;
                     }
                 }

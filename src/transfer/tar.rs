@@ -327,7 +327,19 @@ pub async fn extract_tar_to_dir<R: AsyncRead + Unpin>(
         }
 
         let entry = TarEntryHeader::parse(&header)?;
-        let rel = sanitize_tar_path(&entry.path).map_err(SshMcpError::invalid_params)?;
+
+        // Skip entries that have an empty path after sanitization (e.g., "." entry)
+        // This can happen when tar is invoked with "." as the path argument
+        let rel = match sanitize_tar_path(&entry.path) {
+            Ok(path) => path,
+            Err(e) if e == "tar entry path is empty" => {
+                // Skip the content and continue to next entry
+                discard_stream_len(&mut input, entry.size).await?;
+                skip_padding(&mut input, entry.size).await?;
+                continue;
+            }
+            Err(e) => return Err(SshMcpError::invalid_params(e)),
+        };
         let dest = root.join(rel);
 
         match entry.typeflag {
@@ -354,6 +366,11 @@ pub async fn extract_tar_to_dir<R: AsyncRead + Unpin>(
                 copy_stream_len(&mut input, &mut f, entry.size, &mut counts.bytes).await?;
                 f.flush().await?;
                 counts.files += 1;
+                skip_padding(&mut input, entry.size).await?;
+            }
+            b'x' | b'g' => {
+                // PAX extended header (x=local, g=global): skip content + padding
+                discard_stream_len(&mut input, entry.size).await?;
                 skip_padding(&mut input, entry.size).await?;
             }
             _ => {
@@ -435,12 +452,18 @@ struct TarEntryHeader {
 
 impl TarEntryHeader {
     fn parse(block: &[u8; TAR_BLOCK]) -> Result<Self> {
-        validate_ustar_header(block)?;
+        let is_ustar = validate_tar_header(block)?;
 
         let name = parse_string(&block[0..100]);
-        let prefix = parse_string(&block[345..500]);
-        let path = if !prefix.is_empty() {
-            format!("{}/{}", prefix, name)
+
+        // Only read prefix for ustar format headers
+        let path = if is_ustar {
+            let prefix = parse_string(&block[345..500]);
+            if !prefix.is_empty() {
+                format!("{}/{}", prefix, name)
+            } else {
+                name
+            }
         } else {
             name
         };
@@ -456,27 +479,49 @@ impl TarEntryHeader {
     }
 }
 
-fn validate_ustar_header(block: &[u8; TAR_BLOCK]) -> Result<()> {
-    let magic = &block[257..263];
-    let version = &block[263..265];
-    if magic != b"ustar\0" || version != b"00" {
-        return Err(SshMcpError::invalid_params(
-            "tar header is not a valid ustar header",
-        ));
+fn validate_tar_header(block: &[u8; TAR_BLOCK]) -> Result<bool> {
+    // Check if this is a zero block (end of archive)
+    if block.iter().all(|b| *b == 0) {
+        return Ok(true);
     }
 
+    let magic = &block[257..263];
+    let version = &block[263..265];
+
+    // Check for ustar format (POSIX tar)
+    // Accept common ustar variants:
+    // - magic "ustar\0" with version "00" (standard POSIX)
+    // - magic "ustar\0" with version spaces or null (old GNU/BusyBox)
+    // - magic "ustar " (space) with common version variants
+    let is_ustar = (magic == b"ustar\0" || magic == b"ustar ")
+        && (version == b"00"
+            || version == b"  "
+            || version == b"\0\0"
+            || version == b"0\0"
+            || version == b"0 ");
+
+    // Check for old GNU tar format: magic "ustar  " (with spaces)
+    let is_old_gnu = magic == b"ustar  ";
+
+    // Validate checksum - this is the most important check for corruption detection
     let stored = parse_octal(&block[148..156]).map_err(SshMcpError::invalid_params)?;
-    let computed = compute_ustar_checksum(block);
-    if stored != computed {
+    let computed = compute_tar_checksum(block);
+
+    // For non-ustar headers (old-style tar), we still validate the checksum
+    // but we don't require the magic bytes
+    let has_valid_checksum = stored == computed;
+
+    if !has_valid_checksum {
         return Err(SshMcpError::invalid_params(format!(
             "invalid tar header checksum (expected {computed}, got {stored})",
         )));
     }
 
-    Ok(())
+    // Return true if this is a ustar header (has path prefix support)
+    Ok(is_ustar || is_old_gnu)
 }
 
-fn compute_ustar_checksum(block: &[u8; TAR_BLOCK]) -> u64 {
+fn compute_tar_checksum(block: &[u8; TAR_BLOCK]) -> u64 {
     // Checksum is the sum of all bytes in the header, treating the checksum field as spaces.
     let mut sum: u64 = 0;
     for (idx, b) in block.iter().enumerate() {

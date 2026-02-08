@@ -621,10 +621,32 @@ fn ensure_remote_success(what: &str, out: &TransferRawOutput) -> Result<()> {
                 out.stderr
             )))
         }
-        None => Err(SshMcpError::connection(format!(
-            "{what} failed: missing exit status; stderr={}",
-            out.stderr
-        ))),
+        None => {
+            // Defensive: handle servers that don't emit exit-status
+            // If ERR marker exists, treat as error
+            if parse_marker_value(&out.stderr, ERR_MARKER).is_some() {
+                return Err(SshMcpError::connection(format!(
+                    "{what} failed: missing exit status; stderr={}",
+                    out.stderr
+                )));
+            }
+            // If stderr contains only benign stage markers (or is empty), treat as success
+            let has_only_benign_markers = out.stderr.lines().all(|line| {
+                let trimmed = line.trim();
+                trimmed.is_empty()
+                    || trimmed.starts_with(STAGE_MARKER)
+                    || trimmed.starts_with(STAGE_BASE_MARKER)
+                    || trimmed.starts_with(BACKUP_MARKER)
+            });
+            if has_only_benign_markers {
+                return Ok(());
+            }
+            // Otherwise, treat as error
+            Err(SshMcpError::connection(format!(
+                "{what} failed: missing exit status; stderr={}",
+                out.stderr
+            )))
+        }
     }
 }
 

@@ -411,7 +411,7 @@ async fn test_fallback_from_sftp_to_scp() {
 /// The full chain is tested by using Auto transport and ensuring success.
 #[tokio::test]
 async fn test_fallback_all_the_way_to_execraw() {
-    init_test_env().expect("Failed to initialize test environment");
+    init_test_env().expect("Failed to build test images");
 
     let _ = tracing_subscriber::fmt()
         .with_test_writer()

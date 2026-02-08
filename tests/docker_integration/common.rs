@@ -12,44 +12,69 @@ pub use std::sync::Mutex;
 pub static IMAGE_BUILD_ONCE: Once = Once::new();
 pub static IMAGE_BUILD_RESULT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
-/// Build the custom Debian SSH Docker image if not already present
+/// Build the custom Debian SSH Docker images if not already present
+/// Checks and builds both ssh-mcp-debian-sshd:latest and ssh-mcp-debian-sshd-norsync:latest
 pub fn ensure_debian_sshd_image() -> Result<(), String> {
-    // First check if the image already exists
-    let output = std::process::Command::new("docker")
-        .args([
-            "images",
-            "--format",
-            "{{.Repository}}:{{.Tag}}",
-            "ssh-mcp-debian-sshd:latest",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to check if Docker image exists: {e}"))?;
-
-    let existing = String::from_utf8_lossy(&output.stdout);
-    if existing.trim() == "ssh-mcp-debian-sshd:latest" {
-        return Ok(());
-    }
-
-    // Build the image from the Dockerfile
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dockerfile_path = format!("{}/tests/fixtures/debian-sshd", manifest_dir);
+    let mut errors = Vec::new();
 
-    let output = std::process::Command::new("docker")
-        .args([
-            "build",
-            "-t",
-            "ssh-mcp-debian-sshd:latest",
-            &dockerfile_path,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to build Docker image: {e}"))?;
+    // Helper closure to check and build a single image
+    let check_and_build = |image_name: &str, dockerfile_path: &str| {
+        // Check if the image already exists
+        let output = std::process::Command::new("docker")
+            .args(["images", "--format", "{{.Repository}}:{{.Tag}}", image_name])
+            .output()
+            .map_err(|e| format!("Failed to check if Docker image {image_name} exists: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Docker build failed: {stderr}"));
+        let existing = String::from_utf8_lossy(&output.stdout);
+        if existing.trim() == image_name {
+            return Ok(());
+        }
+
+        // Build the image from the Dockerfile
+        let output = std::process::Command::new("docker")
+            .args([
+                "build",
+                "-t",
+                image_name,
+                "-f",
+                dockerfile_path,
+                manifest_dir,
+            ])
+            .output()
+            .map_err(|e| format!("Failed to build Docker image {image_name}: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Docker build failed for {image_name}: {stderr}"));
+        }
+
+        Ok(())
+    };
+
+    // Check and build first image
+    let dockerfile_path = format!("{}/tests/fixtures/debian-sshd/Dockerfile", manifest_dir);
+    if let Err(e) = check_and_build("ssh-mcp-debian-sshd:latest", &dockerfile_path) {
+        errors.push(e);
     }
 
-    Ok(())
+    // Check and build second image (norsync variant)
+    let norsync_dockerfile_path = format!(
+        "{}/tests/fixtures/debian-sshd-norsync/Dockerfile",
+        manifest_dir
+    );
+    if let Err(e) = check_and_build(
+        "ssh-mcp-debian-sshd-norsync:latest",
+        &norsync_dockerfile_path,
+    ) {
+        errors.push(e);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Initialize the test environment - builds the Docker image once

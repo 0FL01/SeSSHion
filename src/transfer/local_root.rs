@@ -9,9 +9,9 @@ use super::types::{ResolvedPaths, TransferKind, TransferOperation, TransferParam
 /// Join `user_path` to `local_root` while preventing traversal.
 ///
 /// Rules:
-/// - `user_path` must be relative
+/// - `user_path` must be relative or an absolute path within local_root
 /// - no `..` components
-/// - no root/prefix
+/// - no root/prefix for relative paths
 pub fn safe_join_local_root(local_root: &Path, user_path: &str) -> Result<PathBuf, String> {
     let trimmed = user_path.trim();
     if trimmed.is_empty() {
@@ -20,6 +20,33 @@ pub fn safe_join_local_root(local_root: &Path, user_path: &str) -> Result<PathBu
 
     let path = Path::new(trimmed);
 
+    // Check if absolute path
+    if path.has_root() {
+        // Absolute path: must be within local_root
+        let stripped = path.strip_prefix(local_root).map_err(|_| {
+            format!(
+                "local_path {} is outside local_root {}",
+                path.display(),
+                local_root.display()
+            )
+        })?;
+
+        // Check stripped path doesn't contain ..
+        for component in stripped.components() {
+            if matches!(component, Component::ParentDir) {
+                return Err("local_path must not contain '..'".to_string());
+            }
+        }
+
+        // Check not empty after stripping
+        if stripped.as_os_str().is_empty() {
+            return Err("local_path must not be the local_root directory itself".to_string());
+        }
+
+        return Ok(path.to_path_buf());
+    }
+
+    // Relative path: original logic
     let mut saw_normal_component = false;
     for component in path.components() {
         match component {
@@ -204,9 +231,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safe_join_rejects_absolute() {
+    fn safe_join_handles_absolute_paths() {
         let root = Path::new("/srv");
+        // Absolute paths within local_root are accepted
+        assert!(safe_join_local_root(root, "/srv/file.txt").is_ok());
+        assert!(safe_join_local_root(root, "/srv/subdir/file.txt").is_ok());
+        // Absolute paths outside local_root are rejected
         assert!(safe_join_local_root(root, "/etc/passwd").is_err());
+        assert!(safe_join_local_root(root, "/other/path").is_err());
+        // Exact root path is rejected
+        assert!(safe_join_local_root(root, "/srv").is_err());
     }
 
     #[test]

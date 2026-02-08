@@ -418,7 +418,7 @@ Transfer files or directories between local and remote hosts.
 
 PARAMETERS:
 - operation (string, required): "put" (local→remote) or "get" (remote→local)
-- local_path (string, required): Path relative to local_root
+- local_path (string, required): Local file path (relative to local_root or absolute path within local_root)
 - remote_path (string, required): Absolute remote path
 - transport (string): "auto" (default), "sftp", "scp", or "exec-raw"
 - kind (string): "file" or "directory" (auto-detected if omitted)

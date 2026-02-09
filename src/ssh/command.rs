@@ -122,6 +122,18 @@ pub fn wrap_command_with_timeout(command: &str, duration_secs: f64) -> String {
     )
 }
 
+fn validate_timeout_duration(timeout_duration: Duration) -> Result<f64> {
+    // Convert duration to fractional seconds for millisecond precision.
+    // as_secs_f64() preserves sub-second precision (e.g., 500ms -> 0.5, 1500ms -> 1.5).
+    let duration_secs = timeout_duration.as_secs_f64();
+    if !duration_secs.is_finite() || duration_secs <= 0.0 {
+        return Err(SshMcpError::InvalidParams(
+            "duration must be finite and > 0".to_string(),
+        ));
+    }
+    Ok(duration_secs)
+}
+
 /// Errors that can occur before exec is successfully sent.
 /// These errors are retryable since the command has not started executing yet.
 enum PreExecError {
@@ -202,14 +214,7 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
-        // Convert duration to fractional seconds for millisecond precision
-        // as_secs_f64() preserves sub-second precision (e.g., 500ms -> 0.5, 1500ms -> 1.5)
-        let duration_secs = timeout_duration.as_secs_f64();
-        if !duration_secs.is_finite() || duration_secs <= 0.0 {
-            return Err(SshMcpError::InvalidParams(
-                "duration must be finite and > 0".to_string(),
-            ));
-        }
+        let duration_secs = validate_timeout_duration(timeout_duration)?;
 
         // Check timeout availability lazily on first use (same as exec_via_channel)
         let use_wrapper = self.determine_timeout_wrapper_usage().await;
@@ -465,14 +470,7 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
-        // Convert duration to fractional seconds for millisecond precision
-        // as_secs_f64() preserves sub-second precision (e.g., 500ms -> 0.5, 1500ms -> 1.5)
-        let duration_secs = timeout_duration.as_secs_f64();
-        if !duration_secs.is_finite() || duration_secs <= 0.0 {
-            return Err(SshMcpError::InvalidParams(
-                "duration must be finite and > 0".to_string(),
-            ));
-        }
+        let duration_secs = validate_timeout_duration(timeout_duration)?;
 
         // Wrap command with timeout if available
         // Check timeout availability lazily on first use
@@ -486,33 +484,9 @@ impl SshConnectionManager {
         };
 
         // Attempt #1: open channel and exec
-        let (channel, _exec_sent) = match self.try_open_and_exec(&wrapped_cmd).await {
-            Ok(result) => result,
-            Err(PreExecError::ChannelOpen(e)) => {
-                // Channel open failed - reconnect and retry once (Attempt #2)
-                warn!("Channel open failed, attempting reconnect and retry: {}", e);
-                self.reconnect().await?;
-                match self.try_open_and_exec(&wrapped_cmd).await {
-                    Ok(result) => result,
-                    Err(retry_err) => {
-                        // Return the retry error (second failure is the one we report)
-                        return Err(retry_err.into_ssh_error());
-                    }
-                }
-            }
-            Err(PreExecError::ExecSend(e)) => {
-                // Exec send failed - reconnect and retry once (Attempt #2)
-                warn!("Exec send failed, attempting reconnect and retry: {}", e);
-                self.reconnect().await?;
-                match self.try_open_and_exec(&wrapped_cmd).await {
-                    Ok(result) => result,
-                    Err(retry_err) => {
-                        // Return the retry error (second failure is the one we report)
-                        return Err(retry_err.into_ssh_error());
-                    }
-                }
-            }
-        };
+        let (channel, _exec_sent) = self
+            .open_and_exec_with_reconnect_retry(&wrapped_cmd)
+            .await?;
 
         // At this point, exec has been sent successfully.
         // Collect output with appropriate timeout strategy.
@@ -627,6 +601,30 @@ impl SshConnectionManager {
             .map_err(|e| PreExecError::ExecSend(format!("Failed to exec command: {}", e)))?;
 
         Ok((channel, true))
+    }
+
+    async fn open_and_exec_with_reconnect_retry(
+        &self,
+        command: &str,
+    ) -> Result<(russh::Channel<russh::client::Msg>, bool)> {
+        match self.try_open_and_exec(command).await {
+            Ok(result) => Ok(result),
+            Err(pre_exec_err) => {
+                match &pre_exec_err {
+                    PreExecError::ChannelOpen(e) => {
+                        warn!("Channel open failed, attempting reconnect and retry: {}", e);
+                    }
+                    PreExecError::ExecSend(e) => {
+                        warn!("Exec send failed, attempting reconnect and retry: {}", e);
+                    }
+                }
+
+                self.reconnect().await?;
+                self.try_open_and_exec(command)
+                    .await
+                    .map_err(|retry_err| retry_err.into_ssh_error())
+            }
+        }
     }
 
     /// Collect output from a channel until it closes

@@ -71,7 +71,7 @@ pub fn sanitize_command(command: &str, max_chars: Option<usize>) -> Result<Strin
 /// let escaped = escape_command_for_shell("echo 'hello' | cat");
 /// assert_eq!(escaped, "echo '\"'\"'hello'\"'\"' \\| cat");
 /// ```
-fn escape_single_quotes(s: &str) -> String {
+pub(crate) fn escape_single_quotes(s: &str) -> String {
     s.replace('\'', "'\"'\"'")
 }
 

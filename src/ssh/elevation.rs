@@ -7,6 +7,8 @@
 //! The elevation logic for `su` shells is implemented directly in
 //! [`SshConnectionManager`](super::connection::SshConnectionManager).
 
+use super::sanitize::escape_single_quotes;
+
 /// Wraps a command for execution with sudo privileges.
 ///
 /// # Arguments
@@ -70,7 +72,7 @@ pub fn wrap_sudo_command(command: &str, password: Option<&str>) -> String {
 /// assert_eq!(escape_for_shell("a'b'c"), "a'\"'\"'b'\"'\"'c");
 /// ```
 pub fn escape_for_shell(s: &str) -> String {
-    s.replace('\'', "'\"'\"'")
+    escape_single_quotes(s)
 }
 
 /// Checks if a password is valid for use in sudo commands.

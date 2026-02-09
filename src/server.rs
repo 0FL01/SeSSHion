@@ -480,6 +480,9 @@ impl SshMcpServer {
             .with_keepalive_interval(config.keepalive_interval)
             .with_keepalive_max(config.keepalive_max);
 
+        // Add output token limit for OOM protection
+        ssh_config = ssh_config.with_max_output_tokens(config.max_output_tokens);
+
         // Create connection manager
         let connection = Arc::new(SshConnectionManager::new(ssh_config).await);
 
@@ -779,6 +782,7 @@ impl SshMcpServer {
                     stdout: out.stdout,
                     stderr: out.stderr,
                     exit_code: Some(exit_code),
+                    ..Default::default()
                 };
                 Ok(Self::calltool_from_command_output(output))
             }

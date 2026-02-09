@@ -18,6 +18,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 ├── tests/                # Integration and functional tests
 │   ├── integration_test.rs       # Command formatting and connection logic tests
 │   ├── logging_test.rs           # Logging configuration and initialization tests
+│   ├── compact_response_test.rs  # Compact response formatting and MCP protocol compliance
 │   ├── docker_integration/       # Modular E2E tests using Docker containers
 │   │   ├── mod.rs                # Module exports
 │   │   ├── common.rs             # Shared test utilities and helpers
@@ -25,11 +26,13 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── exec_raw_tests.rs     # ExecRaw transport tests
 │   │   ├── sftp_tests.rs         # SFTP transport tests
 │   │   ├── scp_tests.rs          # SCP transport tests
-│   │   ├── rsync_tests.rs        # Rsync transport tests
+│   │   ├── rsync_tests.rs        # Rsync transfer tests
 │   │   ├── rsync_timeout_tests.rs # Rsync timeout and process cleanup tests
 │   │   ├── overwrite_tests.rs    # File overwrite behavior tests
 │   │   ├── fallback_tests.rs     # Transport fallback chain tests
-│   │   └── auth_tests.rs         # Authentication method tests
+│   │   ├── auth_tests.rs         # Authentication method tests
+│   │   ├── timeout_tests.rs      # Command timeout behavior tests
+│   │   └── oom_tests.rs          # Output truncation and OOM protection tests
 │   └── fixtures/                 # Test fixtures and Docker images
 │       └── debian-sshd/          # Custom Debian SSHD image for E2E tests
 │           ├── Dockerfile        # Lightweight debian:trixie-slim with GNU tar

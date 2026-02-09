@@ -39,6 +39,10 @@ pub struct SshConfig {
     /// Maximum keepalive failures before disconnecting (default: 3)
     /// How many keepalive packets can be missed before connection drops
     pub keepalive_max: u64,
+
+    /// Maximum output tokens for command execution (default: 12_000)
+    /// Prevents OOM and context overflow for large outputs
+    pub max_output_tokens: Option<usize>,
 }
 
 impl SshConfig {
@@ -54,6 +58,7 @@ impl SshConfig {
             sudo_password: None,
             keepalive_interval: 30,
             keepalive_max: 3,
+            max_output_tokens: Some(12_000),
         }
     }
 
@@ -102,6 +107,13 @@ impl SshConfig {
         self.keepalive_max = max;
         self
     }
+
+    /// Set maximum output tokens for command execution (default: 12_000)
+    /// Set to None for unlimited output (not recommended for large outputs)
+    pub fn with_max_output_tokens(mut self, tokens: Option<usize>) -> Self {
+        self.max_output_tokens = tokens;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -112,7 +124,8 @@ mod tests {
     fn test_ssh_config_builder() {
         let config = SshConfig::new("192.168.1.1", "admin")
             .with_port(2222)
-            .with_password("secret");
+            .with_password("secret")
+            .with_max_output_tokens(Some(5_000));
 
         assert_eq!(config.host, "192.168.1.1");
         assert_eq!(config.port, 2222);

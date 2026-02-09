@@ -34,7 +34,8 @@ const CONNECT_WAIT_TIMEOUT_SECS: u64 = CONNECTION_TIMEOUT_SECS + AUTH_TIMEOUT_SE
 /// - 30-second connection timeout
 pub struct SshConnectionManager {
     /// SSH configuration
-    config: SshConfig,
+    /// Made pub(crate) to allow access from command.rs for output limiting
+    pub(crate) config: SshConfig,
 
     /// Active SSH session handle
     session: Arc<Mutex<Option<Handle<SshHandler>>>>,

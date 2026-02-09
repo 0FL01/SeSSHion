@@ -63,6 +63,13 @@ pub struct Args {
     #[arg(long, default_value = "false", env = "SSH_MCP_DISABLE_SUDO")]
     pub disable_sudo: bool,
 
+    /// Maximum output tokens for command execution.
+    /// Use "none" or "0" to disable limit.
+    /// Supports "k" suffix (e.g., "12k" for 12000).
+    /// Default: 12000 (approximately 50KB)
+    #[arg(long = "max-output-tokens", env = "SSH_MCP_MAX_OUTPUT_TOKENS")]
+    pub max_output_tokens: Option<String>,
+
     /// Logging level: trace, debug, info, warn, error
     #[arg(long, default_value = "info", env = "SSH_MCP_LOG_LEVEL", value_parser = clap::builder::PossibleValuesParser::new(["trace", "debug", "info", "warn", "error"]))]
     pub log_level: String,
@@ -120,6 +127,9 @@ pub struct Config {
     /// Maximum command length (None = unlimited)
     pub max_chars: Option<usize>,
 
+    /// Maximum output tokens for command execution (None = unlimited)
+    pub max_output_tokens: Option<usize>,
+
     /// Whether sudo-exec tool is disabled
     pub disable_sudo: bool,
 
@@ -136,6 +146,7 @@ impl Config {
         validate_args(&args)?;
 
         let max_chars = parse_max_chars(args.max_chars.as_deref());
+        let max_output_tokens = parse_max_output_tokens(args.max_output_tokens.as_deref());
 
         Ok(Config {
             host: args.host,
@@ -147,6 +158,7 @@ impl Config {
             sudo_password: sanitize_password(args.sudo_password),
             timeout_ms: args.timeout,
             max_chars,
+            max_output_tokens,
             disable_sudo: args.disable_sudo,
             keepalive_interval: args.keepalive_interval,
             keepalive_max: args.keepalive_max,
@@ -188,6 +200,9 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Default max output tokens (12_000 ≈ 50KB)
+pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<usize> = Some(12_000);
+
 /// Parse max_chars argument
 ///
 /// - "none" (case-insensitive) → None (unlimited)
@@ -207,6 +222,40 @@ pub fn parse_max_chars(value: Option<&str>) -> Option<usize> {
                 Ok(n) if n <= 0 => None,
                 Ok(n) => Some(n as usize),
                 Err(_) => DEFAULT_MAX_CHARS,
+            }
+        }
+    }
+}
+
+/// Parse max_output_tokens argument
+///
+/// - "none" (case-insensitive) → None (unlimited)
+/// - "0" or negative → None (unlimited)
+/// - positive integer with optional "k" suffix (e.g., "12k") → Some(value)
+/// - None (not provided) → DEFAULT_MAX_OUTPUT_TOKENS
+pub fn parse_max_output_tokens(value: Option<&str>) -> Option<usize> {
+    match value {
+        None => DEFAULT_MAX_OUTPUT_TOKENS,
+        Some(s) => {
+            let lowered = s.to_lowercase().replace(" ", "");
+            if lowered == "none" {
+                return None;
+            }
+
+            // Try to parse with k suffix
+            if lowered.ends_with('k') {
+                let num_part = &lowered[..lowered.len() - 1];
+                match num_part.parse::<i64>() {
+                    Ok(n) if n <= 0 => None,
+                    Ok(n) => Some((n as usize).saturating_mul(1_000)),
+                    Err(_) => DEFAULT_MAX_OUTPUT_TOKENS,
+                }
+            } else {
+                match lowered.parse::<i64>() {
+                    Ok(n) if n <= 0 => None,
+                    Ok(n) => Some(n as usize),
+                    Err(_) => DEFAULT_MAX_OUTPUT_TOKENS,
+                }
             }
         }
     }
@@ -261,5 +310,47 @@ mod tests {
         );
         assert_eq!(sanitize_password(Some("".to_string())), None);
         assert_eq!(sanitize_password(None), None);
+    }
+
+    #[test]
+    fn test_parse_max_output_tokens_none_string() {
+        assert_eq!(parse_max_output_tokens(Some("none")), None);
+        assert_eq!(parse_max_output_tokens(Some("None")), None);
+        assert_eq!(parse_max_output_tokens(Some("NONE")), None);
+    }
+
+    #[test]
+    fn test_parse_max_output_tokens_zero_or_negative() {
+        assert_eq!(parse_max_output_tokens(Some("0")), None);
+        assert_eq!(parse_max_output_tokens(Some("-1")), None);
+        assert_eq!(parse_max_output_tokens(Some("-100")), None);
+    }
+
+    #[test]
+    fn test_parse_max_output_tokens_positive() {
+        assert_eq!(parse_max_output_tokens(Some("500")), Some(500));
+        assert_eq!(parse_max_output_tokens(Some("12000")), Some(12_000));
+    }
+
+    #[test]
+    fn test_parse_max_output_tokens_with_k_suffix() {
+        assert_eq!(parse_max_output_tokens(Some("12k")), Some(12_000));
+        assert_eq!(parse_max_output_tokens(Some("5K")), Some(5_000));
+        assert_eq!(parse_max_output_tokens(Some("100k")), Some(100_000));
+    }
+
+    #[test]
+    fn test_parse_max_output_tokens_invalid() {
+        // Invalid strings should return default
+        assert_eq!(
+            parse_max_output_tokens(Some("abc")),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(parse_max_output_tokens(Some("")), DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn test_parse_max_output_tokens_not_provided() {
+        assert_eq!(parse_max_output_tokens(None), DEFAULT_MAX_OUTPUT_TOKENS);
     }
 }

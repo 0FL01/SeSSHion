@@ -31,6 +31,18 @@ pub struct CommandOutput {
 
     /// Exit code of the command (if available)
     pub exit_code: Option<u32>,
+
+    /// Whether stdout was truncated due to output limits
+    pub stdout_truncated: bool,
+
+    /// Whether stderr was truncated due to output limits
+    pub stderr_truncated: bool,
+
+    /// Approximate total token count for stdout (including truncated content)
+    pub stdout_total_tokens: usize,
+
+    /// Approximate total token count for stderr (including truncated content)
+    pub stderr_total_tokens: usize,
 }
 
 /// Output from a raw streaming command execution.
@@ -413,6 +425,7 @@ impl SshConnectionManager {
                                     },
                                     stderr: String::new(),
                                     exit_code: Some(0), // Assume success in PTY mode
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -617,22 +630,147 @@ impl SshConnectionManager {
     }
 
     /// Collect output from a channel until it closes
+    ///
+    /// Implements output limiting to prevent OOM and context overflow.
+    /// Approximate token count: 1 token ≈ 4 bytes for UTF-8 text.
     async fn collect_channel_output(
         &self,
         mut channel: russh::Channel<russh::client::Msg>,
     ) -> Result<CommandOutput> {
+        // Approximate: 1 token ≈ 4 bytes for estimation
+        const BYTES_PER_TOKEN: usize = 4;
+
         let mut output = CommandOutput::new();
+
+        // Calculate byte limit from config (if set)
+        let max_bytes = self
+            .config
+            .max_output_tokens
+            .map(|tokens| tokens.saturating_mul(BYTES_PER_TOKEN));
+
+        // Track total tokens received (including what was truncated)
+        let mut total_stdout_tokens: usize = 0;
+        let mut total_stderr_tokens: usize = 0;
+
+        // Flags to track if we've already added truncation messages
+        let mut stdout_truncation_added = false;
+        let mut stderr_truncation_added = false;
 
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => {
-                    output.stdout.push_str(&String::from_utf8_lossy(&data));
+                    let data_len = data.len();
+                    total_stdout_tokens =
+                        total_stdout_tokens.saturating_add(data_len / BYTES_PER_TOKEN);
+                    let data_str = String::from_utf8_lossy(&data);
+
+                    if let Some(limit) = max_bytes {
+                        let current_len = output.stdout.len();
+
+                        // Check if we need to truncate
+                        if current_len.saturating_add(data_str.len()) > limit {
+                            if !stdout_truncation_added {
+                                // Calculate how much we can take
+                                let remaining = limit.saturating_sub(current_len);
+                                if remaining > 0 {
+                                    // Safe slicing: we know remaining is within bounds since data_str.len() > remaining
+                                    let safe_end = data_str
+                                        .char_indices()
+                                        .map(|(i, _)| i)
+                                        .find(|&i| i > remaining)
+                                        .unwrap_or(data_str.len());
+                                    let take = std::cmp::min(safe_end, remaining);
+                                    output.stdout.push_str(&data_str[..take]);
+                                }
+                                output.stdout_truncated = true;
+                                output.stdout_total_tokens = total_stdout_tokens;
+
+                                // Add truncation notice with tips
+                                output.stdout.push_str(&format!(
+                                    "\n[Output truncated: {} tokens total]",
+                                    total_stdout_tokens
+                                ));
+                                output.stdout.push_str(
+                                    "\n[Tip: Use 'head -n 100' for first lines, 'tail -n 100' for last lines]",
+                                );
+                                output.stdout.push_str(
+                                    "\n[Tip: For large output use SFTP/SCP tools to download files]",
+                                );
+
+                                stdout_truncation_added = true;
+                                warn!(
+                                    "stdout truncated: total_tokens={}, limit_tokens={}",
+                                    total_stdout_tokens,
+                                    max_bytes.map(|b| b / BYTES_PER_TOKEN).unwrap_or(0)
+                                );
+                            }
+                            // Skip remaining stdout data
+                        } else {
+                            output.stdout.push_str(&data_str);
+                        }
+                    } else {
+                        // No limit - add all data
+                        output.stdout.push_str(&data_str);
+                    }
                 }
                 ChannelMsg::ExtendedData { data, ext } => {
+                    let data_len = data.len();
+                    total_stderr_tokens =
+                        total_stderr_tokens.saturating_add(data_len / BYTES_PER_TOKEN);
+
                     // ext == 1 is typically stderr
                     if ext == 1 {
-                        output.stderr.push_str(&String::from_utf8_lossy(&data));
+                        let data_str = String::from_utf8_lossy(&data);
+                        if let Some(limit) = max_bytes {
+                            let current_len = output.stderr.len();
+
+                            // Check if we need to truncate
+                            if current_len.saturating_add(data_str.len()) > limit {
+                                if !stderr_truncation_added {
+                                    // Calculate how much we can take
+                                    let remaining = limit.saturating_sub(current_len);
+                                    if remaining > 0 {
+                                        // Safe slicing: find UTF-8 safe boundary
+                                        let safe_end = data_str
+                                            .char_indices()
+                                            .map(|(i, _)| i)
+                                            .find(|&i| i > remaining)
+                                            .unwrap_or(data_str.len());
+                                        let take = std::cmp::min(safe_end, remaining);
+                                        output.stderr.push_str(&data_str[..take]);
+                                    }
+                                    output.stderr_truncated = true;
+                                    output.stderr_total_tokens = total_stderr_tokens;
+
+                                    // Add truncation notice
+                                    output.stderr.push_str(&format!(
+                                        "\n[Output truncated: {} tokens total]",
+                                        total_stderr_tokens
+                                    ));
+                                    output.stderr.push_str(
+                                        "\n[Tip: Use 'head -n 100' for first lines, 'tail -n 100' for last lines]",
+                                    );
+                                    output.stderr.push_str(
+                                        "\n[Tip: For large output use SFTP/SCP tools to download files]",
+                                    );
+
+                                    stderr_truncation_added = true;
+                                    warn!(
+                                        "stderr truncated: total_tokens={}, limit_tokens={}",
+                                        total_stderr_tokens,
+                                        max_bytes.map(|b| b / BYTES_PER_TOKEN).unwrap_or(0)
+                                    );
+                                }
+                                // Skip remaining stderr data
+                            } else {
+                                output.stderr.push_str(&data_str);
+                            }
+                        } else {
+                            // No limit - add all data
+                            output.stderr.push_str(&data_str);
+                        }
                     } else {
+                        // Non-stderr extended data goes to stdout
                         output.stdout.push_str(&String::from_utf8_lossy(&data));
                     }
                 }
@@ -649,13 +787,23 @@ impl SshConnectionManager {
             }
         }
 
+        // Store final token counts (if not already set from truncation)
+        if output.stdout_total_tokens == 0 {
+            output.stdout_total_tokens = total_stdout_tokens;
+        }
+        if output.stderr_total_tokens == 0 {
+            output.stderr_total_tokens = total_stderr_tokens;
+        }
+
         // If there's stderr and a non-zero exit code, we might want to handle it
         // For now, just return the output as-is
         debug!(
-            "Command completed: exit_code={:?}, stdout_len={}, stderr_len={}",
+            "Command completed: exit_code={:?}, stdout_len={}, stderr_len={}, stdout_truncated={}, stderr_truncated={}",
             output.exit_code,
             output.stdout.len(),
-            output.stderr.len()
+            output.stderr.len(),
+            output.stdout_truncated,
+            output.stderr_truncated
         );
 
         Ok(output)
@@ -1131,6 +1279,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: String::new(),
             exit_code: Some(0),
+            ..Default::default()
         };
         assert!(output.success());
     }
@@ -1141,6 +1290,7 @@ mod tests {
             stdout: String::new(),
             stderr: "error".to_string(),
             exit_code: Some(1),
+            ..Default::default()
         };
         assert!(!output.success());
     }
@@ -1151,6 +1301,7 @@ mod tests {
             stdout: "hello".to_string(),
             stderr: String::new(),
             exit_code: None,
+            ..Default::default()
         };
         // No exit code should be treated as success
         assert!(output.success());
@@ -1162,6 +1313,7 @@ mod tests {
             stdout: "stdout".to_string(),
             stderr: "stderr".to_string(),
             exit_code: Some(0),
+            ..Default::default()
         };
         assert_eq!(output.combined_output(), "stdout\nstderr");
     }
@@ -1172,6 +1324,7 @@ mod tests {
             stdout: "stdout".to_string(),
             stderr: String::new(),
             exit_code: Some(0),
+            ..Default::default()
         };
         assert_eq!(output.combined_output(), "stdout");
     }
@@ -1182,6 +1335,7 @@ mod tests {
             stdout: String::new(),
             stderr: "stderr".to_string(),
             exit_code: Some(1),
+            ..Default::default()
         };
         assert_eq!(output.combined_output(), "stderr");
     }

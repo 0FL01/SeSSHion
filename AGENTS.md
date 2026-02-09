@@ -26,6 +26,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── sftp_tests.rs         # SFTP transport tests
 │   │   ├── scp_tests.rs          # SCP transport tests
 │   │   ├── rsync_tests.rs        # Rsync transport tests
+│   │   ├── rsync_timeout_tests.rs # Rsync timeout and process cleanup tests
 │   │   ├── overwrite_tests.rs    # File overwrite behavior tests
 │   │   ├── fallback_tests.rs     # Transport fallback chain tests
 │   │   └── auth_tests.rs         # Authentication method tests

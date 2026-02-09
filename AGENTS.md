@@ -21,6 +21,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   ├── docker_integration/       # Modular E2E tests using Docker containers
 │   │   ├── mod.rs                # Module exports
 │   │   ├── common.rs             # Shared test utilities and helpers
+│   │   ├── check_process_tests.rs # Process monitoring tests
 │   │   ├── exec_raw_tests.rs     # ExecRaw transport tests
 │   │   ├── sftp_tests.rs         # SFTP transport tests
 │   │   ├── scp_tests.rs          # SCP transport tests
@@ -48,7 +49,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── sanitize.rs         # Input validation and command safety
 │   │   └── config.rs           # SSH-specific configuration structures
 │   ├── tools/                  # MCP tool definitions
-│   │   └── mod.rs              # Tool registration and dispatch
+│   │   └── mod.rs              # Tool registration and dispatch (exec, sudo-exec, check-process)
 │   └── transfer/               # File transfer operations
 │       ├── mod.rs              # Transfer module definition
 │       ├── exec_raw.rs         # Raw command execution for transfers

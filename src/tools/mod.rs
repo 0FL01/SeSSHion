@@ -6,6 +6,7 @@
 //! Available tools:
 //! - `exec` - Execute shell commands on the remote SSH server
 //! - `sudo-exec` - Execute shell commands with sudo privileges
+//! - `check-process` - Check if a process is still running and read its log
 //!
 //! See `server.rs` for the implementation.
 
@@ -54,6 +55,24 @@ pub struct SudoExecParams {
     pub log_path: Option<String>,
 }
 
+/// Parameters for the check-process tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CheckProcessParams {
+    /// Process ID to check
+    pub pid: u32,
+
+    /// Optional path to the log file to read tail from
+    pub log_path: Option<String>,
+
+    /// Number of last lines to read from log (default: 50)
+    #[serde(default = "default_tail_lines")]
+    pub tail_lines: usize,
+}
+
+fn default_tail_lines() -> usize {
+    50
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +105,23 @@ mod tests {
         assert!(!params.background);
         assert!(params.timeout_ms.is_none());
         assert!(params.log_path.is_none());
+    }
+
+    #[test]
+    fn test_check_process_params_deserialize() {
+        let json = r#"{"pid": 12345}"#;
+        let params: CheckProcessParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.pid, 12345);
+        assert!(params.log_path.is_none());
+        assert_eq!(params.tail_lines, 50);
+    }
+
+    #[test]
+    fn test_check_process_params_with_log() {
+        let json = r#"{"pid": 12345, "log_path": "/tmp/test.log", "tail_lines": 100}"#;
+        let params: CheckProcessParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.pid, 12345);
+        assert_eq!(params.log_path.as_deref(), Some("/tmp/test.log"));
+        assert_eq!(params.tail_lines, 100);
     }
 }

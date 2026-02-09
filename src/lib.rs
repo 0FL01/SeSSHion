@@ -47,4 +47,4 @@ pub use ssh::{
     escape_for_shell, escape_for_timeout_wrapper, sanitize_command, sanitize_password,
     wrap_command_with_timeout, wrap_sudo_command,
 };
-pub use tools::{ExecParams, SudoExecParams};
+pub use tools::{CheckProcessParams, ExecParams, SudoExecParams};

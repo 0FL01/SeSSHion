@@ -2,6 +2,10 @@
 //!
 //! Provides the `CommandOutput` struct and `exec_command` functionality
 //! for executing commands over an SSH connection with timeout support.
+//!
+//! This module is designed to be compatible with both GNU and BusyBox-based
+//! systems (e.g., Debian/Ubuntu and Alpine Linux). All command detection and
+//! process monitoring uses portable mechanisms that work across distributions.
 
 use std::time::Duration;
 
@@ -45,6 +49,21 @@ pub struct TransferRawOutput {
 
     /// Exit code of the remote command (if provided).
     pub exit_code: Option<u32>,
+}
+
+/// Process status check result
+#[derive(Debug, Clone)]
+pub struct ProcessStatus {
+    /// Whether the process is currently running
+    pub running: bool,
+    /// Exit code if process has completed
+    pub exit_code: Option<u32>,
+    /// Elapsed time in ps format (e.g., "12:34" or "2-12:34:56")
+    pub elapsed_time: String,
+    /// Command line of the process (from /proc/PID/cmdline)
+    pub command: String,
+    /// Tail of the log file (if log_path provided)
+    pub log_tail: String,
 }
 
 impl CommandOutput {
@@ -832,6 +851,143 @@ impl SshConnectionManager {
             }
         }
     }
+
+    /// Check the status of a process by PID
+    ///
+    /// Uses `/proc/PID/stat` for process detection, which is portable across all Linux systems.
+    /// This approach works reliably on Debian, Ubuntu, Alpine, and any Linux distribution with
+    /// procfs support. Unlike the `ps` command, which has varying output formats between GNU
+    /// and BusyBox implementations, `/proc/PID/stat` has a consistent format across all Linux
+    /// distributions, making it the preferred method for portable process detection.
+    ///
+    /// Falls back to reading exit code from `{log_path}.exit` file if process not running.
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID to check
+    /// * `log_path` - Optional path to log file to read tail from
+    /// * `tail_lines` - Number of lines to read from log tail
+    ///
+    /// # Returns
+    /// ProcessStatus with running state, exit code, elapsed time, command, and log tail
+    pub async fn check_process(
+        &self,
+        pid: u32,
+        log_path: Option<String>,
+        tail_lines: usize,
+    ) -> Result<ProcessStatus> {
+        debug!("Checking process status: pid={}", pid);
+
+        // Use /proc/PID/stat which works on both Alpine (BusyBox) and Debian/Ubuntu
+        // Format: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime ...
+        // The command name (comm) is the 2nd field in parentheses
+        let stat_cmd = format!("cat /proc/{}/stat 2>/dev/null || echo 'NOT_FOUND'", pid);
+        debug!("Executing stat command for pid={}", pid);
+        let stat_output = self.exec_command(&stat_cmd, Duration::from_secs(5)).await?;
+
+        let stdout = stat_output.stdout.trim();
+        debug!(
+            "Stat output for pid={}: len={}, content={}",
+            pid,
+            stdout.len(),
+            stdout
+        );
+
+        let (running, command) = if stdout.is_empty() || stdout == "NOT_FOUND" {
+            debug!("Process {} not found in /proc", pid);
+            (false, String::new())
+        } else {
+            // Parse /proc/PID/stat format
+            // Example: "1234 (bash) S 1233 1234 1234 34816 1234 ..."
+            // The command name is in parentheses, may contain spaces
+            let cmd = parse_comm_from_stat(stdout);
+            debug!("Process {} is running, command='{}'", pid, cmd);
+            (true, cmd)
+        };
+
+        // Try to get exit code from exit file if process not running
+        let exit_code = if !running {
+            if let Some(ref path) = log_path {
+                let exit_file = format!("{}.exit", path);
+                let escaped_exit_file = escape_command_for_shell(&exit_file);
+                let exit_cmd = format!("cat '{}' 2>/dev/null | head -1 || true", escaped_exit_file);
+                debug!("Reading exit code from: {}", exit_file);
+                let exit_output = self.exec_command(&exit_cmd, Duration::from_secs(2)).await?;
+                let exit_str = exit_output.stdout.trim();
+                if exit_str.is_empty() {
+                    debug!("No exit code found in {}", exit_file);
+                    None
+                } else {
+                    let code = exit_str.parse::<u32>().ok();
+                    debug!("Found exit code: {:?}", code);
+                    code
+                }
+            } else {
+                debug!("No log_path provided, cannot determine exit code");
+                None
+            }
+        } else {
+            None
+        };
+
+        // Get log tail if path provided
+        let log_tail = if let Some(ref path) = log_path {
+            let escaped_path = escape_command_for_shell(path);
+            let tail_cmd = format!(
+                "tail -n {} '{}' 2>/dev/null || true",
+                tail_lines, escaped_path
+            );
+            debug!("Reading log tail from: {} ({} lines)", path, tail_lines);
+            let tail_output = self.exec_command(&tail_cmd, Duration::from_secs(5)).await?;
+            tail_output.stdout
+        } else {
+            String::new()
+        };
+
+        debug!(
+            "Process status for pid={}: running={}, exit_code={:?}, command_len={}",
+            pid,
+            running,
+            exit_code,
+            command.len()
+        );
+
+        Ok(ProcessStatus {
+            running,
+            exit_code,
+            elapsed_time: String::new(), // Simplified: empty for MVP (BusyBox ps doesn't support etime)
+            command,
+            log_tail,
+        })
+    }
+}
+
+/// Parse the command name (comm) from /proc/PID/stat output.
+///
+/// The stat file format is:
+/// `pid (comm) state ppid pgrp session tty_nr ...`
+///
+/// The command name is the second field, enclosed in parentheses.
+/// It may contain spaces and even parentheses, so we need to parse carefully.
+///
+/// # Arguments
+/// * `stat_line` - The content of /proc/PID/stat
+///
+/// # Returns
+/// The extracted command name (without parentheses)
+fn parse_comm_from_stat(stat_line: &str) -> String {
+    // Find the first '(' and the last ')' before the space after the command name
+    // Format: "1234 (bash) S ..." or "1234 (my cmd) S ..." or "1234 (my (nested)) S ..."
+    if let Some(start) = stat_line.find('(') {
+        // Find the matching ')' - it's the last one before the space that precedes the state
+        // The state is always a single character after the command name
+        if let Some(end) = stat_line.rfind(')') {
+            // Extract between parentheses
+            if start < end {
+                return stat_line[start + 1..end].to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 #[derive(Debug)]

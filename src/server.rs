@@ -22,6 +22,7 @@ use crate::error::{Result, SshMcpError};
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
+use crate::tools::CheckProcessParams;
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -283,7 +284,10 @@ fn background_json_ok(markers: BackgroundMarkers) -> CallToolResult {
 }
 
 fn background_json_timeout(markers: BackgroundMarkers) -> CallToolResult {
-    let hint = "Command timed out; job continues in background. Hint: use JSON fields pid/log_path; check progress with: ps -p <pid> -o pid,etime,cmd; tail -n 50 '<log_path>'";
+    let hint = format!(
+        "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with pid={} to monitor progress and retrieve output.",
+        markers.pid
+    );
     let body = serde_json::json!({
         "ok": false,
         "timeout": true,
@@ -951,6 +955,50 @@ impl SshMcpServer {
             .await
     }
 
+    /// Execute check-process tool
+    async fn execute_check_process(
+        &self,
+        params: CheckProcessParams,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        debug!("check-process tool called: pid={}", params.pid);
+
+        // Ensure connection is established
+        if let Err(e) = self.connection.ensure_connected().await {
+            error!("Failed to ensure SSH connection: {}", e);
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "SSH connection error: {}",
+                e
+            ))]));
+        }
+
+        // Call the check_process method on connection
+        match self
+            .connection
+            .check_process(params.pid, params.log_path.clone(), params.tail_lines)
+            .await
+        {
+            Ok(status) => {
+                let result = serde_json::json!({
+                    "running": status.running,
+                    "exit_code": status.exit_code,
+                    "elapsed_time": status.elapsed_time,
+                    "command": status.command,
+                    "log_tail": status.log_tail,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    result.to_string(),
+                )]))
+            }
+            Err(e) => {
+                error!("Check process failed: {}", e);
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error checking process: {}",
+                    e
+                ))]))
+            }
+        }
+    }
+
     async fn execute_background_sudo_command(
         &self,
         command: &str,
@@ -1160,6 +1208,36 @@ impl SshMcpServer {
         )
     }
 
+    /// Build check-process tool definition
+    fn check_process_tool() -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID to check"
+                },
+                "log_path": {
+                    "type": "string",
+                    "description": "Optional path to log file to read tail from"
+                },
+                "tail_lines": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Number of last lines to read from log"
+                }
+            },
+            "required": ["pid"]
+        });
+
+        let schema_obj = schema.as_object().cloned().unwrap_or_default();
+        Tool::new(
+            "check-process",
+            "Check status of a background process started by exec/sudo-exec tools. Useful for monitoring long-running commands and retrieving results after timeout.",
+            Arc::new(schema_obj),
+        )
+    }
+
     /// Get extended documentation for a tool by name
     ///
     /// Returns the full documentation text that was removed from compact tool definitions
@@ -1202,6 +1280,22 @@ impl SshMcpServer {
         command: &str,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_sudo_command(command).await
+    }
+
+    /// Internal method exposed for testing - checks a process status by PID
+    #[doc(hidden)]
+    pub async fn test_check_process(
+        &self,
+        pid: u32,
+        log_path: Option<String>,
+        tail_lines: usize,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let params = CheckProcessParams {
+            pid,
+            log_path,
+            tail_lines,
+        };
+        self.execute_check_process(params).await
     }
 
     #[doc(hidden)]
@@ -1270,6 +1364,7 @@ impl ServerHandler for SshMcpServer {
         let mut tools = vec![Self::exec_tool()];
 
         tools.push(Self::transfer_tool());
+        tools.push(Self::check_process_tool());
 
         // Add sudo-exec tool if enabled
         if !self.config.disable_sudo {
@@ -1466,6 +1561,14 @@ impl ServerHandler for SshMcpServer {
                 });
                 Ok(CallToolResult::success(vec![Content::text(body)]))
             }
+            "check-process" | "check_process" => {
+                let params: CheckProcessParams =
+                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
+                        McpError::invalid_params(format!("invalid check-process params: {e}"), None)
+                    })?;
+
+                self.execute_check_process(params).await
+            }
             _ => Err(McpError::invalid_params(
                 format!("Unknown tool: {}", tool_name),
                 None,
@@ -1660,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn test_background_json_timeout_hint_uses_placeholders_not_marker_values() {
+    fn test_background_json_timeout_hint_contains_pid_and_check_process_tool() {
         let markers = BackgroundMarkers {
             job_id: "job-42".to_string(),
             pid: 4242,
@@ -1685,17 +1788,34 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("expected hint field");
 
+        // Hint should contain the actual PID value
         assert!(
-            hint.contains("<pid>"),
-            "hint should reference pid placeholder; got: '{hint}'"
+            hint.contains("4242"),
+            "hint should contain the actual pid value; got: '{hint}'"
+        );
+        // Hint should mention the check-process tool
+        assert!(
+            hint.contains("check-process"),
+            "hint should mention check-process tool; got: '{hint}'"
+        );
+        // Hint should warn against restarting
+        assert!(
+            hint.contains("DO NOT restart"),
+            "hint should warn against restarting; got: '{hint}'"
+        );
+        // Hint should use TIMEOUT_RECOVERY prefix
+        assert!(
+            hint.contains("TIMEOUT_RECOVERY"),
+            "hint should start with TIMEOUT_RECOVERY; got: '{hint}'"
+        );
+        // Hint should NOT contain old placeholders
+        assert!(
+            !hint.contains("<pid>"),
+            "hint should not contain <pid> placeholder; got: '{hint}'"
         );
         assert!(
-            hint.contains("<log_path>"),
-            "hint should reference log_path placeholder; got: '{hint}'"
-        );
-        assert!(
-            !hint.contains(&markers.log_path),
-            "hint should not contain concrete log_path marker value; got: '{hint}'"
+            !hint.contains("<log_path>"),
+            "hint should not contain <log_path> placeholder; got: '{hint}'"
         );
     }
 

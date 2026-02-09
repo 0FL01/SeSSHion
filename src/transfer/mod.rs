@@ -10,6 +10,7 @@ mod exec_raw;
 mod local_root;
 mod openssh;
 mod rsync;
+mod staging;
 mod tar;
 mod types;
 

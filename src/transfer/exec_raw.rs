@@ -11,14 +11,12 @@ use crate::error::{Result, SshMcpError};
 use crate::ssh::{CommandOutput, SshConnectionManager, TransferRawOutput, escape_for_shell};
 
 use super::local_root;
+use super::staging::{
+    BACKUP_MARKER, ERR_MARKER, STAGE_BASE_MARKER, STAGE_MARKER, parse_marker_value,
+    remote_home_staging_base,
+};
 use super::tar;
 use super::types::{StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferStaging};
-
-const REMOTE_STAGING_BASE_SUFFIX: &str = "/.ssh-mcp/staging";
-const STAGE_MARKER: &str = "__SSH_MCP_STAGE=";
-const STAGE_BASE_MARKER: &str = "__SSH_MCP_STAGE_BASE=";
-const BACKUP_MARKER: &str = "__SSH_MCP_BACKUP=";
-const ERR_MARKER: &str = "__SSH_MCP_ERR=";
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExecRawCtx<'a> {
@@ -119,16 +117,6 @@ pub(crate) fn validate_remote_user_file_path(path: &str, field: &'static str) ->
         )));
     }
     Ok(())
-}
-
-fn parse_marker_value(stderr: &str, prefix: &str) -> Option<String> {
-    stderr
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix).map(|v| v.to_string()))
-}
-
-pub(crate) fn remote_home_staging_base(remote_home: &str) -> String {
-    format!("{remote_home}{REMOTE_STAGING_BASE_SUFFIX}")
 }
 
 pub async fn resolve_remote_home(conn: &SshConnectionManager, timeout: Duration) -> Result<String> {

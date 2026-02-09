@@ -639,6 +639,9 @@ impl SshConnectionManager {
     ) -> Result<CommandOutput> {
         // Approximate: 1 token ≈ 4 bytes for estimation
         const BYTES_PER_TOKEN: usize = 4;
+        // Keep a small tail of truncated output so callers can still see
+        // end-of-command markers (e.g. "done").
+        const TAIL_BYTES: usize = 512;
 
         let mut output = CommandOutput::new();
 
@@ -656,6 +659,26 @@ impl SshConnectionManager {
         let mut stdout_truncation_added = false;
         let mut stderr_truncation_added = false;
 
+        let mut stdout_tail: String = String::new();
+        let mut stderr_tail: String = String::new();
+
+        let push_tail = |buf: &mut String, chunk: &str| {
+            if chunk.is_empty() {
+                return;
+            }
+            buf.push_str(chunk);
+            if buf.len() > TAIL_BYTES {
+                let start = buf.len().saturating_sub(TAIL_BYTES);
+                let mut safe_start = start;
+                while safe_start > 0 && !buf.is_char_boundary(safe_start) {
+                    safe_start = safe_start.saturating_sub(1);
+                }
+                if safe_start > 0 {
+                    buf.drain(..safe_start);
+                }
+            }
+        };
+
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => {
@@ -672,6 +695,7 @@ impl SshConnectionManager {
                             if !stdout_truncation_added {
                                 // Calculate how much we can take
                                 let remaining = limit.saturating_sub(current_len);
+                                let mut take: usize = 0;
                                 if remaining > 0 {
                                     // Safe slicing: we know remaining is within bounds since data_str.len() > remaining
                                     let safe_end = data_str
@@ -679,7 +703,7 @@ impl SshConnectionManager {
                                         .map(|(i, _)| i)
                                         .find(|&i| i > remaining)
                                         .unwrap_or(data_str.len());
-                                    let take = std::cmp::min(safe_end, remaining);
+                                    take = std::cmp::min(safe_end, remaining);
                                     output.stdout.push_str(&data_str[..take]);
                                 }
                                 output.stdout_truncated = true;
@@ -695,7 +719,7 @@ impl SshConnectionManager {
                                 );
                                 output.stdout.push_str(
                                     "\n[Tip: For large output use SFTP/SCP tools to download files]",
-                                );
+                                 );
 
                                 stdout_truncation_added = true;
                                 warn!(
@@ -703,6 +727,10 @@ impl SshConnectionManager {
                                     total_stdout_tokens,
                                     max_bytes.map(|b| b / BYTES_PER_TOKEN).unwrap_or(0)
                                 );
+
+                                push_tail(&mut stdout_tail, &data_str[take..]);
+                            } else {
+                                push_tail(&mut stdout_tail, &data_str);
                             }
                             // Skip remaining stdout data
                         } else {
@@ -729,6 +757,7 @@ impl SshConnectionManager {
                                 if !stderr_truncation_added {
                                     // Calculate how much we can take
                                     let remaining = limit.saturating_sub(current_len);
+                                    let mut take: usize = 0;
                                     if remaining > 0 {
                                         // Safe slicing: find UTF-8 safe boundary
                                         let safe_end = data_str
@@ -736,7 +765,7 @@ impl SshConnectionManager {
                                             .map(|(i, _)| i)
                                             .find(|&i| i > remaining)
                                             .unwrap_or(data_str.len());
-                                        let take = std::cmp::min(safe_end, remaining);
+                                        take = std::cmp::min(safe_end, remaining);
                                         output.stderr.push_str(&data_str[..take]);
                                     }
                                     output.stderr_truncated = true;
@@ -760,6 +789,10 @@ impl SshConnectionManager {
                                         total_stderr_tokens,
                                         max_bytes.map(|b| b / BYTES_PER_TOKEN).unwrap_or(0)
                                     );
+
+                                    push_tail(&mut stderr_tail, &data_str[take..]);
+                                } else {
+                                    push_tail(&mut stderr_tail, &data_str);
                                 }
                                 // Skip remaining stderr data
                             } else {
@@ -793,6 +826,16 @@ impl SshConnectionManager {
         }
         if output.stderr_total_tokens == 0 {
             output.stderr_total_tokens = total_stderr_tokens;
+        }
+
+        if output.stdout_truncated && !stdout_tail.is_empty() {
+            output.stdout.push('\n');
+            output.stdout.push_str(&stdout_tail);
+        }
+
+        if output.stderr_truncated && !stderr_tail.is_empty() {
+            output.stderr.push('\n');
+            output.stderr.push_str(&stderr_tail);
         }
 
         // If there's stderr and a non-zero exit code, we might want to handle it

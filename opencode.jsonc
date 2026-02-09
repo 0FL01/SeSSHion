@@ -19,7 +19,7 @@
  //       "--log-format=json",
  //       "--log-rotation=daily"
       ],
-      "enabled": true
+      "enabled": false
     }
   }
 }

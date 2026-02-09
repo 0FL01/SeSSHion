@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::error::{Result, SshMcpError};
@@ -127,7 +128,7 @@ async fn run_rsync(
     rsync_options: &RsyncOptions,
     src: &str,
     dst: &str,
-    _timeout: Duration,
+    timeout_duration: Duration,
 ) -> std::result::Result<RsyncOutput, super::TransportAttemptError> {
     let ssh_opts = build_ssh_options(endpoint);
     let mut cmd = Command::new("rsync");
@@ -156,24 +157,81 @@ async fn run_rsync(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let child = cmd
-        .spawn()
-        .map_err(classify_spawn_error)?
-        .wait_with_output()
-        .await
-        .map_err(|e| super::TransportAttemptError::Other(SshMcpError::Io(e)))?;
+    // Spawn child separately to allow proper cleanup on timeout
+    let mut child = cmd.spawn().map_err(classify_spawn_error)?;
 
-    let stdout = String::from_utf8_lossy(&child.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&child.stderr).to_string();
+    // Take stdout/stderr handles before select! to read them separately
+    let mut stdout_pipe = child.stdout.take().ok_or_else(|| {
+        super::TransportAttemptError::Other(SshMcpError::connection("missing stdout pipe"))
+    })?;
+    let mut stderr_pipe = child.stderr.take().ok_or_else(|| {
+        super::TransportAttemptError::Other(SshMcpError::connection("missing stderr pipe"))
+    })?;
 
-    if !child.status.success() {
-        return Err(classify_rsync_failure(child.status.code(), &stderr));
+    // Spawn tasks to read stdout and stderr
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    });
+
+    // Use select! for timeout handling with proper cleanup
+    let status = tokio::select! {
+        res = child.wait() => {
+            res.map_err(|e| {
+                super::TransportAttemptError::Other(SshMcpError::Io(e))
+            })?
+        }
+        _ = tokio::time::sleep(timeout_duration) => {
+            // Kill the child process on timeout
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = child.kill().await;
+            let _ = child.wait().await; // Reap the process
+            return Err(super::TransportAttemptError::Other(
+                SshMcpError::Timeout(timeout_duration.as_millis() as u64)
+            ));
+        }
+    };
+
+    // Collect stdout/stderr after child completes
+    let stdout_bytes = match stdout_task.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
+        Err(_) => {
+            return Err(super::TransportAttemptError::Other(
+                SshMcpError::connection("stdout task join failed"),
+            ));
+        }
+    };
+
+    let stderr_bytes = match stderr_task.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
+        Err(_) => {
+            return Err(super::TransportAttemptError::Other(
+                SshMcpError::connection("stderr task join failed"),
+            ));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+    if !status.success() {
+        return Err(classify_rsync_failure(status.code(), &stderr));
     }
 
     let counts = parse_rsync_stats(&stdout);
 
     Ok(RsyncOutput {
-        status: child.status,
+        status,
         stdout,
         stderr,
         counts,

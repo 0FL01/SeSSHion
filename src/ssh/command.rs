@@ -79,11 +79,11 @@ impl CommandOutput {
 ///
 /// # Arguments
 /// * `command` - The command to wrap (should be pre-escaped)
-/// * `duration_secs` - Timeout duration in seconds
+/// * `duration_secs` - Timeout duration in seconds (supports fractional seconds like 0.5)
 ///
 /// # Returns
 /// A wrapped command string that includes timeout logic
-pub fn wrap_command_with_timeout(command: &str, duration_secs: u64) -> String {
+pub fn wrap_command_with_timeout(command: &str, duration_secs: f64) -> String {
     let escaped_command = escape_for_timeout_wrapper(command);
     format!(
         "timeout -k {}s {}s sh -lc '{}'",
@@ -171,11 +171,12 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
-        // Check duration edge case
-        let duration_secs = timeout_duration.as_secs();
-        if duration_secs == 0 {
+        // Convert duration to fractional seconds for millisecond precision
+        // as_secs_f64() preserves sub-second precision (e.g., 500ms -> 0.5, 1500ms -> 1.5)
+        let duration_secs = timeout_duration.as_secs_f64();
+        if !duration_secs.is_finite() || duration_secs <= 0.0 {
             return Err(SshMcpError::InvalidParams(
-                "duration must be > 0".to_string(),
+                "duration must be finite and > 0".to_string(),
             ));
         }
 
@@ -432,11 +433,12 @@ impl SshConnectionManager {
         command: &str,
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
-        // Check duration edge case
-        let duration_secs = timeout_duration.as_secs();
-        if duration_secs == 0 {
+        // Convert duration to fractional seconds for millisecond precision
+        // as_secs_f64() preserves sub-second precision (e.g., 500ms -> 0.5, 1500ms -> 1.5)
+        let duration_secs = timeout_duration.as_secs_f64();
+        if !duration_secs.is_finite() || duration_secs <= 0.0 {
             return Err(SshMcpError::InvalidParams(
-                "duration must be > 0".to_string(),
+                "duration must be finite and > 0".to_string(),
             ));
         }
 
@@ -1030,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_wrap_command_with_timeout() {
-        let cmd = wrap_command_with_timeout("sleep 10", 2);
+        let cmd = wrap_command_with_timeout("sleep 10", 2.0);
         assert!(cmd.contains("timeout -k 2s 2s"));
         assert!(cmd.contains("sh -lc")); // Uses login shell
         assert!(cmd.contains("sleep 10"));
@@ -1039,15 +1041,24 @@ mod tests {
     #[test]
     fn test_wrap_command_with_timeout_zero_duration() {
         // Edge case: wrapper accepts zero (validation is elsewhere)
-        let cmd = wrap_command_with_timeout("echo test", 0);
+        let cmd = wrap_command_with_timeout("echo test", 0.0);
         assert!(cmd.contains("timeout -k 2s 0s"));
         assert!(cmd.contains("sh -lc"));
         assert!(cmd.contains("echo test"));
     }
 
     #[test]
+    fn test_wrap_command_with_timeout_fractional() {
+        // Test fractional seconds for sub-second precision
+        let cmd = wrap_command_with_timeout("sleep 1", 0.5);
+        assert!(cmd.contains("timeout -k 2s 0.5s"));
+        assert!(cmd.contains("sh -lc"));
+        assert!(cmd.contains("sleep 1"));
+    }
+
+    #[test]
     fn test_wrap_command_with_timeout_complex_command() {
-        let cmd = wrap_command_with_timeout("echo 'hello world'", 10);
+        let cmd = wrap_command_with_timeout("echo 'hello world'", 10.0);
         assert!(cmd.contains("timeout -k 2s 10s"));
         assert!(cmd.contains("sh -lc"));
         assert!(cmd.contains("echo"));
@@ -1055,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_wrap_command_with_timeout_with_single_quotes() {
-        let cmd = wrap_command_with_timeout("echo 'hello'", 10);
+        let cmd = wrap_command_with_timeout("echo 'hello'", 10.0);
         assert!(cmd.contains("timeout -k 2s 10s"));
         assert!(cmd.contains("sh -lc"));
         // Single quotes are escaped as '"'"'

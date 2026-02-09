@@ -8,3 +8,4 @@ pub mod overwrite_tests;
 pub mod rsync_tests;
 pub mod scp_tests;
 pub mod sftp_tests;
+pub mod timeout_tests;

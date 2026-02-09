@@ -9,13 +9,13 @@ fn test_timeout_wrapper_formatting() {
     use ssh_mcp::ssh::command::wrap_command_with_timeout;
 
     // Test basic command
-    let cmd = wrap_command_with_timeout("echo hello", 10);
+    let cmd = wrap_command_with_timeout("echo hello", 10.0);
     assert!(cmd.contains("timeout -k 2s 10s"));
     assert!(cmd.contains("sh -lc")); // Login shell
     assert!(cmd.contains("echo hello"));
 
     // Test command with special characters
-    let cmd = wrap_command_with_timeout("sleep 30", 2);
+    let cmd = wrap_command_with_timeout("sleep 30", 2.0);
     assert!(cmd.contains("timeout -k 2s 2s"));
     assert!(cmd.contains("sh -lc"));
     assert!(cmd.contains("sleep 30"));
@@ -27,8 +27,24 @@ fn test_wrap_command_with_zero_duration() {
     use ssh_mcp::ssh::command::wrap_command_with_timeout;
 
     // Edge case: wrapper accepts zero (validation is elsewhere)
-    let cmd = wrap_command_with_timeout("echo test", 0);
+    let cmd = wrap_command_with_timeout("echo test", 0.0);
     assert!(cmd.contains("timeout -k 2s 0s"));
+    assert!(cmd.contains("sh -lc"));
+}
+
+/// Test that fractional seconds are handled correctly
+#[test]
+fn test_wrap_command_with_fractional_duration() {
+    use ssh_mcp::ssh::command::wrap_command_with_timeout;
+
+    // Test sub-second timeout
+    let cmd = wrap_command_with_timeout("sleep 1", 0.5);
+    assert!(cmd.contains("timeout -k 2s 0.5s"));
+    assert!(cmd.contains("sh -lc"));
+
+    // Test millisecond precision
+    let cmd = wrap_command_with_timeout("sleep 1", 1.5);
+    assert!(cmd.contains("timeout -k 2s 1.5s"));
     assert!(cmd.contains("sh -lc"));
 }
 

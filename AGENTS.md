@@ -60,6 +60,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │       ├── openssh.rs          # OpenSSH compatibility layer
 │       ├── tar.rs              # TAR archive operations
 │       ├── rsync.rs            # Rsync transfer implementation with delta sync support
+│       ├── staging.rs          # Atomic staging operations for transfers
 │       ├── types.rs            # Transfer type definitions
 │       └── local_root.rs       # Local filesystem root operations
 ```

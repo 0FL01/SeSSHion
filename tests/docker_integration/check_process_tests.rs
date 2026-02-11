@@ -9,6 +9,7 @@
 
 use super::common::*;
 use serde::Deserialize;
+use std::path::Path;
 use std::time::Duration;
 
 /// Response from check_process tool
@@ -16,11 +17,19 @@ use std::time::Duration;
 struct CheckProcessResponse {
     running: bool,
     exit_code: Option<u32>,
-    #[allow(dead_code)]
     elapsed_time: String,
     command: String,
-    #[allow(dead_code)]
     log_tail: String,
+}
+
+/// Response from exec background=true
+#[derive(Debug, Deserialize)]
+struct BackgroundExecResponse {
+    ok: bool,
+    background: bool,
+    job_id: String,
+    pid: u32,
+    log_path: String,
 }
 
 /// Response from timeout foreground command that gets backgrounded
@@ -29,23 +38,23 @@ struct TimeoutBackgroundResponse {
     ok: bool,
     timeout: bool,
     background: bool,
-    #[allow(dead_code)]
     job_id: String,
     pid: u32,
     log_path: String,
-    #[allow(dead_code)]
     hint: String,
 }
 
 /// Helper to parse check_process JSON response
 fn parse_check_process_response(result: &rmcp::model::CallToolResult) -> CheckProcessResponse {
     let text = extract_text_from_result(result);
-    serde_json::from_str(&text).unwrap_or_else(|e| {
-        panic!(
-            "Failed to parse check_process response: {}\nText: {}",
-            e, text
-        )
-    })
+    serde_json::from_str(&text).expect("check_process response should be valid JSON")
+}
+
+fn assert_local_log_file_present(log_path: &str) {
+    let p = Path::new(log_path);
+    assert!(p.is_absolute(), "log_path should be absolute: {log_path}");
+    let meta = std::fs::metadata(p).expect("log_path should exist on local filesystem");
+    assert!(meta.is_file(), "log_path should be a file: {log_path}");
 }
 
 #[tokio::test]
@@ -96,35 +105,30 @@ async fn test_check_process_running() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Start a long-running background process (testing the shell directly)
-    let _exec_result = server
-        .test_execute_command("sleep 30")
-        .await
-        .expect("Failed to execute command");
-
-    // For background test, we need to manually start a background process
-    // and capture its PID using shell mechanisms
     let bg_result = server
-        .test_execute_command("sh -c 'sleep 60 & echo $!'")
+        .test_execute_background_command("sleep 60")
         .await
-        .expect("Failed to start background process");
+        .expect("Failed to start background command");
 
     let bg_text = extract_text_from_result(&bg_result);
-    let pid: u32 = bg_text
-        .split_whitespace()
-        .last()
-        .expect("No PID found in output")
-        .parse()
-        .expect("Failed to parse PID");
+    let bg_resp: BackgroundExecResponse =
+        serde_json::from_str(&bg_text).expect("Failed to parse background response");
+    assert!(bg_resp.ok);
+    assert!(bg_resp.background);
+    assert!(!bg_resp.job_id.is_empty());
+    assert!(!bg_resp.log_path.is_empty());
+    assert_local_log_file_present(&bg_resp.log_path);
 
-    tracing::info!("Started background process with PID: {}", pid);
+    tracing::info!(
+        "Started background job_id={} pid={}",
+        bg_resp.job_id,
+        bg_resp.pid
+    );
 
-    // Give the process a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Check the process - should be running
     let check_result = server
-        .test_check_process(pid, None, 50)
+        .test_check_process(&bg_resp.job_id, 50)
         .await
         .expect("Failed to check process");
 
@@ -132,7 +136,7 @@ async fn test_check_process_running() {
     assert!(
         status.running,
         "Process {} should be running but got: {:?}",
-        pid, status
+        bg_resp.pid, status
     );
     assert!(
         status.exit_code.is_none(),
@@ -141,6 +145,11 @@ async fn test_check_process_running() {
     assert!(
         !status.command.is_empty(),
         "Command name should be captured"
+    );
+    assert!(
+        status.elapsed_time.is_empty() || status.elapsed_time.chars().any(|c| c.is_ascii_digit()),
+        "elapsed_time should be empty or include digits; got: '{}'",
+        status.elapsed_time
     );
 
     server.shutdown().await;
@@ -195,37 +204,47 @@ async fn test_check_process_completed() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Start a quick background process that will exit soon
     let bg_result = server
-        .test_execute_command("sh -c 'sleep 0.5 & echo $!'")
+        .test_execute_background_command("sh -c 'echo done; exit 7'")
         .await
-        .expect("Failed to start background process");
+        .expect("Failed to start background command");
 
     let bg_text = extract_text_from_result(&bg_result);
-    let pid: u32 = bg_text
-        .split_whitespace()
-        .last()
-        .expect("No PID found in output")
-        .parse()
-        .expect("Failed to parse PID");
+    let bg_resp: BackgroundExecResponse =
+        serde_json::from_str(&bg_text).expect("Failed to parse background response");
+    assert!(!bg_resp.log_path.is_empty());
+    assert_local_log_file_present(&bg_resp.log_path);
 
-    tracing::info!("Started quick background process with PID: {}", pid);
+    tracing::info!(
+        "Started background job_id={} pid={}",
+        bg_resp.job_id,
+        bg_resp.pid
+    );
 
-    // Wait for the process to complete
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Poll until exit code is recorded.
+    let mut last = None;
+    for _ in 0..30 {
+        let check_result = server
+            .test_check_process(&bg_resp.job_id, 50)
+            .await
+            .expect("Failed to check process");
+        let status = parse_check_process_response(&check_result);
+        if status.exit_code == Some(7) {
+            last = Some(status);
+            break;
+        }
+        last = Some(status);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    // Check the process - should not be running
-    let check_result = server
-        .test_check_process(pid, None, 50)
-        .await
-        .expect("Failed to check process");
-
-    let status = parse_check_process_response(&check_result);
+    let status = last.expect("status should be set");
     assert!(
         !status.running,
         "Process {} should not be running but got: {:?}",
-        pid, status
+        bg_resp.pid, status
     );
+
+    assert_eq!(status.exit_code, Some(7));
 
     // Command name might be empty for completed processes
     tracing::info!("Completed process status: {:?}", status);
@@ -282,27 +301,21 @@ async fn test_check_process_not_exists() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Try to check a PID that definitely doesn't exist (very large number)
-    let nonexistent_pid: u32 = 99999;
+    let job_id = "job-does-not-exist";
 
     let check_result = server
-        .test_check_process(nonexistent_pid, None, 50)
+        .test_check_process(job_id, 50)
         .await
-        .expect("Failed to check process");
+        .expect("Failed to call check-process");
 
-    let status = parse_check_process_response(&check_result);
     assert!(
-        !status.running,
-        "Non-existent process {} should not be running",
-        nonexistent_pid
+        check_result.is_error.unwrap_or(false),
+        "expected check-process to error"
     );
+    let text = extract_text_from_result(&check_result);
     assert!(
-        status.exit_code.is_none(),
-        "Non-existent process should not have exit code"
-    );
-    assert!(
-        status.command.is_empty(),
-        "Non-existent process should have empty command"
+        text.contains("job not found") || text.contains("not found"),
+        "unexpected error text: {text}"
     );
 
     server.shutdown().await;
@@ -357,51 +370,44 @@ async fn test_check_process_log_tail() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Resolve remote home
-    let home_result = server
-        .test_execute_command(r#"sh -c 'printf %s "$HOME"'"#)
+    let bg_result = server
+        .test_execute_background_command(
+            "sh -c 'for i in $(seq 1 20); do echo \"Line $i\"; done; sleep 2'",
+        )
         .await
-        .expect("failed to resolve remote HOME");
-    let remote_home = extract_text_from_result(&home_result).trim().to_string();
+        .expect("Failed to start background command");
 
-    // Create a test log file with multiple lines
-    let log_path = format!("{}/test_check_process.log", remote_home);
-    let create_result = server
-        .test_execute_command(&format!(
-            "sh -c 'for i in $(seq 1 20); do echo \"Line $i\"; done > {}'",
-            ssh_mcp::escape_for_shell(&log_path)
-        ))
-        .await
-        .expect("Failed to create test log file");
+    let bg_text = extract_text_from_result(&bg_result);
+    let bg_resp: BackgroundExecResponse =
+        serde_json::from_str(&bg_text).expect("Failed to parse background response");
+    assert!(bg_resp.ok);
+    assert!(bg_resp.background);
+    assert!(!bg_resp.log_path.is_empty());
+    assert_local_log_file_present(&bg_resp.log_path);
 
-    let create_text = extract_text_from_result(&create_result);
+    let mut tail5 = String::new();
+    for _ in 0..20 {
+        let check_result = server
+            .test_check_process(&bg_resp.job_id, 5)
+            .await
+            .expect("Failed to check process");
+        let status = parse_check_process_response(&check_result);
+        tail5 = status.log_tail;
+        if tail5.contains("Line 20") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     assert!(
-        !create_text.contains("error"),
-        "Creating log file should not error"
+        tail5.contains("Line 16") || tail5.contains("Line 17") || tail5.contains("Line 20"),
+        "Log tail should contain recent lines. Got: {tail5}"
     );
 
-    // Use PID 1 (init process) which always exists - we just want to test log reading
-    let check_result = server
-        .test_check_process(1, Some(log_path.clone()), 5)
-        .await
-        .expect("Failed to check process");
-
-    let status = parse_check_process_response(&check_result);
-    // Log tail should contain the last 5 lines
-    assert!(
-        status.log_tail.contains("Line 16")
-            || status.log_tail.contains("Line 17")
-            || status.log_tail.contains("Line 20"),
-        "Log tail should contain recent lines. Got: {}",
-        status.log_tail
-    );
-
-    // Check with different tail_lines value
     let check_result_10 = server
-        .test_check_process(1, Some(log_path.clone()), 10)
+        .test_check_process(&bg_resp.job_id, 10)
         .await
         .expect("Failed to check process");
-
     let status_10 = parse_check_process_response(&check_result_10);
     assert!(
         status_10.log_tail.contains("Line 11") || status_10.log_tail.contains("Line 12"),
@@ -409,9 +415,8 @@ async fn test_check_process_log_tail() {
         status_10.log_tail
     );
 
-    // Cleanup
     let _ = server
-        .test_execute_command(&format!("rm -f {}", ssh_mcp::escape_for_shell(&log_path)))
+        .test_execute_command(&format!("kill {} 2>/dev/null || true", bg_resp.pid))
         .await;
 
     server.shutdown().await;
@@ -474,7 +479,8 @@ async fn test_check_process_full_workflow_timeout() {
 
     assert!(result.is_ok(), "Command should return Ok with timeout info");
 
-    let text = extract_text_from_result(&result.unwrap());
+    let result = result.expect("should get timeout/background exec result");
+    let text = extract_text_from_result(&result);
     tracing::info!("Timeout response: {}", text);
 
     // Parse the timeout response
@@ -491,8 +497,18 @@ async fn test_check_process_full_workflow_timeout() {
         "Timeout response should have background=true"
     );
 
+    assert!(!timeout_resp.job_id.is_empty(), "job_id should be present");
+    assert!(
+        !timeout_resp.log_path.is_empty(),
+        "local log_path should be present"
+    );
+    assert_local_log_file_present(&timeout_resp.log_path);
+    assert!(
+        timeout_resp.hint.contains("TIMEOUT_RECOVERY"),
+        "hint should contain TIMEOUT_RECOVERY"
+    );
+
     let pid = timeout_resp.pid;
-    let log_path = timeout_resp.log_path;
 
     tracing::info!("Process running in background with PID: {}", pid);
 
@@ -501,7 +517,7 @@ async fn test_check_process_full_workflow_timeout() {
 
     // Check the process - should still be running
     let check_result = server
-        .test_check_process(pid, Some(log_path.clone()), 50)
+        .test_check_process(&timeout_resp.job_id, 50)
         .await
         .expect("Failed to check process");
 
@@ -525,7 +541,7 @@ async fn test_check_process_full_workflow_timeout() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let check_result2 = server
-        .test_check_process(pid, Some(log_path.clone()), 10)
+        .test_check_process(&timeout_resp.job_id, 10)
         .await
         .expect("Failed to check process");
 
@@ -552,7 +568,7 @@ async fn test_check_process_full_workflow_timeout() {
 
     // Check again - should not be running
     let check_result3 = server
-        .test_check_process(pid, Some(log_path.clone()), 50)
+        .test_check_process(&timeout_resp.job_id, 50)
         .await
         .expect("Failed to check process");
 
@@ -623,7 +639,8 @@ async fn test_check_process_background_exec_workflow() {
 
     assert!(result.is_ok(), "Command should complete or timeout");
 
-    let text = extract_text_from_result(&result.unwrap());
+    let result = result.expect("should get background exec result");
+    let text = extract_text_from_result(&result);
     tracing::info!("Response: {}", text);
 
     // If it timed out and went to background, parse the response
@@ -631,8 +648,18 @@ async fn test_check_process_background_exec_workflow() {
         let timeout_resp: TimeoutBackgroundResponse =
             serde_json::from_str(&text).expect("Failed to parse timeout response");
 
+        assert!(!timeout_resp.job_id.is_empty(), "job_id should be present");
+        assert!(
+            !timeout_resp.log_path.is_empty(),
+            "local log_path should be present"
+        );
+        assert_local_log_file_present(&timeout_resp.log_path);
+        assert!(
+            timeout_resp.hint.contains("TIMEOUT_RECOVERY"),
+            "hint should contain TIMEOUT_RECOVERY"
+        );
+
         let pid = timeout_resp.pid;
-        let log_path = timeout_resp.log_path;
 
         tracing::info!("Background process PID: {}", pid);
 
@@ -640,7 +667,7 @@ async fn test_check_process_background_exec_workflow() {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let check_result = server
-            .test_check_process(pid, Some(log_path.clone()), 50)
+            .test_check_process(&timeout_resp.job_id, 50)
             .await
             .expect("Failed to check process");
 

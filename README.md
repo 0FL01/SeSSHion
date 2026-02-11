@@ -176,7 +176,7 @@ Add this to your `claude_desktop_config.json`:
 }
 ```
 
-With `--log-rotation=daily`, the file will be created as `logs/ssh-mcp.log.YYYY-MM-DD`.
+When using `--log-rotation=daily`, log files are suffixed with the date: `<log_file>.YYYY-MM-DD` (in the same directory as `--log-file`).
 
 ## 🛠 Tools
 
@@ -186,18 +186,29 @@ The server exposes the following MCP tools:
 Execute a shell command as the connected user.
 - **Arguments**:
   - `command` (string, required): The shell command to execute.
-  - `background` (boolean, default: false): If true, start the command detached via nohup and return immediately with a JSON response containing `{job_id, pid, log_path}`. Recommended for long-running operations to avoid client timeouts.
+  - `background` (boolean, default: false): If true, return immediately and continue streaming output to a local log on the MCP server. The job is tracked via `job_id` in an in-memory registry and the response includes `{job_id, pid, log_path}`. Recommended for long-running operations to avoid client timeouts.
   - `timeout_ms` (integer, optional): Override the default command timeout (ms). If the foreground command exceeds this timeout, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`.
-  - `log_path` (string, optional): Custom remote log path for background mode. Defaults to `/tmp/ssh-mcp/<job_id>.log`.
+  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. Defaults to `/tmp/ssh-mcp/<job_id>.log`.
+
+- **Background response fields**:
+  - `log_path` (string): Local log path on the MCP server (e.g. `/tmp/ssh-mcp/<job_id>.log`).
+  - `remote_log_path` (string, deprecated): Compatibility field for backward compatibility. Does NOT represent an actual remote log file in the current architecture. Output is streamed locally; use `log_path` for local log access.
 
 ### `sudo-exec`
 Execute a command with root privileges using `sudo`.
 - **Arguments**:
   - `command` (string, required): The shell command to execute with sudo.
-  - `background` (boolean, default: false): Same behavior as `exec` - detach long-running commands.
+  - `background` (boolean, default: false): Same behavior as `exec` - return immediately and stream output to a local log.
   - `timeout_ms` (integer, optional): Override timeout (ms). Same auto-detach behavior on timeout.
-  - `log_path` (string, optional): Custom log path for background mode.
+  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output.
 - **Note**: This tool uses the `--sudo-password` provided at startup.
+
+### `check-process`
+Check if a background job is still running and read the tail of its local log (stored on the MCP server).
+
+- **Arguments**:
+  - `job_id` (string, required): Job ID returned by `exec`/`sudo-exec` when `background=true` (or timeout auto-detach).
+  - `tail_lines` (integer, default: 50): Number of last lines to read from the local log.
 
 ### `transfer`
 Transfer a file or directory over SSH.
@@ -256,12 +267,39 @@ When using `transport=rsync`, you can customize behavior via `rsync_options`:
 ### Monitoring Background Jobs
 When using `background=true` or when a command auto-detaches on timeout:
 - The response includes `{job_id, pid, log_path}` and a `hint` field with monitoring guidance.
+  - `log_path` is local to the MCP server (default: `/tmp/ssh-mcp/<job_id>.log`).
+  - `remote_log_path` may still be present for backward compatibility but is deprecated; it is compat-only and does not represent a remote log file.
+
+### Log Path Restrictions
+
+When providing a custom `log_path`:
+- Must be an absolute path
+- Must be directly under `/tmp/ssh-mcp/` (no subdirectories)
+- Must have `.log` extension
+- Cannot contain `.` or `..` components
+- Must not have leading/trailing whitespace
+- Must not start with `-`
+- Must not contain control characters (including `\n` / `\r`)
+- Example: `/tmp/ssh-mcp/my-job.log`
+
+Example response:
+```json
+{
+  "job_id": "abc123",
+  "pid": 12345,
+  "log_path": "/tmp/ssh-mcp/abc123.log",
+  "remote_log_path": "/tmp/.ssh-mcp-job-abc123.log"
+}
+```
 - **Recommended approach**: Sleep between checks instead of tight polling.
   - Start with 2-5s intervals, then use 10-30s for longer-running jobs.
-- Check progress with:
+- To check the status/output of a background job, use the `check-process` tool with the `job_id`:
+  ```json
+  {"job_id": "abc123", "tail_lines": 50}
+  ```
+  Or, if you want to run commands on the target host:
   ```bash
   ps -p <pid> -o pid,etime,cmd
-  tail -n 50 -- '<log_path>'
   ```
 
 ### When to Use Background Mode
@@ -276,9 +314,18 @@ When using `background=true` or when a command auto-detaches on timeout:
 **Agent workflow:**
 1. Start command with `background=true` or let it auto-detach on timeout
 2. Get `{job_id, pid, log_path}` immediately
-3. Sleep 2-5s, then check status with `ps` and `tail`
+3. Sleep 2-5s, then check status/output with `check-process` using `job_id`
 4. For long jobs, increase interval to 10-30s
-5. Confirm completion when `ps` no longer lists the PID
+5. Confirm completion when `check-process` reports `running=false` and an `exit_code`
+
+## Migration from Remote Logs
+
+Previous versions wrote background logs to the remote target host. Current versions write and serve logs locally on the MCP server.
+
+Changes:
+- `log_path` in responses is now a LOCAL path on the MCP server (`/tmp/ssh-mcp/<job_id>.log`)
+- `check-process` now requires `job_id` (no more `pid` + `remote_log_path`)
+- `remote_log_path` is a deprecated compatibility field and will be removed in a future version
 
 ## 🔒 Security
 

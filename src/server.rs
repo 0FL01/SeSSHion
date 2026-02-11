@@ -3,6 +3,7 @@
 //! This module provides the main MCP server that integrates SSH connection
 //! management with the `exec` and `sudo-exec` tools.
 
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
@@ -14,9 +15,12 @@ use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
+use crate::background::job::NewRunningJob;
+use crate::background::{JobRegistry, JobState, LocalLogSpooler, OutputStreamer, SharedJobState};
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
 use crate::ssh::{
@@ -27,11 +31,41 @@ use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, Transf
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
-const FOREGROUND_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const FOREGROUND_EXIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const FOREGROUND_LOG_READ_TIMEOUT: Duration = Duration::from_secs(30);
-const DETACH_PROBE_EXIT_WAIT: Duration = Duration::from_secs(5);
-const DETACH_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+const JOB_COMPLETED_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+// O_NOFOLLOW avoids following a symlink on open(), preventing TOCTOU attacks.
+// Keep values in sync with src/transfer/exec_raw.rs.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -71,7 +105,14 @@ struct CommonToolArgs {
 struct BackgroundMarkers {
     job_id: String,
     pid: u32,
-    log_path: String,
+    remote_log_path: String,
+}
+
+fn remote_job_log_path(job_id: &str) -> String {
+    // Transitional behavior:
+    // - Kept for API compatibility (exec/sudo-exec responses may still include remote_log_path).
+    // - Current versions serve logs from local spool files on the MCP server.
+    format!("/tmp/.ssh-mcp-job-{job_id}.log")
 }
 
 fn make_job_id() -> String {
@@ -93,17 +134,14 @@ fn build_background_wrapper_script_full(
     let escaped_user_command = crate::ssh::escape_for_shell(user_command);
     let escaped_log_path = crate::ssh::escape_for_shell(log_path);
 
-    // Keep stdout deterministic: only emit markers.
-    // Any error output should go to stderr.
+    // Emit markers first, then `exec` the user command.
+    // The wrapper PID becomes the command PID after `exec`.
     format!(
         "LOG='{escaped_log_path}'; \
- EXIT=\"$LOG.exit\"; export EXIT; \
- log_dir=\"$(dirname -- \"$LOG\")\" || {{ printf '%s\n' \"__SSH_MCP_ERR=dirname_failed\" >&2; exit 1; }}; \
- mkdir -p -- \"$log_dir\" || {{ printf '%s\n' \"__SSH_MCP_ERR=mkdir_failed\" >&2; exit 1; }}; \
-  nohup sh -lc '{escaped_user_command}; ec=$?; printf '\"'\"'%s\\n'\"'\"' \"$ec\" >\"$EXIT\"' >\"$LOG\" 2>&1 </dev/null & pid=$!; \
- printf '%s\n' \"__SSH_MCP_JOB_ID={job_id}\"; \
- printf '%s\n' \"__SSH_MCP_PID=$pid\"; \
- printf '%s\n' \"__SSH_MCP_LOG=$LOG\"",
+  printf '%s\n' \"__SSH_MCP_JOB_ID={job_id}\"; \
+  printf '%s\n' \"__SSH_MCP_PID=$$\"; \
+  printf '%s\n' \"__SSH_MCP_LOG=$LOG\"; \
+  exec sh -lc 'set +m; {escaped_user_command}'",
     )
 }
 
@@ -117,21 +155,14 @@ fn build_background_wrapper_script_portable(
     let escaped_user_command = crate::ssh::escape_for_shell(user_command);
     let escaped_log_path = crate::ssh::escape_for_shell(log_path);
 
-    // BusyBox-friendly: avoid GNU `--` flags; avoid `sh -l`.
-    // Keep stdout deterministic: only emit markers.
+    // BusyBox-friendly: avoid `sh -l`.
+    // Emit markers first, then `exec` the user command.
     format!(
         "LOG='{escaped_log_path}'; \
- EXIT=\"$LOG.exit\"; export EXIT; \
- log_dir=\"${{LOG%/*}}\"; [ \"$log_dir\" = \"$LOG\" ] && log_dir='.'; \
- mkdir -p \"$log_dir\" || {{ printf '%s\n' \"__SSH_MCP_ERR=mkdir_failed\" >&2; exit 1; }}; \
-  if command -v nohup >/dev/null 2>&1; then \
-    nohup sh -c '{escaped_user_command}; ec=$?; printf '\"'\"'%s\\n'\"'\"' \"$ec\" >\"$EXIT\"' >\"$LOG\" 2>&1 </dev/null & \
-  else \
-    sh -c '{escaped_user_command}; ec=$?; printf '\"'\"'%s\\n'\"'\"' \"$ec\" >\"$EXIT\"' >\"$LOG\" 2>&1 </dev/null & \
-  fi; pid=$!; \
   printf '%s\n' \"__SSH_MCP_JOB_ID={job_id}\"; \
-  printf '%s\n' \"__SSH_MCP_PID=$pid\"; \
-  printf '%s\n' \"__SSH_MCP_LOG=$LOG\"",
+  printf '%s\n' \"__SSH_MCP_PID=$$\"; \
+  printf '%s\n' \"__SSH_MCP_LOG=$LOG\"; \
+  exec sh -c 'set +m; {escaped_user_command}'",
     )
 }
 
@@ -148,42 +179,138 @@ fn build_background_wrapper_script(
         DetachMode::Portable => {
             build_background_wrapper_script_portable(job_id, user_command, log_path)
         }
-        DetachMode::DirectOnly => String::new(),
+        DetachMode::DirectOnly => {
+            build_background_wrapper_script_portable(job_id, user_command, log_path)
+        }
     }
 }
 
-fn build_exit_probe_command(exit_path: &str) -> String {
-    let escaped_exit_path = crate::ssh::escape_for_shell(exit_path);
-    format!("cat '{escaped_exit_path}' 2>/dev/null || true")
+async fn read_background_markers_from_channel(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    expected_job_id: &str,
+    expected_log_path: &str,
+    timeout_duration: Duration,
+) -> std::result::Result<(BackgroundMarkers, Vec<u8>), String> {
+    let mut stdout_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut marker_stdout = String::new();
+    let mut parsed_lines = 0usize;
+    let mut line_start = 0usize;
+
+    let fut = async {
+        while parsed_lines < 3 {
+            let Some(msg) = channel.wait().await else {
+                return Err("channel ended before background markers".to_string());
+            };
+
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    stdout_buf.extend_from_slice(data.as_ref());
+
+                    while parsed_lines < 3 {
+                        let Some(rel_nl) =
+                            stdout_buf[line_start..].iter().position(|b| *b == b'\n')
+                        else {
+                            break;
+                        };
+
+                        let nl = line_start.saturating_add(rel_nl);
+                        let line_bytes = &stdout_buf[line_start..nl];
+                        let line = std::str::from_utf8(line_bytes)
+                            .map_err(|e| format!("invalid UTF-8 in marker stream: {e}"))?;
+                        marker_stdout.push_str(line);
+                        marker_stdout.push('\n');
+
+                        parsed_lines = parsed_lines.saturating_add(1);
+                        line_start = nl.saturating_add(1);
+                    }
+                }
+                russh::ChannelMsg::ExtendedData { data, .. } => {
+                    let snippet = String::from_utf8_lossy(data.as_ref());
+                    let snippet: String = snippet.chars().take(256).collect();
+                    return Err(format!(
+                        "unexpected stderr while reading background markers: {snippet}"
+                    ));
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => {
+                    return Err(format!(
+                        "channel exited before background markers (exit_status={exit_status})"
+                    ));
+                }
+                russh::ChannelMsg::Close | russh::ChannelMsg::Eof => {
+                    // Keep reading: ExitStatus may still arrive.
+                }
+                _ => {}
+            }
+        }
+
+        let markers = parse_background_markers(&marker_stdout, expected_job_id, expected_log_path)
+            .map_err(|e| format!("failed to parse background markers: {e}"))?;
+
+        let remaining = if line_start < stdout_buf.len() {
+            stdout_buf.split_off(line_start)
+        } else {
+            Vec::new()
+        };
+        Ok((markers, remaining))
+    };
+
+    match tokio::time::timeout(timeout_duration, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "timed out waiting for background markers after {}ms",
+            timeout_duration.as_millis()
+        )),
+    }
 }
 
-fn build_log_read_command(log_path: &str) -> String {
-    let escaped_log_path = crate::ssh::escape_for_shell(log_path);
-    format!("cat < '{escaped_log_path}'")
-}
-
-fn validate_background_log_path(log_path: &str) -> std::result::Result<(), &'static str> {
+fn validate_background_log_path(
+    base_dir: &Path,
+    log_path: &str,
+) -> std::result::Result<(), String> {
     if log_path.is_empty() {
-        return Err("log_path cannot be empty");
+        return Err("log_path cannot be empty".to_string());
     }
 
     if log_path != log_path.trim() {
-        return Err("log_path must not have leading/trailing whitespace");
+        return Err("log_path must not have leading/trailing whitespace".to_string());
     }
 
     // Be explicit for readability even though these are control chars.
     if log_path.contains(['\n', '\r']) {
-        return Err("log_path must not contain newlines");
+        return Err("log_path must not contain newlines".to_string());
     }
 
     // Without GNU `cat --`, a path starting with '-' may be treated as an option.
     // Disallow this for user-provided paths.
     if log_path.starts_with('-') {
-        return Err("log_path must not start with '-'");
+        return Err("log_path must not start with '-'.".to_string());
     }
 
     if log_path.chars().any(|c| c.is_control()) {
-        return Err("log_path must not contain control characters");
+        return Err("log_path must not contain control characters".to_string());
+    }
+
+    // Current semantics: log_path is a LOCAL path on the MCP server.
+    // Keep it in a single, fixed spool directory to avoid arbitrary local writes.
+    let path = Path::new(log_path);
+    if !path.is_absolute() {
+        return Err("log_path must be an absolute path".to_string());
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return Err("log_path must not contain '.' or '..' path components".to_string());
+    }
+
+    if path.parent() != Some(base_dir) {
+        return Err(format!(
+            "log_path must be directly under {}",
+            base_dir.display()
+        ));
+    }
+    if path.extension().and_then(|s| s.to_str()) != Some("log") {
+        return Err("log_path must have a .log extension".to_string());
     }
 
     Ok(())
@@ -259,7 +386,7 @@ fn parse_background_markers(
     Ok(BackgroundMarkers {
         job_id,
         pid,
-        log_path,
+        remote_log_path: log_path,
     })
 }
 
@@ -270,31 +397,42 @@ fn truncate_with_flag(input: &str, limit_chars: usize) -> (String, bool) {
     (snippet, truncated)
 }
 
-fn background_json_ok(markers: BackgroundMarkers) -> CallToolResult {
+fn background_json_ok(
+    job_id: &str,
+    pid: u32,
+    local_log_path: &str,
+    remote_log_path: &str,
+) -> CallToolResult {
     let body = serde_json::json!({
         "ok": true,
         "background": true,
-        "job_id": markers.job_id,
-        "pid": markers.pid,
-        "log_path": markers.log_path,
+        "job_id": job_id,
+        "pid": pid,
+        "log_path": local_log_path,
+        "remote_log_path": remote_log_path,
     })
     .to_string();
 
     CallToolResult::success(vec![Content::text(body)])
 }
 
-fn background_json_timeout(markers: BackgroundMarkers) -> CallToolResult {
+fn background_json_timeout(
+    job_id: &str,
+    pid: u32,
+    local_log_path: &str,
+    remote_log_path: &str,
+) -> CallToolResult {
     let hint = format!(
-        "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with pid={} to monitor progress and retrieve output.",
-        markers.pid
+        "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with job_id={job_id} to retrieve output."
     );
     let body = serde_json::json!({
         "ok": false,
         "timeout": true,
         "background": true,
-        "job_id": markers.job_id,
-        "pid": markers.pid,
-        "log_path": markers.log_path,
+        "job_id": job_id,
+        "pid": pid,
+        "log_path": local_log_path,
+        "remote_log_path": remote_log_path,
         "hint": hint,
     })
     .to_string();
@@ -302,7 +440,13 @@ fn background_json_timeout(markers: BackgroundMarkers) -> CallToolResult {
     CallToolResult::success(vec![Content::text(body)])
 }
 
-fn background_json_err(job_id: &str, log_path: &str, error: &str, stderr: &str) -> CallToolResult {
+fn background_json_err(
+    job_id: &str,
+    local_log_path: &str,
+    remote_log_path: Option<&str>,
+    error: &str,
+    stderr: &str,
+) -> CallToolResult {
     // Keep the payload deterministic and single-line. Avoid echoing the original command.
     let (error_snippet, error_truncated) =
         truncate_with_flag(error, BACKGROUND_JSON_SNIPPET_LIMIT_CHARS);
@@ -320,8 +464,14 @@ fn background_json_err(job_id: &str, log_path: &str, error: &str, stderr: &str) 
     );
     obj.insert(
         "log_path".to_string(),
-        serde_json::Value::String(log_path.to_string()),
+        serde_json::Value::String(local_log_path.to_string()),
     );
+    if let Some(remote) = remote_log_path {
+        obj.insert(
+            "remote_log_path".to_string(),
+            serde_json::Value::String(remote.to_string()),
+        );
+    }
     obj.insert(
         "error".to_string(),
         serde_json::Value::String(error_snippet),
@@ -342,7 +492,7 @@ fn background_json_err(job_id: &str, log_path: &str, error: &str, stderr: &str) 
         obj.insert(
             "hint".to_string(),
                 serde_json::Value::String(format!(
-                "Response fields were truncated to {} chars. Hint: inspect full output using the JSON log_path field; tail -n 50 '<log_path>'",
+                "Response fields were truncated to {} chars. Hint: inspect full output using log_path or check-process with job_id={job_id}.",
                 BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
             )),
         );
@@ -374,6 +524,9 @@ pub struct SshMcpServer {
     detach_mode: Arc<AtomicU8>,
     detach_mode_lock: Arc<Mutex<()>>,
 
+    spooler: Arc<LocalLogSpooler>,
+    job_registry: Arc<JobRegistry>,
+
     transfer: TransferEngine,
 }
 
@@ -385,17 +538,21 @@ Execute shell commands on remote SSH server.
 
 PARAMETERS:
 - command (string, required): Shell command to execute
-- background (boolean): Run via nohup, returns {job_id,pid,log_path}
+- background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
+  Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
+  (+ remote_log_path deprecated)
 - timeout_ms (integer): Wait timeout in milliseconds (ignored if background=true)
-- log_path (string): Custom log path for background mode
+- log_path (string): Custom LOCAL log path for background mode (must be under /tmp/ssh-mcp)
 
 BACKGROUND MODE:
 For commands longer than RPC timeout, use background=true:
-1. Command runs detached via nohup
-2. Returns immediately with job_id, pid, and log_path
-3. Monitor: ps -p <pid> -o pid,etime,cmd
-4. View output: tail -n 50 '<log_path>'
-5. Check exit code: cat '<log_path>.exit'
+1. Command runs detached on the remote host
+2. Returns immediately with job_id, pid, LOCAL log_path on the MCP server
+3. Monitor: use check-process with job_id (preferred) or ps -p <pid> -o pid,etime,cmd
+4. View output: use check-process with job_id; or tail -n 50 '<log_path>' (local spool file)
+
+NOTE:
+- remote_log_path is kept for backward compatibility only (deprecated) and will be removed in a future version.
 
 EXAMPLE:
 {"command": "apt update && apt install -y nginx", "background": true}"#;
@@ -409,9 +566,10 @@ Requires passwordless sudo or pre-configured sudo password.
 
 PARAMETERS:
 - command (string, required): Shell command to execute with sudo
-- background (boolean): Run via nohup
+- background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
+  Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
 - timeout_ms (integer): Wait timeout
-- log_path (string): Custom log path
+- log_path (string): Custom LOCAL log path (must be under /tmp/ssh-mcp)
 
 EXAMPLE:
 {"command": "systemctl restart nginx", "background": false}"#;
@@ -449,6 +607,15 @@ impl SshMcpServer {
     /// Connection is not established until a tool is actually used.
     pub async fn new(config: Config) -> Result<Self> {
         let local_root = std::env::current_dir()?;
+
+        let spooler = Arc::new(LocalLogSpooler::new_default());
+        spooler.ensure_dir().await.map_err(|e| {
+            SshMcpError::Config(format!(
+                "failed to initialize local log spool dir {}: {e}",
+                spooler.base_dir().display()
+            ))
+        })?;
+        let job_registry = Arc::new(JobRegistry::new(JOB_COMPLETED_RETENTION));
 
         // Build SSH configuration
         let mut ssh_config = SshConfig::new(&config.host, &config.user).with_port(config.port);
@@ -496,8 +663,108 @@ impl SshMcpServer {
             max_chars,
             detach_mode: Arc::new(AtomicU8::new(DetachMode::Unknown.as_u8())),
             detach_mode_lock: Arc::new(Mutex::new(())),
+            spooler,
+            job_registry,
             transfer: TransferEngine::new(local_root),
         })
+    }
+
+    fn connection_id(&self) -> String {
+        format!(
+            "{}@{}:{}",
+            self.config.user, self.config.host, self.config.port
+        )
+    }
+
+    fn default_local_log_path(
+        &self,
+        job_id: &str,
+    ) -> std::result::Result<(PathBuf, String), String> {
+        let path = self
+            .spooler
+            .log_path_for(job_id)
+            .map_err(|e| format!("failed to generate local log path for job_id='{job_id}': {e}"))?;
+        let path_str = path.to_string_lossy().to_string();
+        Ok((path, path_str))
+    }
+
+    async fn ensure_local_log_file(&self, log_path: &Path) -> std::result::Result<(), SshMcpError> {
+        self.spooler.ensure_dir().await.map_err(|e| {
+            SshMcpError::Config(format!(
+                "failed to ensure local log spool dir {}: {e}",
+                self.spooler.base_dir().display()
+            ))
+        })?;
+
+        if log_path.parent() != Some(self.spooler.base_dir()) {
+            return Err(SshMcpError::InvalidParams(format!(
+                "log_path must be directly under {}",
+                self.spooler.base_dir().display()
+            )));
+        }
+
+        match tokio::fs::symlink_metadata(log_path).await {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if ft.is_symlink() {
+                    return Err(SshMcpError::invalid_params(
+                        "log_path is a symlink (refusing to follow it)",
+                    ));
+                }
+                if !ft.is_file() {
+                    return Err(SshMcpError::invalid_params(
+                        "log_path exists but is not a regular file",
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SshMcpError::Io(e)),
+        }
+
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+
+        #[cfg(unix)]
+        {
+            opts.custom_flags(O_NOFOLLOW_FLAG);
+        }
+
+        let file = match opts.open(log_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                if let Ok(meta) = tokio::fs::symlink_metadata(log_path).await
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(SshMcpError::invalid_params(
+                        "log_path is a symlink (refusing to follow it)",
+                    ));
+                }
+                return Err(SshMcpError::Io(e));
+            }
+        };
+
+        file.sync_all().await.map_err(SshMcpError::Io)
+    }
+
+    async fn register_running_job(
+        &self,
+        job_id: &str,
+        pid: u32,
+        log_path: PathBuf,
+        command: &str,
+    ) -> SharedJobState {
+        let job = Arc::new(Mutex::new(JobState::new_running(NewRunningJob {
+            job_id: job_id.to_string(),
+            pid,
+            log_path,
+            command: command.to_string(),
+            connection_id: self.connection_id(),
+        })));
+
+        self.job_registry
+            .insert(job_id.to_string(), Arc::clone(&job))
+            .await;
+        job
     }
 
     /// Get a reference to the SSH connection manager
@@ -560,16 +827,25 @@ impl SshMcpServer {
         let marker = format!("__SSH_MCP_AUTODETECT_OK={job_id}");
         let probe_command = format!("printf '%s\\n' \"{marker}\"");
 
-        let log_path = format!("/tmp/ssh-mcp/autodetect-{job_id}.log");
-        let exit_path = format!("{}.exit", log_path);
-        let wrapper = build_background_wrapper_script(mode, &job_id, &probe_command, &log_path);
+        let (log_path_buf, _log_path_str) = self
+            .default_local_log_path(&format!("autodetect-{job_id}"))
+            .map_err(SshMcpError::config)?;
+        self.ensure_local_log_file(&log_path_buf).await?;
+
+        let remote_log_path = remote_job_log_path(&job_id);
+        let wrapper =
+            build_background_wrapper_script(mode, &job_id, &probe_command, &remote_log_path);
 
         let start_output = self
             .connection
             .exec_command(&wrapper, Duration::from_secs(5))
             .await?;
 
-        let markers = match parse_background_markers(&start_output.stdout, &job_id, &log_path) {
+        let markers = match parse_background_markers(
+            &start_output.stdout,
+            &job_id,
+            &remote_log_path,
+        ) {
             Ok(m) => m,
             Err(parse_err) => {
                 debug!(
@@ -581,37 +857,10 @@ impl SshMcpServer {
             }
         };
 
-        let deadline = tokio::time::Instant::now() + DETACH_PROBE_EXIT_WAIT;
-        let mut exit_code: Option<u32> = None;
-        while tokio::time::Instant::now() < deadline {
-            let probe_cmd = build_exit_probe_command(&exit_path);
-            let out = self
-                .connection
-                .exec_command(&probe_cmd, Duration::from_secs(2))
-                .await?;
-            let trimmed = out.stdout.trim();
-            if let Ok(code) = trimmed.parse::<u32>() {
-                exit_code = Some(code);
-                break;
-            }
-            tokio::time::sleep(DETACH_PROBE_POLL_INTERVAL).await;
-        }
-
-        if exit_code != Some(0) {
-            return Ok(false);
-        }
-
-        let read_log_cmd = build_log_read_command(&markers.log_path);
-        let log_out = self
-            .connection
-            .exec_command(&read_log_cmd, Duration::from_secs(5))
-            .await?;
-
-        if log_out.exit_code.is_some_and(|code| code != 0) || !log_out.stderr.is_empty() {
-            return Ok(false);
-        }
-
-        Ok(log_out.stdout.contains(&marker))
+        Ok(start_output.exit_code == Some(0)
+            && start_output.stderr.is_empty()
+            && markers.remote_log_path == remote_log_path
+            && start_output.stdout.contains(&marker))
     }
 
     /// Execute a command (used by exec tool)
@@ -649,9 +898,9 @@ impl SshMcpServer {
         }
 
         // Foreground execution is detachable-by-design:
-        // - Start the command immediately using the background wrapper (nohup + log + pid markers)
-        // - Poll for an exit-code file until timeout
-        // - If timeout elapses, return a deterministic single-line JSON payload and keep the job running
+        // - Start the command on a dedicated SSH channel
+        // - Stream remote stdout/stderr into a local spool file
+        // - If timeout elapses, return JSON with job_id/pid/log_path while the stream continues
 
         let detach_mode = self.determine_detach_mode().await;
         if detach_mode == DetachMode::DirectOnly {
@@ -661,7 +910,7 @@ impl SshMcpServer {
                     error!("Command execution failed: {}", e);
                     let mut msg = format!("Error: {}", e);
                     if matches!(e, SshMcpError::Timeout(_)) {
-                        msg.push_str("\nHint: background detach is not supported on this target; rerun with a larger timeout_ms or split the command.");
+                        msg.push_str("\nHint: background detach is not supported on this target; rerun with background=true or a larger timeout_ms.");
                     }
                     return Ok(CallToolResult::error(vec![Content::text(msg)]));
                 }
@@ -669,138 +918,223 @@ impl SshMcpServer {
         }
 
         let job_id = make_job_id();
-        let final_log_path = format!("/tmp/ssh-mcp/{}.log", job_id);
-        let exit_path = format!("{}.exit", final_log_path);
 
+        let (final_log_path_buf, final_log_path) = match self.default_local_log_path(&job_id) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: {e}"
+                ))]));
+            }
+        };
+        if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: {e}"
+            ))]));
+        }
+
+        let remote_log_path = remote_job_log_path(&job_id);
         let wrapper =
-            build_background_wrapper_script(detach_mode, &job_id, &sanitized, &final_log_path);
-        let start_output = match self
+            build_background_wrapper_script(detach_mode, &job_id, &sanitized, &remote_log_path);
+
+        let permit = match self
             .connection
-            .exec_command(&wrapper, BACKGROUND_START_TIMEOUT)
+            .channel_semaphore
+            .clone()
+            .acquire_owned()
             .await
         {
-            Ok(out) => out,
+            Ok(p) => p,
             Err(e) => {
-                error!("Failed to start detached foreground command: {}", e);
                 return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    e
+                    "Error: Failed to acquire command slot: {e}"
                 ))]));
             }
         };
 
-        let markers = match parse_background_markers(&start_output.stdout, &job_id, &final_log_path)
+        let mut channel = match self.connection.open_channel().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: {e}"
+                ))]));
+            }
+        };
+
+        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: Failed to exec background wrapper: {e}"
+            ))]));
+        }
+
+        let (markers, initial_stdout) = match read_background_markers_from_channel(
+            &mut channel,
+            &job_id,
+            &remote_log_path,
+            BACKGROUND_START_TIMEOUT,
+        )
+        .await
         {
-            Ok(m) => m,
-            Err(parse_err) => {
-                let mut msg = format!("Failed to parse background markers: {parse_err}");
-                if let Some(code) = start_output.exit_code {
-                    msg.push_str(&format!("; exit_code={}", code));
-                }
-                if !start_output.stderr.is_empty() {
-                    let stderr_snippet: String = start_output.stderr.chars().take(2048).collect();
-                    msg.push_str("; stderr=");
-                    msg.push_str(&stderr_snippet);
-                }
-                error!("{}", msg);
+            Ok(v) => v,
+            Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    msg
+                    "Error: {e}"
                 ))]));
             }
         };
 
-        let start = tokio::time::Instant::now();
-        let mut last_probe_error: Option<String> = None;
-
-        let exit_code: u32 = loop {
-            if start.elapsed() >= timeout {
-                return Ok(background_json_timeout(markers));
-            }
-
-            let probe_cmd = build_exit_probe_command(&exit_path);
-
-            match self
-                .connection
-                .exec_command(&probe_cmd, FOREGROUND_EXIT_PROBE_TIMEOUT)
-                .await
-            {
-                Ok(out) => {
-                    let trimmed = out.stdout.trim();
-                    if trimmed.is_empty() {
-                        // Not ready yet (or remote cat produced no stdout).
-                        // Keep polling until the effective timeout.
-                    } else {
-                        match trimmed.parse::<u32>() {
-                            Ok(code) => break code,
-                            Err(e) => {
-                                last_probe_error =
-                                    Some(format!("failed to parse exit code '{trimmed}': {e}"));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    last_probe_error = Some(e.to_string());
-                }
-            }
-
-            tokio::time::sleep(FOREGROUND_EXIT_POLL_INTERVAL).await;
-        };
-
-        let read_log_cmd = build_log_read_command(&final_log_path);
-        let log_output = self
-            .connection
-            .exec_command(&read_log_cmd, FOREGROUND_LOG_READ_TIMEOUT)
+        self.register_running_job(&job_id, markers.pid, final_log_path_buf.clone(), &sanitized)
             .await;
 
-        match log_output {
-            Ok(out) => {
-                // Treat log read failures as tool errors. `exec_command` returns Ok(CommandOutput)
-                // even for non-zero exit codes, so we must inspect the result.
-                if out.exit_code.is_some_and(|code| code != 0) || !out.stderr.is_empty() {
-                    let mut msg = format!(
-                        "Command finished (exit_code={}), but reading log failed: cat_exit_code={:?}",
-                        exit_code, out.exit_code
-                    );
-                    if let Some(probe_err) = last_probe_error {
-                        msg.push_str(&format!("; last_probe_error={probe_err}"));
-                    }
-                    let combined = out.combined_output();
-                    if !combined.is_empty() {
-                        msg.push_str("; cat_output=");
-                        msg.push_str(&combined);
-                    }
-                    error!("{}", msg);
+        let streamer = OutputStreamer::new(
+            job_id.clone(),
+            final_log_path_buf.clone(),
+            Arc::clone(&self.job_registry),
+        );
+
+        let join = tokio::spawn(async move {
+            let _permit = permit;
+            streamer.stream_channel(channel, initial_stdout).await
+        });
+
+        let completed = tokio::time::timeout(timeout, join).await;
+        let join_exit_code: Option<i32> = match completed {
+            Ok(joined) => match joined {
+                Ok(Ok(code)) => code,
+                Ok(Err(e)) => {
+                    error!("streaming failed for job {}: {}", job_id, e);
                     return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error: {}",
-                        msg
+                        "Error: streaming failed: {e}"
                     ))]));
                 }
-
-                let output = CommandOutput {
-                    stdout: out.stdout,
-                    stderr: out.stderr,
-                    exit_code: Some(exit_code),
-                    ..Default::default()
-                };
-                Ok(Self::calltool_from_command_output(output))
-            }
-            Err(e) => {
-                let mut msg = format!(
-                    "Command finished (exit_code={}), but reading log failed: {}",
-                    exit_code, e
-                );
-                if let Some(probe_err) = last_probe_error {
-                    msg.push_str(&format!("; last_probe_error={probe_err}"));
+                Err(e) => {
+                    error!("streaming task join failed for job {}: {}", job_id, e);
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: streaming task join failed: {e}"
+                    ))]));
                 }
-                error!("{}", msg);
-                Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    msg
-                ))]))
+            },
+            Err(_) => {
+                return Ok(background_json_timeout(
+                    &job_id,
+                    markers.pid,
+                    &final_log_path,
+                    &markers.remote_log_path,
+                ));
             }
-        }
+        };
+
+        // Phase 5 semantics: exit codes are sourced from local JobRegistry (updated by OutputStreamer).
+        let registry_exit_code: Option<i32> = match self.job_registry.get(&job_id).await {
+            Some(job) => {
+                let job_guard = job.lock().await;
+                job_guard.exit_code
+            }
+            None => None,
+        };
+
+        let exit_code_u32 = registry_exit_code
+            .or(join_exit_code)
+            .and_then(|code| u32::try_from(code).ok())
+            .unwrap_or(255)
+            .min(255);
+
+        let mut file = match tokio::fs::File::open(&final_log_path_buf).await {
+            Ok(f) => f,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to read local log: {e}"
+                ))]));
+            }
+        };
+
+        let max_bytes = self.config.max_output_tokens.map(|t| t.saturating_mul(4));
+
+        const TAIL_BYTES: u64 = 512;
+
+        let stdout = match max_bytes {
+            Some(limit) => {
+                let meta = file.metadata().await.map_err(|e| {
+                    McpError::internal_error(format!("failed to stat local log: {e}"), None)
+                })?;
+                let file_len = meta.len();
+
+                if file_len <= limit as u64 {
+                    let mut buf = Vec::new();
+                    file.read_to_end(&mut buf).await.map_err(|e| {
+                        McpError::internal_error(format!("failed to read local log: {e}"), None)
+                    })?;
+                    String::from_utf8_lossy(&buf).to_string()
+                } else {
+                    let mut head = vec![0u8; limit];
+                    let mut read_total = 0usize;
+                    while read_total < limit {
+                        let n = file.read(&mut head[read_total..]).await.map_err(|e| {
+                            McpError::internal_error(format!("failed to read local log: {e}"), None)
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        read_total = read_total.saturating_add(n);
+                    }
+                    head.truncate(read_total);
+
+                    let tail_len = std::cmp::min(TAIL_BYTES, file_len);
+                    file.seek(std::io::SeekFrom::Start(file_len.saturating_sub(tail_len)))
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(format!("failed to seek local log: {e}"), None)
+                        })?;
+
+                    let mut tail = vec![0u8; tail_len as usize];
+                    let mut tail_read = 0usize;
+                    while tail_read < tail.len() {
+                        let n = file.read(&mut tail[tail_read..]).await.map_err(|e| {
+                            McpError::internal_error(
+                                format!("failed to read local log tail: {e}"),
+                                None,
+                            )
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        tail_read = tail_read.saturating_add(n);
+                    }
+                    tail.truncate(tail_read);
+
+                    let total_tokens = (file_len as usize).saturating_div(4);
+                    let mut out = String::from_utf8_lossy(&head).to_string();
+                    out.push_str(&format!(
+                        "\n[Output truncated: {} tokens total]",
+                        total_tokens
+                    ));
+                    out.push_str(
+                        "\n[Tip: Use 'head -n 100' for first lines, 'tail -n 100' for last lines]",
+                    );
+                    out.push_str("\n[Tip: For large output use SFTP/SCP tools to download files]");
+                    if !tail.is_empty() {
+                        out.push('\n');
+                        out.push_str(&String::from_utf8_lossy(&tail));
+                    }
+                    out
+                }
+            }
+            None => {
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).await.map_err(|e| {
+                    McpError::internal_error(format!("failed to read local log: {e}"), None)
+                })?;
+                String::from_utf8_lossy(&buf).to_string()
+            }
+        };
+
+        let output = CommandOutput {
+            stdout,
+            stderr: String::new(),
+            exit_code: Some(exit_code_u32),
+            ..Default::default()
+        };
+        Ok(Self::calltool_from_command_output(output))
     }
 
     async fn execute_command(
@@ -816,25 +1150,55 @@ impl SshMcpServer {
         command: &str,
         log_path: Option<&str>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let job_id = make_job_id();
+        let remote_log_path = remote_job_log_path(&job_id);
+
+        let (final_log_path_buf, final_log_path) = match log_path {
+            Some(p) => (PathBuf::from(p), p.to_string()),
+            None => match self.default_local_log_path(&job_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(background_json_err(
+                        &job_id,
+                        "",
+                        Some(&remote_log_path),
+                        &e,
+                        "",
+                    ));
+                }
+            },
+        };
+
+        if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
+            return Ok(background_json_err(
+                &job_id,
+                &final_log_path,
+                Some(&remote_log_path),
+                &e.to_string(),
+                "",
+            ));
+        }
+
         // Sanitize the command
         let sanitized = match sanitize_command(command, self.max_chars) {
             Ok(cmd) => cmd,
             Err(e) => {
-                let job_id = make_job_id();
-                let default_log = format!("/tmp/ssh-mcp/{}.log", job_id);
-                let path = log_path.unwrap_or(&default_log);
-                return Ok(background_json_err(&job_id, path, &e.to_string(), ""));
+                return Ok(background_json_err(
+                    &job_id,
+                    &final_log_path,
+                    Some(&remote_log_path),
+                    &e.to_string(),
+                    "",
+                ));
             }
         };
 
         // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
-            let job_id = make_job_id();
-            let default_log = format!("/tmp/ssh-mcp/{}.log", job_id);
-            let path = log_path.unwrap_or(&default_log);
             return Ok(background_json_err(
                 &job_id,
-                path,
+                &final_log_path,
+                Some(&remote_log_path),
                 &format!("SSH connection error: {}", e),
                 "",
             ));
@@ -847,54 +1211,109 @@ impl SshMcpServer {
             debug!("Elevation failed, will run as normal user: {}", e);
         }
 
-        let job_id = make_job_id();
-        let default_log = format!("/tmp/ssh-mcp/{}.log", job_id);
-        let final_log_path: String = log_path.unwrap_or(&default_log).to_string();
-
         let detach_mode = self.determine_detach_mode().await;
         if detach_mode == DetachMode::DirectOnly {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,
+                Some(&remote_log_path),
                 "Background detach is not supported on this target; run with background=false.",
                 "",
             ));
         }
 
         let wrapper =
-            build_background_wrapper_script(detach_mode, &job_id, &sanitized, &final_log_path);
+            build_background_wrapper_script(detach_mode, &job_id, &sanitized, &remote_log_path);
 
-        let output = match self
+        let permit = match self
             .connection
-            .exec_command(&wrapper, BACKGROUND_START_TIMEOUT)
+            .channel_semaphore
+            .clone()
+            .acquire_owned()
             .await
         {
-            Ok(out) => out,
+            Ok(p) => p,
             Err(e) => {
                 return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
+                    Some(&remote_log_path),
+                    &format!("Failed to acquire command slot: {e}"),
+                    "",
+                ));
+            }
+        };
+
+        let mut channel = match self.connection.open_channel().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                return Ok(background_json_err(
+                    &job_id,
+                    &final_log_path,
+                    Some(&remote_log_path),
                     &e.to_string(),
                     "",
                 ));
             }
         };
 
-        match parse_background_markers(&output.stdout, &job_id, &final_log_path) {
-            Ok(markers) => Ok(background_json_ok(markers)),
-            Err(parse_err) => {
-                let mut err = parse_err;
-                if let Some(code) = output.exit_code {
-                    err.push_str(&format!("; exit_code={}", code));
-                }
-                Ok(background_json_err(
+        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
+            return Ok(background_json_err(
+                &job_id,
+                &final_log_path,
+                Some(&remote_log_path),
+                &format!("Failed to exec background wrapper: {e}"),
+                "",
+            ));
+        }
+
+        let (markers, initial_stdout) = match read_background_markers_from_channel(
+            &mut channel,
+            &job_id,
+            &remote_log_path,
+            BACKGROUND_START_TIMEOUT,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
-                    &err,
-                    &output.stderr,
-                ))
+                    Some(&remote_log_path),
+                    &e,
+                    "",
+                ));
             }
-        }
+        };
+
+        self.register_running_job(&job_id, markers.pid, final_log_path_buf.clone(), &sanitized)
+            .await;
+
+        let streamer = OutputStreamer::new(
+            job_id.clone(),
+            final_log_path_buf.clone(),
+            Arc::clone(&self.job_registry),
+        );
+
+        let job_id_for_log = job_id.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = streamer.stream_channel(channel, initial_stdout).await {
+                error!(
+                    "streaming failed for background job {}: {}",
+                    job_id_for_log, e
+                );
+            }
+        });
+
+        Ok(background_json_ok(
+            &job_id,
+            markers.pid,
+            &final_log_path,
+            &markers.remote_log_path,
+        ))
     }
 
     /// Execute a command with sudo (used by sudo-exec tool)
@@ -943,7 +1362,7 @@ impl SshMcpServer {
                 let mut msg = format!("Error: {}", e);
                 if matches!(e, SshMcpError::Timeout(_)) {
                     msg.push_str(
-                        "\nHint: rerun with background=true; watch log_path (e.g. tail -n 50 '<log_path>').",
+                        "\nHint: rerun with background=true; then use check-process with job_id.",
                     );
                 }
                 Ok(CallToolResult::error(vec![Content::text(msg)]))
@@ -964,7 +1383,7 @@ impl SshMcpServer {
         &self,
         params: CheckProcessParams,
     ) -> std::result::Result<CallToolResult, McpError> {
-        debug!("check-process tool called: pid={}", params.pid);
+        debug!("check-process tool called: job_id={}", params.job_id);
 
         // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
@@ -975,10 +1394,13 @@ impl SshMcpServer {
             ))]));
         }
 
-        // Call the check_process method on connection
         match self
             .connection
-            .check_process(params.pid, params.log_path.clone(), params.tail_lines)
+            .check_process(
+                &params.job_id,
+                params.tail_lines,
+                self.job_registry.as_ref(),
+            )
             .await
         {
             Ok(status) => {
@@ -1008,25 +1430,53 @@ impl SshMcpServer {
         command: &str,
         log_path: Option<&str>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        // Sanitize the command
+        let job_id = make_job_id();
+        let remote_log_path = remote_job_log_path(&job_id);
+
+        let (final_log_path_buf, final_log_path) = match log_path {
+            Some(p) => (PathBuf::from(p), p.to_string()),
+            None => match self.default_local_log_path(&job_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(background_json_err(
+                        &job_id,
+                        "",
+                        Some(&remote_log_path),
+                        &e,
+                        "",
+                    ));
+                }
+            },
+        };
+
+        if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
+            return Ok(background_json_err(
+                &job_id,
+                &final_log_path,
+                Some(&remote_log_path),
+                &e.to_string(),
+                "",
+            ));
+        }
+
         let sanitized = match sanitize_command(command, self.max_chars) {
             Ok(cmd) => cmd,
             Err(e) => {
-                let job_id = make_job_id();
-                let default_log = format!("/tmp/ssh-mcp/{}.log", job_id);
-                let path = log_path.unwrap_or(&default_log);
-                return Ok(background_json_err(&job_id, path, &e.to_string(), ""));
+                return Ok(background_json_err(
+                    &job_id,
+                    &final_log_path,
+                    Some(&remote_log_path),
+                    &e.to_string(),
+                    "",
+                ));
             }
         };
 
-        // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
-            let job_id = make_job_id();
-            let default_log = format!("/tmp/ssh-mcp/{}.log", job_id);
-            let path = log_path.unwrap_or(&default_log);
             return Ok(background_json_err(
                 &job_id,
-                path,
+                &final_log_path,
+                Some(&remote_log_path),
                 &format!("SSH connection error: {}", e),
                 "",
             ));
@@ -1039,15 +1489,12 @@ impl SshMcpServer {
             "Wrapped sudo command (password hidden): sudo -n sh -c '...' or printf '...' | sudo ..."
         );
 
-        let job_id = make_job_id();
-        let default_log = format!("/tmp/ssh-mcp/{}.log", job_id);
-        let final_log_path: String = log_path.unwrap_or(&default_log).to_string();
-
         let detach_mode = self.determine_detach_mode().await;
         if detach_mode == DetachMode::DirectOnly {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,
+                Some(&remote_log_path),
                 "Background detach is not supported on this target; run with background=false.",
                 "",
             ));
@@ -1057,40 +1504,103 @@ impl SshMcpServer {
             detach_mode,
             &job_id,
             &wrapped_command,
-            &final_log_path,
+            &remote_log_path,
         );
 
-        let output = match self
+        let permit = match self
             .connection
-            .exec_command(&wrapper, BACKGROUND_START_TIMEOUT)
+            .channel_semaphore
+            .clone()
+            .acquire_owned()
             .await
         {
-            Ok(out) => out,
+            Ok(p) => p,
             Err(e) => {
                 return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
+                    Some(&remote_log_path),
+                    &format!("Failed to acquire command slot: {e}"),
+                    "",
+                ));
+            }
+        };
+
+        let mut channel = match self.connection.open_channel().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                return Ok(background_json_err(
+                    &job_id,
+                    &final_log_path,
+                    Some(&remote_log_path),
                     &e.to_string(),
                     "",
                 ));
             }
         };
 
-        match parse_background_markers(&output.stdout, &job_id, &final_log_path) {
-            Ok(markers) => Ok(background_json_ok(markers)),
-            Err(parse_err) => {
-                let mut err = parse_err;
-                if let Some(code) = output.exit_code {
-                    err.push_str(&format!("; exit_code={}", code));
-                }
-                Ok(background_json_err(
+        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
+            return Ok(background_json_err(
+                &job_id,
+                &final_log_path,
+                Some(&remote_log_path),
+                &format!("Failed to exec background wrapper: {e}"),
+                "",
+            ));
+        }
+
+        let (markers, initial_stdout) = match read_background_markers_from_channel(
+            &mut channel,
+            &job_id,
+            &remote_log_path,
+            BACKGROUND_START_TIMEOUT,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
-                    &err,
-                    &output.stderr,
-                ))
+                    Some(&remote_log_path),
+                    &e,
+                    "",
+                ));
             }
-        }
+        };
+
+        self.register_running_job(
+            &job_id,
+            markers.pid,
+            final_log_path_buf.clone(),
+            &format!("sudo {sanitized}"),
+        )
+        .await;
+
+        let streamer = OutputStreamer::new(
+            job_id.clone(),
+            final_log_path_buf.clone(),
+            Arc::clone(&self.job_registry),
+        );
+
+        let job_id_for_log = job_id.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = streamer.stream_channel(channel, initial_stdout).await {
+                error!(
+                    "streaming failed for background sudo job {}: {}",
+                    job_id_for_log, e
+                );
+            }
+        });
+
+        Ok(background_json_ok(
+            &job_id,
+            markers.pid,
+            &final_log_path,
+            &markers.remote_log_path,
+        ))
     }
 
     fn sanitize_or_tool_error(&self, command: &str) -> std::result::Result<String, CallToolResult> {
@@ -1217,21 +1727,17 @@ impl SshMcpServer {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "pid": {
-                    "type": "integer",
-                    "description": "Process ID to check"
-                },
-                "log_path": {
+                "job_id": {
                     "type": "string",
-                    "description": "Optional path to log file to read tail from"
+                    "description": "Job ID returned by exec/sudo-exec (required)"
                 },
                 "tail_lines": {
                     "type": "integer",
                     "default": 50,
-                    "description": "Number of last lines to read from log"
+                    "description": "Number of lines to read from local log (default 50)"
                 }
             },
-            "required": ["pid"]
+            "required": ["job_id"]
         });
 
         let schema_obj = schema.as_object().cloned().unwrap_or_default();
@@ -1290,16 +1796,23 @@ impl SshMcpServer {
     #[doc(hidden)]
     pub async fn test_check_process(
         &self,
-        pid: u32,
-        log_path: Option<String>,
+        job_id: &str,
         tail_lines: usize,
     ) -> std::result::Result<CallToolResult, McpError> {
         let params = CheckProcessParams {
-            pid,
-            log_path,
+            job_id: job_id.to_string(),
             tail_lines,
         };
         self.execute_check_process(params).await
+    }
+
+    /// Internal method exposed for testing - starts an exec command in background=true mode
+    #[doc(hidden)]
+    pub async fn test_execute_background_command(
+        &self,
+        command: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_background_command(command, None).await
     }
 
     #[doc(hidden)]
@@ -1442,7 +1955,7 @@ impl ServerHandler for SshMcpServer {
                         let s = v.as_str().ok_or_else(|| {
                             McpError::invalid_params("log_path must be a string", None)
                         })?;
-                        validate_background_log_path(s)
+                        validate_background_log_path(self.spooler.base_dir(), s)
                             .map_err(|msg| McpError::invalid_params(msg, None))?;
 
                         Some(s.to_string())
@@ -1619,76 +2132,71 @@ mod tests {
 
     #[test]
     fn test_build_background_wrapper_full_escapes_single_quotes_in_user_command() {
-        let script = build_background_wrapper_script_full(
-            "job-1",
-            "echo 'hello world'",
-            "/tmp/ssh-mcp/job-1.log",
-        );
-        assert!(script.contains("nohup sh -lc 'echo '\"'\"'hello world'\"'\"'; ec=$?;"));
+        let remote_log = remote_job_log_path("job-1");
+        let script =
+            build_background_wrapper_script_full("job-1", "echo 'hello world'", &remote_log);
+        assert!(script.contains("exec sh -lc 'set +m; echo '\"'\"'hello world'\"'\"''"));
     }
 
     #[test]
     fn test_build_background_wrapper_portable_is_busybox_friendly() {
-        let script = build_background_wrapper_script_portable(
-            "job-1",
-            "echo test",
-            "/tmp/ssh-mcp/job-1.log",
-        );
+        let remote_log = remote_job_log_path("job-1");
+        let script = build_background_wrapper_script_portable("job-1", "echo test", &remote_log);
         assert!(!script.contains("dirname --"));
         assert!(!script.contains("mkdir -p --"));
         assert!(!script.contains("sh -lc"));
-        assert!(script.contains("sh -c"));
-        assert!(script.contains("command -v nohup"));
-    }
-
-    fn normalize_single_quote_escapes(script: &str) -> String {
-        script.replace("'\"'\"'", "'")
+        assert!(script.contains("exec sh -c"));
+        assert!(!script.contains("nohup"));
     }
 
     #[test]
-    fn test_background_wrappers_use_single_quoted_printf_format_for_exit_code() {
-        let full =
-            build_background_wrapper_script_full("job-1", "echo test", "/tmp/ssh-mcp/job-1.log");
-        let portable = build_background_wrapper_script_portable(
-            "job-1",
-            "echo test",
-            "/tmp/ssh-mcp/job-1.log",
-        );
+    fn test_background_wrappers_emit_markers_and_exec() {
+        let remote_log = remote_job_log_path("job-1");
 
-        let full_normalized = normalize_single_quote_escapes(&full);
-        let portable_normalized = normalize_single_quote_escapes(&portable);
+        let full = build_background_wrapper_script_full("job-1", "echo test", &remote_log);
+        assert!(full.contains("__SSH_MCP_JOB_ID=job-1"));
+        assert!(full.contains("__SSH_MCP_PID=$$"));
+        assert!(full.contains("__SSH_MCP_LOG=$LOG"));
+        assert!(full.contains("exec sh -lc"));
 
-        assert!(
-            full_normalized.contains("printf '%s\\n' \"$ec\" >\"$EXIT\""),
-            "full wrapper should write exit code using printf with a single-quoted format"
-        );
-        assert!(
-            portable_normalized.contains("printf '%s\\n' \"$ec\" >\"$EXIT\""),
-            "portable wrapper should write exit code using printf with a single-quoted format"
-        );
+        let portable = build_background_wrapper_script_portable("job-1", "echo test", &remote_log);
+        assert!(portable.contains("__SSH_MCP_JOB_ID=job-1"));
+        assert!(portable.contains("__SSH_MCP_PID=$$"));
+        assert!(portable.contains("__SSH_MCP_LOG=$LOG"));
+        assert!(portable.contains("exec sh -c"));
     }
 
     #[test]
-    fn test_exit_probe_and_log_read_commands_are_portable() {
-        let exit_cmd = build_exit_probe_command("/tmp/ssh-mcp/x.log.exit");
-        assert!(!exit_cmd.contains("cat --"));
-        assert!(exit_cmd.contains("2>/dev/null"));
+    fn test_background_wrappers_do_not_redirect_remote_output() {
+        let remote_log = remote_job_log_path("job-1");
+        let full = build_background_wrapper_script_full("job-1", "echo test", &remote_log);
+        assert!(!full.contains(">$LOG"));
+        assert!(!full.contains("2>&1"));
+        assert!(!full.contains("$EXIT"));
+        assert!(!full.contains("nohup"));
 
-        let log_cmd = build_log_read_command("/tmp/ssh-mcp/x.log");
-        assert!(!log_cmd.contains("cat --"));
-        assert!(log_cmd.contains("cat < "));
+        let portable = build_background_wrapper_script_portable("job-1", "echo test", &remote_log);
+        assert!(!portable.contains(">$LOG"));
+        assert!(!portable.contains("2>&1"));
+        assert!(!portable.contains("$EXIT"));
+        assert!(!portable.contains("nohup"));
     }
 
     #[test]
     fn test_validate_background_log_path_rejects_leading_dash() {
-        let err = validate_background_log_path("-not-a-path").unwrap_err();
+        let err =
+            validate_background_log_path(Path::new("/tmp/ssh-mcp"), "-not-a-path").unwrap_err();
         assert!(err.contains("start with '-'") || err.contains("start with"));
     }
 
     #[test]
     fn test_validate_background_log_path_rejects_newlines() {
-        assert!(validate_background_log_path("/tmp/x\nrm -rf /").is_err());
-        assert!(validate_background_log_path("/tmp/x\rrm -rf /").is_err());
+        assert!(
+            validate_background_log_path(Path::new("/tmp/ssh-mcp"), "/tmp/x\nrm -rf /").is_err()
+        );
+        assert!(
+            validate_background_log_path(Path::new("/tmp/ssh-mcp"), "/tmp/x\rrm -rf /").is_err()
+        );
     }
 
     #[test]
@@ -1701,15 +2209,16 @@ mod tests {
 
     #[test]
     fn test_parse_background_markers() {
+        let remote_log = remote_job_log_path("abc-123");
         let stdout =
-            "__SSH_MCP_JOB_ID=abc-123\n__SSH_MCP_PID=456\n__SSH_MCP_LOG=/tmp/ssh-mcp/abc.log\n";
-        let markers = parse_background_markers(stdout, "abc-123", "/tmp/ssh-mcp/abc.log").unwrap();
+            format!("__SSH_MCP_JOB_ID=abc-123\n__SSH_MCP_PID=456\n__SSH_MCP_LOG={remote_log}\n");
+        let markers = parse_background_markers(&stdout, "abc-123", &remote_log).unwrap();
         assert_eq!(
             markers,
             BackgroundMarkers {
                 job_id: "abc-123".to_string(),
                 pid: 456,
-                log_path: "/tmp/ssh-mcp/abc.log".to_string(),
+                remote_log_path: remote_log,
             }
         );
     }
@@ -1719,8 +2228,13 @@ mod tests {
         let long_error = "e".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
         let long_stderr = "s".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
 
-        let result =
-            background_json_err("job-1", "/tmp/ssh-mcp/job-1.log", &long_error, &long_stderr);
+        let result = background_json_err(
+            "job-1",
+            "/tmp/ssh-mcp/job-1.log",
+            Some("/tmp/.ssh-mcp-job-job-1.log"),
+            &long_error,
+            &long_stderr,
+        );
         let text = extract_text_from_result(&result);
 
         let value: serde_json::Value =
@@ -1744,8 +2258,8 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("expected hint when truncated");
         assert!(
-            hint.contains("tail -n 50 '<log_path>'"),
-            "hint should include a safe tail snippet with a placeholder path; got: '{hint}'"
+            hint.contains("check-process") && hint.contains("job_id=job-1"),
+            "hint should point to check-process job_id; got: '{hint}'"
         );
 
         let error_snippet = value
@@ -1768,13 +2282,12 @@ mod tests {
 
     #[test]
     fn test_background_json_timeout_hint_contains_pid_and_check_process_tool() {
-        let markers = BackgroundMarkers {
-            job_id: "job-42".to_string(),
-            pid: 4242,
-            log_path: "/tmp/ssh-mcp/VERY_DISTINCT_LOG_PATH_9b9e3c.log".to_string(),
-        };
-
-        let result = background_json_timeout(markers.clone());
+        let result = background_json_timeout(
+            "job-42",
+            4242,
+            "/tmp/ssh-mcp/local.log",
+            "/tmp/.ssh-mcp-job-job-42.log",
+        );
         let text = extract_text_from_result(&result);
 
         let value: serde_json::Value =
@@ -1792,10 +2305,10 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("expected hint field");
 
-        // Hint should contain the actual PID value
+        // Hint should contain the actual job_id value
         assert!(
-            hint.contains("4242"),
-            "hint should contain the actual pid value; got: '{hint}'"
+            hint.contains("job_id=job-42"),
+            "hint should contain the actual job_id value; got: '{hint}'"
         );
         // Hint should mention the check-process tool
         assert!(

@@ -135,11 +135,14 @@ async fn test_mcp_tools_with_docker() {
             );
         }
 
-        let log_result = server
-            .test_execute_command(&format!("cat < '{}'", log_path))
-            .await
-            .expect("failed to read detached job log");
-        let log_text = extract_text_from_result(&log_result);
+        let log_text = match tokio::fs::read_to_string(log_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                last_log_text = format!("<read error: {e}>");
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        };
         last_log_text = log_text.clone();
 
         if log_text.contains("done") {

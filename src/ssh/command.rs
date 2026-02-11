@@ -7,10 +7,11 @@
 //! systems (e.g., Debian/Ubuntu and Alpine Linux). All command detection and
 //! process monitoring uses portable mechanisms that work across distributions.
 
+use std::path::Path;
 use std::time::Duration;
 
 use russh::ChannelMsg;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
@@ -18,7 +19,41 @@ use tracing::{debug, error, warn};
 use super::config::TIMEOUT_KILL_AFTER_SECS;
 use super::connection::SshConnectionManager;
 use super::sanitize::{escape_command_for_shell, escape_for_timeout_wrapper};
+use crate::background::{JobRegistry, JobStatus};
 use crate::error::{Result, SshMcpError};
+
+// O_NOFOLLOW avoids following a symlink on open(), preventing TOCTOU attacks.
+// Keep values in sync with src/server.rs and src/background/stream.rs.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0;
 
 /// Output from a command execution
 #[derive(Debug, Clone, Default)]
@@ -1041,142 +1076,189 @@ impl SshConnectionManager {
         }
     }
 
-    /// Check the status of a process by PID
+    /// Check the status of a background job by job_id.
     ///
-    /// Uses `/proc/PID/stat` for process detection, which is portable across all Linux systems.
-    /// This approach works reliably on Debian, Ubuntu, Alpine, and any Linux distribution with
-    /// procfs support. Unlike the `ps` command, which has varying output formats between GNU
-    /// and BusyBox implementations, `/proc/PID/stat` has a consistent format across all Linux
-    /// distributions, making it the preferred method for portable process detection.
-    ///
-    /// Falls back to reading exit code from `{log_path}.exit` file if process not running.
+    /// Uses `kill -0` for process detection (existence/permission check without sending a signal).
+    /// This avoids parsing `ps` output (GNU vs BusyBox differences) and works on common Linux
+    /// distributions.
     ///
     /// # Arguments
-    /// * `pid` - Process ID to check
-    /// * `log_path` - Optional path to log file to read tail from
+    /// * `job_id` - Job id returned by background exec
     /// * `tail_lines` - Number of lines to read from log tail
+    /// * `registry` - Job registry holding current job state
     ///
     /// # Returns
     /// ProcessStatus with running state, exit code, elapsed time, command, and log tail
     pub async fn check_process(
         &self,
-        pid: u32,
-        log_path: Option<String>,
+        job_id: &str,
         tail_lines: usize,
+        registry: &JobRegistry,
     ) -> Result<ProcessStatus> {
-        debug!("Checking process status: pid={}", pid);
+        debug!("Checking process status: job_id={}", job_id);
 
-        // Use /proc/PID/stat which works on both Alpine (BusyBox) and Debian/Ubuntu
-        // Format: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime ...
-        // The command name (comm) is the 2nd field in parentheses
-        let stat_cmd = format!("cat /proc/{}/stat 2>/dev/null || echo 'NOT_FOUND'", pid);
-        debug!("Executing stat command for pid={}", pid);
-        let stat_output = self.exec_command(&stat_cmd, Duration::from_secs(5)).await?;
+        let job = registry
+            .get(job_id)
+            .await
+            .ok_or_else(|| SshMcpError::invalid_params(format!("job not found: {job_id}")))?;
 
-        let stdout = stat_output.stdout.trim();
-        debug!(
-            "Stat output for pid={}: len={}, content={}",
-            pid,
-            stdout.len(),
-            stdout
-        );
+        let job_guard = job.lock().await;
+        let pid = job_guard.pid;
+        let command = job_guard.command.clone();
+        let log_path = job_guard.log_path.clone();
+        let status = job_guard.status;
+        let exit_code_i32 = job_guard.exit_code;
+        drop(job_guard);
 
-        let (running, command) = if stdout.is_empty() || stdout == "NOT_FOUND" {
-            debug!("Process {} not found in /proc", pid);
-            (false, String::new())
-        } else {
-            // Parse /proc/PID/stat format
-            // Example: "1234 (bash) S 1233 1234 1234 34816 1234 ..."
-            // The command name is in parentheses, may contain spaces
-            let cmd = parse_comm_from_stat(stdout);
-            debug!("Process {} is running, command='{}'", pid, cmd);
-            (true, cmd)
+        let running = match status {
+            JobStatus::Running => self.is_pid_running(pid).await?,
+            JobStatus::Completed | JobStatus::Failed => false,
         };
 
-        // Try to get exit code from exit file if process not running
-        let exit_code = if !running {
-            if let Some(ref path) = log_path {
-                let exit_file = format!("{}.exit", path);
-                let escaped_exit_file = escape_command_for_shell(&exit_file);
-                let exit_cmd = format!("cat '{}' 2>/dev/null | head -1 || true", escaped_exit_file);
-                debug!("Reading exit code from: {}", exit_file);
-                let exit_output = self.exec_command(&exit_cmd, Duration::from_secs(2)).await?;
-                let exit_str = exit_output.stdout.trim();
-                if exit_str.is_empty() {
-                    debug!("No exit code found in {}", exit_file);
-                    None
-                } else {
-                    let code = exit_str.parse::<u32>().ok();
-                    debug!("Found exit code: {:?}", code);
-                    code
-                }
-            } else {
-                debug!("No log_path provided, cannot determine exit code");
-                None
-            }
-        } else {
+        let exit_code = if running {
             None
-        };
-
-        // Get log tail if path provided
-        let log_tail = if let Some(ref path) = log_path {
-            let escaped_path = escape_command_for_shell(path);
-            let tail_cmd = format!(
-                "tail -n {} '{}' 2>/dev/null || true",
-                tail_lines, escaped_path
-            );
-            debug!("Reading log tail from: {} ({} lines)", path, tail_lines);
-            let tail_output = self.exec_command(&tail_cmd, Duration::from_secs(5)).await?;
-            tail_output.stdout
         } else {
-            String::new()
+            exit_code_i32.and_then(|code| u32::try_from(code).ok())
         };
 
-        debug!(
-            "Process status for pid={}: running={}, exit_code={:?}, command_len={}",
-            pid,
-            running,
-            exit_code,
-            command.len()
-        );
+        let log_tail = read_local_log_tail(&log_path, tail_lines).await?;
 
         Ok(ProcessStatus {
             running,
             exit_code,
-            elapsed_time: String::new(), // Simplified: empty for MVP (BusyBox ps doesn't support etime)
+            elapsed_time: String::new(),
             command,
             log_tail,
         })
     }
+
+    async fn is_pid_running(&self, pid: u32) -> Result<bool> {
+        // `kill -0` checks for existence/permission without sending a signal.
+        let cmd = format!("sh -c 'kill -0 {pid} 2>/dev/null'");
+        let output = self.exec_command(&cmd, Duration::from_secs(5)).await?;
+        Ok(output.exit_code == Some(0))
+    }
 }
 
-/// Parse the command name (comm) from /proc/PID/stat output.
-///
-/// The stat file format is:
-/// `pid (comm) state ppid pgrp session tty_nr ...`
-///
-/// The command name is the second field, enclosed in parentheses.
-/// It may contain spaces and even parentheses, so we need to parse carefully.
-///
-/// # Arguments
-/// * `stat_line` - The content of /proc/PID/stat
-///
-/// # Returns
-/// The extracted command name (without parentheses)
-fn parse_comm_from_stat(stat_line: &str) -> String {
-    // Find the first '(' and the last ')' before the space after the command name
-    // Format: "1234 (bash) S ..." or "1234 (my cmd) S ..." or "1234 (my (nested)) S ..."
-    if let Some(start) = stat_line.find('(') {
-        // Find the matching ')' - it's the last one before the space that precedes the state
-        // The state is always a single character after the command name
-        if let Some(end) = stat_line.rfind(')') {
-            // Extract between parentheses
-            if start < end {
-                return stat_line[start + 1..end].to_string();
+async fn read_local_log_tail(path: &Path, lines: usize) -> Result<String> {
+    if lines == 0 {
+        return Ok(String::new());
+    }
+
+    let mut file = match open_log_read_no_symlink(path).await? {
+        Some(f) => f,
+        None => return Ok(String::new()),
+    };
+
+    let meta = file.metadata().await?;
+    let mut pos = meta.len();
+
+    const CHUNK_SIZE: u64 = 8192;
+    const MAX_READ_BYTES: usize = 1024 * 1024;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut newlines = 0usize;
+
+    while pos > 0 && newlines <= lines && buf.len() < MAX_READ_BYTES {
+        let read_len = std::cmp::min(CHUNK_SIZE, pos) as usize;
+        pos = pos.saturating_sub(read_len as u64);
+
+        file.seek(std::io::SeekFrom::Start(pos)).await?;
+
+        let mut chunk = vec![0u8; read_len];
+        let mut got = 0usize;
+        while got < read_len {
+            let n = file.read(&mut chunk[got..]).await?;
+            if n == 0 {
+                break;
+            }
+            got = got.saturating_add(n);
+        }
+        if got == 0 {
+            break;
+        }
+        chunk.truncate(got);
+
+        newlines = newlines.saturating_add(chunk.iter().filter(|&&b| b == b'\n').count());
+
+        // Prepend chunk to existing buffer (bounded by MAX_READ_BYTES).
+        if chunk.len().saturating_add(buf.len()) > MAX_READ_BYTES {
+            let allowed = MAX_READ_BYTES.saturating_sub(buf.len());
+            chunk.truncate(allowed);
+        }
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let all_lines: Vec<&str> = text.lines().collect();
+    if all_lines.is_empty() {
+        return Ok(String::new());
+    }
+
+    let start = all_lines.len().saturating_sub(lines);
+    Ok(all_lines[start..].join("\n"))
+}
+
+async fn open_log_read_no_symlink(path: &Path) -> Result<Option<tokio::fs::File>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log path is a symlink (refusing to follow it)",
+                )
+                .into());
+            }
+            if !meta.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log path is not a regular file",
+                )
+                .into());
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
     }
-    String::new()
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+
+    #[cfg(unix)]
+    {
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+
+    match opts.open(path).await {
+        Ok(f) => {
+            // Re-check based on the opened file handle to avoid TOCTOU.
+            let meta = f.metadata().await?;
+            if !meta.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log path is not a regular file",
+                )
+                .into());
+            }
+            Ok(Some(f))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            if let Ok(meta) = tokio::fs::symlink_metadata(path).await
+                && meta.file_type().is_symlink()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log path is a symlink (refusing to follow it)",
+                )
+                .into());
+            }
+            Err(e.into())
+        }
+    }
 }
 
 #[derive(Debug)]

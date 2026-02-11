@@ -23,16 +23,21 @@ pub struct ExecParams {
     /// Shell command to execute on the remote SSH server
     pub command: String,
 
-    /// If true, start the command detached (nohup) and return immediately.
-    /// Use this for long-running commands to avoid client timeouts.
-    /// The command output is written to log_path and the tool returns JSON metadata (job_id/pid/log_path).
+    /// Background execution mode.
+    ///
+    /// If true, run the command in background and return immediately.
+    /// The server continues streaming output into a local log file on the MCP server and
+    /// tracks the job via an in-memory registry keyed by job_id.
+    /// The tool returns JSON metadata (job_id/pid/log_path; remote_log_path is deprecated).
     #[serde(default)]
     pub background: bool,
 
     /// Optional timeout override in milliseconds for foreground execution
     pub timeout_ms: Option<u64>,
 
-    /// Optional remote log path for background mode
+    /// Local log path for background mode output (stored on MCP server)
+    ///
+    /// Defaults to /tmp/ssh-mcp/<job_id>.log locally.
     pub log_path: Option<String>,
 }
 
@@ -42,27 +47,33 @@ pub struct SudoExecParams {
     /// Shell command to execute with sudo on the remote SSH server
     pub command: String,
 
-    /// If true, start the command detached (nohup) and return immediately.
-    /// Use this for long-running commands to avoid client timeouts.
-    /// The command output is written to log_path and the tool returns JSON metadata (job_id/pid/log_path).
+    /// Background execution mode.
+    ///
+    /// If true, run the command in background and return immediately.
+    /// The server continues streaming output into a local log file on the MCP server and
+    /// tracks the job via an in-memory registry keyed by job_id.
+    /// The tool returns JSON metadata (job_id/pid/log_path; remote_log_path is deprecated).
     #[serde(default)]
     pub background: bool,
 
     /// Optional timeout override in milliseconds for foreground execution
     pub timeout_ms: Option<u64>,
 
-    /// Optional remote log path for background mode
+    /// Local log path for background mode output (stored on MCP server)
+    ///
+    /// Defaults to /tmp/ssh-mcp/<job_id>.log locally.
     pub log_path: Option<String>,
 }
 
 /// Parameters for the check-process tool
+///
+/// # Migration from old API
+/// Previously required `pid` and `log_path`. Now uses `job_id` only.
+/// The job_id is returned by exec/sudo-exec when background=true.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CheckProcessParams {
-    /// Process ID to check
-    pub pid: u32,
-
-    /// Optional path to the log file to read tail from
-    pub log_path: Option<String>,
+    /// Job ID returned by exec/sudo-exec background execution
+    pub job_id: String,
 
     /// Number of last lines to read from log (default: 50)
     #[serde(default = "default_tail_lines")]
@@ -109,19 +120,17 @@ mod tests {
 
     #[test]
     fn test_check_process_params_deserialize() {
-        let json = r#"{"pid": 12345}"#;
+        let json = r#"{"job_id": "job-123"}"#;
         let params: CheckProcessParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.pid, 12345);
-        assert!(params.log_path.is_none());
+        assert_eq!(params.job_id, "job-123");
         assert_eq!(params.tail_lines, 50);
     }
 
     #[test]
-    fn test_check_process_params_with_log() {
-        let json = r#"{"pid": 12345, "log_path": "/tmp/test.log", "tail_lines": 100}"#;
+    fn test_check_process_params_with_tail_lines() {
+        let json = r#"{"job_id": "job-123", "tail_lines": 100}"#;
         let params: CheckProcessParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.pid, 12345);
-        assert_eq!(params.log_path.as_deref(), Some("/tmp/test.log"));
+        assert_eq!(params.job_id, "job-123");
         assert_eq!(params.tail_lines, 100);
     }
 }

@@ -30,6 +30,7 @@
 //!   --host=YOUR_HOST --user=root --password=pass
 //! ```
 
+pub mod background;
 pub mod config;
 pub mod error;
 pub mod logging;

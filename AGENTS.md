@@ -44,6 +44,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   ├── config.rs               # Configuration and CLI argument parsing
 │   ├── error.rs                # Centralized error handling
 │   ├── logging.rs              # Logging configuration and initialization
+│   ├── platform.rs             # Platform-specific constants (O_NOFOLLOW_FLAG)
 │   ├── ssh/                    # SSH core logic
 │   │   ├── mod.rs              # SSH module definition
 │   │   ├── connection.rs       # SSH session and connection management

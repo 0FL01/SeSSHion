@@ -21,39 +21,8 @@ use super::connection::SshConnectionManager;
 use super::sanitize::{escape_command_for_shell, escape_for_timeout_wrapper};
 use crate::background::{JobRegistry, JobStatus};
 use crate::error::{Result, SshMcpError};
-
-// O_NOFOLLOW avoids following a symlink on open(), preventing TOCTOU attacks.
-// Keep values in sync with src/server.rs and src/background/stream.rs.
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0;
+#[cfg(unix)]
+use crate::platform::O_NOFOLLOW_FLAG;
 
 /// Output from a command execution
 #[derive(Debug, Clone, Default)]

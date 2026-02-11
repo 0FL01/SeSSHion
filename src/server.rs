@@ -23,6 +23,8 @@ use crate::background::job::NewRunningJob;
 use crate::background::{JobRegistry, JobState, LocalLogSpooler, OutputStreamer, SharedJobState};
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
+#[cfg(unix)]
+use crate::platform::O_NOFOLLOW_FLAG;
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
@@ -33,39 +35,6 @@ const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
 
 const JOB_COMPLETED_RETENTION: Duration = Duration::from_secs(60 * 60);
-
-// O_NOFOLLOW avoids following a symlink on open(), preventing TOCTOU attacks.
-// Keep values in sync with src/transfer/exec_raw.rs.
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -8,6 +8,8 @@ use tokio::io;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::{Result, SshMcpError};
+#[cfg(unix)]
+use crate::platform::O_NOFOLLOW_FLAG;
 use crate::ssh::{CommandOutput, SshConnectionManager, TransferRawOutput, escape_for_shell};
 
 use super::local_root;
@@ -740,37 +742,6 @@ pub(crate) async fn atomic_install_file_overwrite_false(
         }
     }
 }
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0;
 
 pub(crate) async fn create_unique_local_staging_file(
     local_root_path: &Path,

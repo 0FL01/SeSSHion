@@ -34,6 +34,8 @@ pub mod background;
 pub mod config;
 pub mod error;
 pub mod logging;
+#[cfg(unix)]
+pub(crate) mod platform;
 pub mod server;
 pub mod ssh;
 pub mod tools;

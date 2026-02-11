@@ -6,39 +6,8 @@ use russh::client;
 use tokio::io::AsyncWriteExt;
 
 use crate::background::{JobRegistry, Result};
-
-// O_NOFOLLOW avoids following a symlink on open(), preventing TOCTOU attacks.
-// Keep values in sync with src/server.rs and src/transfer/exec_raw.rs.
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0;
+#[cfg(unix)]
+use crate::platform::O_NOFOLLOW_FLAG;
 
 fn clamp_exit_status(exit_status: u32) -> i32 {
     if exit_status > 255 {

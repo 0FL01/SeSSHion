@@ -50,9 +50,10 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   ├── error.rs                # Centralized error handling
 │   ├── logging.rs              # Logging configuration and initialization
 │   ├── platform.rs             # Platform-specific constants (O_NOFOLLOW_FLAG)
+│   ├── validate.rs             # Shared path/string validation utilities with unit tests
 │   ├── ssh/                    # SSH core logic
 │   │   ├── mod.rs              # SSH module definition
-│   │   ├── connection.rs       # SSH session and connection management
+│   │   ├── connection.rs       # SSH session, connection management, and slot semaphore helpers
 │   │   ├── command.rs          # Command execution over SSH
 │   │   ├── handler.rs          # SSH event handlers (russh implementation)
 │   │   ├── elevation.rs        # Privileged execution (su/sudo) logic
@@ -71,8 +72,8 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   ├── tools/                  # MCP tool parameter structs
 │   │   └── mod.rs              # Parameter definitions (ExecParams, SudoExecParams, CheckProcessParams)
 │   └── transfer/               # File transfer operations
-│       ├── mod.rs              # Transfer module definition
-│       ├── skeleton.rs         # Shared staging/orchestration helpers (put/get file/dir deduplication)
+│       ├── mod.rs              # Transfer module definition and shared error mapping helpers
+│       ├── skeleton.rs         # Shared staging/orchestration helpers (put/get file/dir deduplication, transfer dispatch)
 │       ├── process.rs          # Shared process spawn/capture/timeout helpers
 │       ├── walk.rs             # Shared directory traversal helpers (no-symlink)
 │       ├── exec_raw.rs         # Raw command execution for transfers

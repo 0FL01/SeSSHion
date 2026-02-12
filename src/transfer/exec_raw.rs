@@ -11,6 +11,7 @@ use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
 use crate::ssh::{CommandOutput, SshConnectionManager, TransferRawOutput, escape_for_shell};
+use crate::validate::validate_basic_path_str;
 
 use super::local_root;
 use super::staging::{
@@ -70,45 +71,7 @@ pub struct GetDirExecRawArgs<'a> {
 }
 
 pub(crate) fn validate_remote_user_path(path: &str, field: &'static str) -> Result<()> {
-    if path.is_empty() {
-        return Err(SshMcpError::invalid_params(format!(
-            "{field} cannot be empty",
-        )));
-    }
-
-    if path.trim().is_empty() {
-        return Err(SshMcpError::invalid_params(format!(
-            "{field} must not be whitespace-only",
-        )));
-    }
-
-    if path != path.trim() {
-        return Err(SshMcpError::invalid_params(format!(
-            "{field} must not have leading or trailing whitespace",
-        )));
-    }
-
-    if path.contains('\0') {
-        return Err(SshMcpError::invalid_params(format!(
-            "{field} must not contain NUL",
-        )));
-    }
-
-    if path.chars().any(|c| c.is_control()) {
-        return Err(SshMcpError::invalid_params(format!(
-            "{field} must not contain control characters",
-        )));
-    }
-
-    // Without consistent `--` support across all remote utilities, a leading '-' may be
-    // interpreted as an option. Reject early for user-supplied remote paths.
-    if path.starts_with('-') {
-        return Err(SshMcpError::invalid_params(format!(
-            "{field} must not start with '-'",
-        )));
-    }
-
-    Ok(())
+    validate_basic_path_str(path, field).map_err(SshMcpError::invalid_params)
 }
 
 pub(crate) fn validate_remote_user_file_path(path: &str, field: &'static str) -> Result<()> {

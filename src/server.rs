@@ -37,6 +37,7 @@ use crate::ssh::{
 };
 use crate::tools::CheckProcessParams;
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
+use crate::validate::validate_basic_path_str;
 
 mod args;
 mod exec;
@@ -80,28 +81,7 @@ fn validate_background_log_path(
     base_dir: &Path,
     log_path: &str,
 ) -> std::result::Result<(), String> {
-    if log_path.is_empty() {
-        return Err("log_path cannot be empty".to_string());
-    }
-
-    if log_path != log_path.trim() {
-        return Err("log_path must not have leading/trailing whitespace".to_string());
-    }
-
-    // Be explicit for readability even though these are control chars.
-    if log_path.contains(['\n', '\r']) {
-        return Err("log_path must not contain newlines".to_string());
-    }
-
-    // Without GNU `cat --`, a path starting with '-' may be treated as an option.
-    // Disallow this for user-provided paths.
-    if log_path.starts_with('-') {
-        return Err("log_path must not start with '-'.".to_string());
-    }
-
-    if log_path.chars().any(|c| c.is_control()) {
-        return Err("log_path must not contain control characters".to_string());
-    }
+    validate_basic_path_str(log_path, "log_path")?;
 
     // Current semantics: log_path is a LOCAL path on the MCP server.
     // Keep it in a single, fixed spool directory to avoid arbitrary local writes.

@@ -41,6 +41,7 @@ mod shell_escape;
 pub mod ssh;
 pub mod tools;
 pub mod transfer;
+pub(crate) mod validate;
 
 // Re-exports for convenience
 pub use config::{Args, Config};

@@ -275,7 +275,7 @@ impl SshConnectionManager {
 
                 // Handle post-send failure: reset su state and invalidate session, no retry
                 if let Err(ref e) = result {
-                    warn!("su channel failed after command sent: {}", e);
+                    warn!(error = ?e, "su channel failed after command sent");
                     self.reset_su_state().await;
                     self.invalidate_session("su channel failed after send")
                         .await;
@@ -290,8 +290,8 @@ impl SshConnectionManager {
 
                 // Reset su state and re-elevate once
                 warn!(
-                    "su channel send failed (pre-send), resetting and re-elevating: {}",
-                    e
+                    error = ?e,
+                    "su channel send failed (pre-send), resetting and re-elevating"
                 );
                 self.reset_su_state().await;
                 self.ensure_elevated().await?;
@@ -333,7 +333,7 @@ impl SshConnectionManager {
 
                 // Handle post-send failure: reset su state and invalidate session, no retry
                 if let Err(ref e) = result {
-                    warn!("su channel failed after command sent (retry): {}", e);
+                    warn!(error = ?e, "su channel failed after command sent (retry)");
                     self.reset_su_state().await;
                     self.invalidate_session("su channel failed after send (retry)")
                         .await;
@@ -616,10 +616,13 @@ impl SshConnectionManager {
             Err(pre_exec_err) => {
                 match &pre_exec_err {
                     PreExecError::ChannelOpen(e) => {
-                        warn!("Channel open failed, attempting reconnect and retry: {}", e);
+                        warn!(
+                            error = ?e,
+                            "Channel open failed, attempting reconnect and retry"
+                        );
                     }
                     PreExecError::ExecSend(e) => {
-                        warn!("Exec send failed, attempting reconnect and retry: {}", e);
+                        warn!(error = ?e, "Exec send failed, attempting reconnect and retry");
                     }
                 }
 
@@ -863,7 +866,7 @@ impl SshConnectionManager {
         let channel = match self.open_channel().await {
             Ok(ch) => ch,
             Err(e) => {
-                error!("Failed to open channel for abort: {}", e);
+                error!(error = ?e, "Failed to open channel for abort");
                 return;
             }
         };
@@ -881,7 +884,7 @@ impl SshConnectionManager {
         );
 
         if let Err(e) = channel.exec(true, abort_cmd.as_str()).await {
-            error!("Failed to exec abort command: {}", e);
+            error!(error = ?e, "Failed to exec abort command");
             return;
         }
 
@@ -1064,7 +1067,7 @@ impl SshConnectionManager {
         tail_lines: usize,
         registry: &JobRegistry,
     ) -> Result<ProcessStatus> {
-        debug!("Checking process status: job_id={}", job_id);
+        debug!(job_id = ?job_id, "Checking process status");
 
         let job = registry
             .get(job_id)

@@ -8,10 +8,14 @@
 //! - [`JobRegistry`]: thread-safe registry for active + recently completed jobs
 //! - [`LocalLogSpooler`]: local `/tmp/ssh-mcp/` directory management
 
+pub(crate) mod detach;
 pub mod job;
+pub(crate) mod marker;
 pub mod registry;
+pub(crate) mod response;
 pub mod spooler;
 pub mod stream;
+pub(crate) mod wrapper;
 
 pub use job::{JobState, JobStatus, SharedJobState};
 pub use registry::JobRegistry;

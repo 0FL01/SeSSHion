@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
                             sigterm.recv().await;
                         }
                         Err(e) => {
-                            error!("Failed to register SIGTERM handler: {}", e);
+                            error!(error = ?e, "Failed to register SIGTERM handler");
                             std::future::pending::<()>().await;
                         }
                     }
@@ -94,11 +94,11 @@ async fn main() -> Result<()> {
             // Wait for the server to finish (it will run until the transport closes)
             info!("MCP server is serving...");
             if let Err(e) = running_server.waiting().await {
-                error!("Server error: {}", e);
+                error!(error = ?e, "Server error");
             }
         }
         Err(e) => {
-            error!("Failed to start MCP server: {}", e);
+            error!(error = ?e, "Failed to start MCP server");
             return Err(ssh_mcp::SshMcpError::connection(e.to_string()));
         }
     }

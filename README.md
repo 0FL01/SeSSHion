@@ -187,8 +187,8 @@ Execute a shell command as the connected user.
 - **Arguments**:
   - `command` (string, required): The shell command to execute.
   - `background` (boolean, default: false): If true, return immediately and continue streaming output to a local log on the MCP server. The job is tracked via `job_id` in an in-memory registry and the response includes `{job_id, pid, log_path}`. Recommended for long-running operations to avoid client timeouts.
-  - `timeout_ms` (integer, optional): Override the default command timeout (ms). If the foreground command exceeds this timeout, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`.
-  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. Defaults to `/tmp/ssh-mcp/<job_id>.log`.
+  - `timeout_ms` (integer, optional): Override the default command timeout (ms) for foreground runs. If the foreground command exceeds this timeout, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`. When `background=true`, `timeout_ms` is ignored and NOT validated.
+  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. Defaults to `/tmp/ssh-mcp/<job_id>.log`. When `background=false`, `log_path` is ignored and NOT validated.
 
 - **Background response fields**:
   - `log_path` (string): Local log path on the MCP server (e.g. `/tmp/ssh-mcp/<job_id>.log`).
@@ -199,8 +199,8 @@ Execute a command with root privileges using `sudo`.
 - **Arguments**:
   - `command` (string, required): The shell command to execute with sudo.
   - `background` (boolean, default: false): Same behavior as `exec` - return immediately and stream output to a local log.
-  - `timeout_ms` (integer, optional): Override timeout (ms). Same auto-detach behavior on timeout.
-  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output.
+  - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. Same auto-detach behavior on timeout. When `background=true`, `timeout_ms` is ignored and NOT validated.
+  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. When `background=false`, `log_path` is ignored and NOT validated.
 - **Note**: This tool uses the `--sudo-password` provided at startup.
 
 ### `check-process`

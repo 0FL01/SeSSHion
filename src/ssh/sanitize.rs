@@ -71,14 +71,10 @@ pub fn sanitize_command(command: &str, max_chars: Option<usize>) -> Result<Strin
 /// let escaped = escape_command_for_shell("echo 'hello' | cat");
 /// assert_eq!(escaped, "echo '\"'\"'hello'\"'\"' \\| cat");
 /// ```
-pub(crate) fn escape_single_quotes(s: &str) -> String {
-    s.replace('\'', "'\"'\"'")
-}
-
 pub fn escape_command_for_shell(command: &str) -> String {
     // Escape order matters for backslash - we escape it first
     // to avoid double-escaping subsequent characters
-    escape_single_quotes(
+    crate::shell_escape::escape_for_shell(
         &command
             .replace('\\', "\\\\")
             .replace('$', "\\$")
@@ -116,7 +112,7 @@ pub fn escape_command_for_shell(command: &str) -> String {
 pub fn escape_for_timeout_wrapper(command: &str) -> String {
     // The command is placed inside single quotes, so backslashes are already preserved.
     // We only need to escape single quotes to keep the wrapper syntax valid.
-    escape_single_quotes(command)
+    crate::shell_escape::escape_for_shell(command)
 }
 
 #[cfg(test)]

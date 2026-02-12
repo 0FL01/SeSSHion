@@ -83,7 +83,7 @@ impl LocalLogSpooler {
                 Ok(Some(e)) => e,
                 Ok(None) => break,
                 Err(e) => {
-                    warn!(error = %e, "failed to read spool directory entry");
+                    warn!(error = ?e, "failed to read spool directory entry");
                     continue;
                 }
             };
@@ -107,7 +107,7 @@ impl LocalLogSpooler {
             let meta = match fs::symlink_metadata(&path).await {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(path = %path.display(), error = %e, "failed to stat spool file");
+                    warn!(path = ?path, error = ?e, "failed to stat spool file");
                     continue;
                 }
             };
@@ -120,7 +120,7 @@ impl LocalLogSpooler {
             let modified = match meta.modified() {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(path = %path.display(), error = %e, "failed to read mtime");
+                    warn!(path = ?path, error = ?e, "failed to read mtime");
                     continue;
                 }
             };
@@ -128,7 +128,7 @@ impl LocalLogSpooler {
             let age = match now.duration_since(modified) {
                 Ok(d) => d,
                 Err(e) => {
-                    warn!(path = %path.display(), error = %e, "invalid modified time");
+                    warn!(path = ?path, error = ?e, "invalid modified time");
                     continue;
                 }
             };
@@ -139,7 +139,7 @@ impl LocalLogSpooler {
             match fs::remove_file(&path).await {
                 Ok(()) => removed += 1,
                 Err(e) => {
-                    warn!(path = %path.display(), error = %e, "failed to remove old spool file");
+                    warn!(path = ?path, error = ?e, "failed to remove old spool file");
                 }
             }
         }

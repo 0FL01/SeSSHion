@@ -19,7 +19,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
+use crate::background::detach::{DetachMode, DetachProbeOutput, DetachProbeRequest};
 use crate::background::job::NewRunningJob;
+use crate::background::marker::read_background_markers_from_channel;
+use crate::background::response::background_json_timeout;
+use crate::background::wrapper::{
+    build_background_wrapper_script_full, build_background_wrapper_script_portable,
+    remote_job_log_path,
+};
 use crate::background::{JobRegistry, JobState, LocalLogSpooler, OutputStreamer, SharedJobState};
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
@@ -31,58 +38,15 @@ use crate::ssh::{
 use crate::tools::CheckProcessParams;
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
+mod args;
+mod exec;
+mod tools;
+
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
-const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
 
 const JOB_COMPLETED_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetachMode {
-    Unknown = 0,
-    Full = 1,
-    Portable = 2,
-    DirectOnly = 3,
-}
-
-impl DetachMode {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Full,
-            2 => Self::Portable,
-            3 => Self::DirectOnly,
-            _ => Self::Unknown,
-        }
-    }
-
-    fn as_u8(self) -> u8 {
-        self as u8
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CommonToolArgs {
-    command: String,
-    background: bool,
-    timeout_ms: Option<u64>,
-    log_path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BackgroundMarkers {
-    job_id: String,
-    pid: u32,
-    remote_log_path: String,
-}
-
-fn remote_job_log_path(job_id: &str) -> String {
-    // Transitional behavior:
-    // - Kept for API compatibility (exec/sudo-exec responses may still include remote_log_path).
-    // - Current versions serve logs from local spool files on the MCP server.
-    format!("/tmp/.ssh-mcp-job-{job_id}.log")
-}
 
 fn make_job_id() -> String {
     let counter = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -91,48 +55,6 @@ fn make_job_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("{}-{}", epoch_ms, counter)
-}
-
-fn build_background_wrapper_script_full(
-    job_id: &str,
-    user_command: &str,
-    log_path: &str,
-) -> String {
-    // The wrapper itself may be nested inside another `sh -lc '...'`.
-    // Escape only for single-quoted contexts inside this wrapper.
-    let escaped_user_command = crate::ssh::escape_for_shell(user_command);
-    let escaped_log_path = crate::ssh::escape_for_shell(log_path);
-
-    // Emit markers first, then `exec` the user command.
-    // The wrapper PID becomes the command PID after `exec`.
-    format!(
-        "LOG='{escaped_log_path}'; \
-  printf '%s\n' \"__SSH_MCP_JOB_ID={job_id}\"; \
-  printf '%s\n' \"__SSH_MCP_PID=$$\"; \
-  printf '%s\n' \"__SSH_MCP_LOG=$LOG\"; \
-  exec sh -lc 'set +m; {escaped_user_command}'",
-    )
-}
-
-fn build_background_wrapper_script_portable(
-    job_id: &str,
-    user_command: &str,
-    log_path: &str,
-) -> String {
-    // The wrapper itself may be nested inside another `sh -lc '...'`.
-    // Escape only for single-quoted contexts inside this wrapper.
-    let escaped_user_command = crate::ssh::escape_for_shell(user_command);
-    let escaped_log_path = crate::ssh::escape_for_shell(log_path);
-
-    // BusyBox-friendly: avoid `sh -l`.
-    // Emit markers first, then `exec` the user command.
-    format!(
-        "LOG='{escaped_log_path}'; \
-  printf '%s\n' \"__SSH_MCP_JOB_ID={job_id}\"; \
-  printf '%s\n' \"__SSH_MCP_PID=$$\"; \
-  printf '%s\n' \"__SSH_MCP_LOG=$LOG\"; \
-  exec sh -c 'set +m; {escaped_user_command}'",
-    )
 }
 
 fn build_background_wrapper_script(
@@ -151,84 +73,6 @@ fn build_background_wrapper_script(
         DetachMode::DirectOnly => {
             build_background_wrapper_script_portable(job_id, user_command, log_path)
         }
-    }
-}
-
-async fn read_background_markers_from_channel(
-    channel: &mut russh::Channel<russh::client::Msg>,
-    expected_job_id: &str,
-    expected_log_path: &str,
-    timeout_duration: Duration,
-) -> std::result::Result<(BackgroundMarkers, Vec<u8>), String> {
-    let mut stdout_buf: Vec<u8> = Vec::with_capacity(256);
-    let mut marker_stdout = String::new();
-    let mut parsed_lines = 0usize;
-    let mut line_start = 0usize;
-
-    let fut = async {
-        while parsed_lines < 3 {
-            let Some(msg) = channel.wait().await else {
-                return Err("channel ended before background markers".to_string());
-            };
-
-            match msg {
-                russh::ChannelMsg::Data { data } => {
-                    stdout_buf.extend_from_slice(data.as_ref());
-
-                    while parsed_lines < 3 {
-                        let Some(rel_nl) =
-                            stdout_buf[line_start..].iter().position(|b| *b == b'\n')
-                        else {
-                            break;
-                        };
-
-                        let nl = line_start.saturating_add(rel_nl);
-                        let line_bytes = &stdout_buf[line_start..nl];
-                        let line = std::str::from_utf8(line_bytes)
-                            .map_err(|e| format!("invalid UTF-8 in marker stream: {e}"))?;
-                        marker_stdout.push_str(line);
-                        marker_stdout.push('\n');
-
-                        parsed_lines = parsed_lines.saturating_add(1);
-                        line_start = nl.saturating_add(1);
-                    }
-                }
-                russh::ChannelMsg::ExtendedData { data, .. } => {
-                    let snippet = String::from_utf8_lossy(data.as_ref());
-                    let snippet: String = snippet.chars().take(256).collect();
-                    return Err(format!(
-                        "unexpected stderr while reading background markers: {snippet}"
-                    ));
-                }
-                russh::ChannelMsg::ExitStatus { exit_status } => {
-                    return Err(format!(
-                        "channel exited before background markers (exit_status={exit_status})"
-                    ));
-                }
-                russh::ChannelMsg::Close | russh::ChannelMsg::Eof => {
-                    // Keep reading: ExitStatus may still arrive.
-                }
-                _ => {}
-            }
-        }
-
-        let markers = parse_background_markers(&marker_stdout, expected_job_id, expected_log_path)
-            .map_err(|e| format!("failed to parse background markers: {e}"))?;
-
-        let remaining = if line_start < stdout_buf.len() {
-            stdout_buf.split_off(line_start)
-        } else {
-            Vec::new()
-        };
-        Ok((markers, remaining))
-    };
-
-    match tokio::time::timeout(timeout_duration, fut).await {
-        Ok(r) => r,
-        Err(_) => Err(format!(
-            "timed out waiting for background markers after {}ms",
-            timeout_duration.as_millis()
-        )),
     }
 }
 
@@ -285,193 +129,6 @@ fn validate_background_log_path(
     Ok(())
 }
 
-fn select_detach_mode(full_supported: bool, portable_supported: bool) -> DetachMode {
-    if full_supported {
-        DetachMode::Full
-    } else if portable_supported {
-        DetachMode::Portable
-    } else {
-        DetachMode::DirectOnly
-    }
-}
-
-fn parse_background_markers(
-    stdout: &str,
-    expected_job_id: &str,
-    expected_log_path: &str,
-) -> std::result::Result<BackgroundMarkers, String> {
-    let mut job_id: Option<String> = None;
-    let mut pid: Option<u32> = None;
-    let mut log_path: Option<String> = None;
-
-    for raw_line in stdout.lines() {
-        let line = raw_line.trim_end_matches('\r');
-        if let Some(rest) = line.strip_prefix("__SSH_MCP_JOB_ID=") {
-            if job_id.is_some() {
-                return Err("Duplicate __SSH_MCP_JOB_ID marker".to_string());
-            }
-            job_id = Some(rest.to_string());
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("__SSH_MCP_PID=") {
-            if pid.is_some() {
-                return Err("Duplicate __SSH_MCP_PID marker".to_string());
-            }
-            let parsed_pid: u32 = rest
-                .parse()
-                .map_err(|e| format!("Invalid pid marker value '{rest}': {e}"))?;
-            pid = Some(parsed_pid);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("__SSH_MCP_LOG=") {
-            if log_path.is_some() {
-                return Err("Duplicate __SSH_MCP_LOG marker".to_string());
-            }
-            log_path = Some(rest.to_string());
-            continue;
-        }
-    }
-
-    let job_id = job_id.ok_or_else(|| "Missing __SSH_MCP_JOB_ID marker".to_string())?;
-    let pid = pid.ok_or_else(|| "Missing __SSH_MCP_PID marker".to_string())?;
-    let log_path = log_path.ok_or_else(|| "Missing __SSH_MCP_LOG marker".to_string())?;
-
-    if pid == 0 {
-        return Err("Invalid pid marker value '0'".to_string());
-    }
-
-    if job_id != expected_job_id {
-        return Err(format!(
-            "Unexpected job id marker value '{job_id}', expected '{expected_job_id}'"
-        ));
-    }
-
-    if log_path != expected_log_path {
-        return Err(format!(
-            "Unexpected log path marker value '{log_path}', expected '{expected_log_path}'"
-        ));
-    }
-
-    Ok(BackgroundMarkers {
-        job_id,
-        pid,
-        remote_log_path: log_path,
-    })
-}
-
-fn truncate_with_flag(input: &str, limit_chars: usize) -> (String, bool) {
-    let mut iter = input.chars();
-    let snippet: String = iter.by_ref().take(limit_chars).collect();
-    let truncated = iter.next().is_some();
-    (snippet, truncated)
-}
-
-fn background_json_ok(
-    job_id: &str,
-    pid: u32,
-    local_log_path: &str,
-    remote_log_path: &str,
-) -> CallToolResult {
-    let body = serde_json::json!({
-        "ok": true,
-        "background": true,
-        "job_id": job_id,
-        "pid": pid,
-        "log_path": local_log_path,
-        "remote_log_path": remote_log_path,
-    })
-    .to_string();
-
-    CallToolResult::success(vec![Content::text(body)])
-}
-
-fn background_json_timeout(
-    job_id: &str,
-    pid: u32,
-    local_log_path: &str,
-    remote_log_path: &str,
-) -> CallToolResult {
-    let hint = format!(
-        "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with job_id={job_id} to retrieve output."
-    );
-    let body = serde_json::json!({
-        "ok": false,
-        "timeout": true,
-        "background": true,
-        "job_id": job_id,
-        "pid": pid,
-        "log_path": local_log_path,
-        "remote_log_path": remote_log_path,
-        "hint": hint,
-    })
-    .to_string();
-
-    CallToolResult::success(vec![Content::text(body)])
-}
-
-fn background_json_err(
-    job_id: &str,
-    local_log_path: &str,
-    remote_log_path: Option<&str>,
-    error: &str,
-    stderr: &str,
-) -> CallToolResult {
-    // Keep the payload deterministic and single-line. Avoid echoing the original command.
-    let (error_snippet, error_truncated) =
-        truncate_with_flag(error, BACKGROUND_JSON_SNIPPET_LIMIT_CHARS);
-    let (stderr_snippet, stderr_truncated) =
-        truncate_with_flag(stderr, BACKGROUND_JSON_SNIPPET_LIMIT_CHARS);
-
-    let truncated = error_truncated || stderr_truncated;
-
-    let mut obj = serde_json::Map::new();
-    obj.insert("ok".to_string(), serde_json::Value::Bool(false));
-    obj.insert("background".to_string(), serde_json::Value::Bool(true));
-    obj.insert(
-        "job_id".to_string(),
-        serde_json::Value::String(job_id.to_string()),
-    );
-    obj.insert(
-        "log_path".to_string(),
-        serde_json::Value::String(local_log_path.to_string()),
-    );
-    if let Some(remote) = remote_log_path {
-        obj.insert(
-            "remote_log_path".to_string(),
-            serde_json::Value::String(remote.to_string()),
-        );
-    }
-    obj.insert(
-        "error".to_string(),
-        serde_json::Value::String(error_snippet),
-    );
-    obj.insert(
-        "stderr".to_string(),
-        serde_json::Value::String(stderr_snippet),
-    );
-    obj.insert("truncated".to_string(), serde_json::Value::Bool(truncated));
-    obj.insert(
-        "truncated_fields".to_string(),
-        serde_json::json!({
-            "error": error_truncated,
-            "stderr": stderr_truncated,
-        }),
-    );
-    if truncated {
-        obj.insert(
-            "hint".to_string(),
-                serde_json::Value::String(format!(
-                "Response fields were truncated to {} chars. Hint: inspect full output using log_path or check-process with job_id={job_id}.",
-                BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
-            )),
-        );
-    }
-
-    let body = serde_json::Value::Object(obj).to_string();
-
-    CallToolResult::success(vec![Content::text(body)])
-}
-
 /// SSH MCP Server
 ///
 /// The main server implementation that provides MCP tools for remote SSH
@@ -497,76 +154,6 @@ pub struct SshMcpServer {
     job_registry: Arc<JobRegistry>,
 
     transfer: TransferEngine,
-}
-
-/// Extended documentation for tools (available on-demand to save tokens in tool definitions)
-pub mod tool_docs {
-    /// Documentation for the exec tool
-    pub const EXEC: &str = r#"EXEC TOOL
-Execute shell commands on remote SSH server.
-
-PARAMETERS:
-- command (string, required): Shell command to execute
-- background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
-  Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
-  (+ remote_log_path deprecated)
-- timeout_ms (integer): Wait timeout in milliseconds (ignored if background=true)
-- log_path (string): Custom LOCAL log path for background mode (must be under /tmp/ssh-mcp)
-
-BACKGROUND MODE:
-For commands longer than RPC timeout, use background=true:
-1. Command runs detached on the remote host
-2. Returns immediately with job_id, pid, LOCAL log_path on the MCP server
-3. Monitor: use check-process with job_id (preferred) or ps -p <pid> -o pid,etime,cmd
-4. View output: use check-process with job_id; or tail -n 50 '<log_path>' (local spool file)
-
-NOTE:
-- remote_log_path is kept for backward compatibility only (deprecated) and will be removed in a future version.
-
-EXAMPLE:
-{"command": "apt update && apt install -y nginx", "background": true}"#;
-
-    /// Documentation for the sudo-exec tool  
-    pub const SUDO_EXEC: &str = r#"SUDO-EXEC TOOL
-Execute shell commands with sudo privileges.
-
-Same parameters and behavior as exec tool, but runs with sudo.
-Requires passwordless sudo or pre-configured sudo password.
-
-PARAMETERS:
-- command (string, required): Shell command to execute with sudo
-- background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
-  Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
-- timeout_ms (integer): Wait timeout
-- log_path (string): Custom LOCAL log path (must be under /tmp/ssh-mcp)
-
-EXAMPLE:
-{"command": "systemctl restart nginx", "background": false}"#;
-
-    /// Documentation for the transfer tool
-    pub const TRANSFER: &str = r#"TRANSFER TOOL
-Transfer files or directories between local and remote hosts.
-
-PARAMETERS:
-- operation (string, required): "put" (local→remote) or "get" (remote→local)
-- local_path (string, required): Local file path (relative to local_root or absolute path within local_root)
-- remote_path (string, required): Absolute remote path
-- transport (string): "auto" (default), "sftp", "scp", "rsync", or "exec-raw"
-- kind (string): "file" or "directory" (auto-detected if omitted)
-- overwrite (boolean): Allow overwriting destination (default: false)
-- timeout_ms (integer): Transfer timeout override
-
-TRANSPORTS:
-- auto: Tries rsync → sftp → scp → exec-raw in order
-- sftp/scp/rsync: Require local OpenSSH binaries and --key
-- exec-raw: Streaming via SSH exec (no OpenSSH needed)
-
-SAFETY:
-- local_path resolved within local_root (prevents ../ attacks)
-- remote_path rejects paths starting with '-' or containing NUL
-
-EXAMPLE:
-{"operation": "put", "local_path": "config.yml", "remote_path": "/etc/app/config.yml"}"#;
 }
 
 impl SshMcpServer {
@@ -748,88 +335,30 @@ impl SshMcpServer {
     }
 
     async fn determine_detach_mode(&self) -> DetachMode {
-        let cached = DetachMode::from_u8(self.detach_mode.load(Ordering::Acquire));
-        if cached != DetachMode::Unknown {
-            return cached;
-        }
-
-        let _guard = self.detach_mode_lock.lock().await;
-        let cached = DetachMode::from_u8(self.detach_mode.load(Ordering::Acquire));
-        if cached != DetachMode::Unknown {
-            return cached;
-        }
-
-        let full_supported = match self.probe_detach_mode(DetachMode::Full).await {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(e) => {
-                debug!("full detach probe failed: {e}");
-                false
-            }
-        };
-
-        let portable_supported = if full_supported {
-            false
-        } else {
-            match self.probe_detach_mode(DetachMode::Portable).await {
-                Ok(true) => true,
-                Ok(false) => false,
-                Err(e) => {
-                    debug!("portable detach probe failed: {e}");
-                    false
-                }
-            }
-        };
-
-        let selected = select_detach_mode(full_supported, portable_supported);
-        // Cache a non-Unknown decision to avoid repeated probes (and /tmp litter).
-        self.detach_mode.store(selected.as_u8(), Ordering::Release);
-        selected
+        let server = self.clone();
+        crate::background::detach::determine_detach_mode(
+            self.detach_mode.as_ref(),
+            self.detach_mode_lock.as_ref(),
+            make_job_id,
+            move |req, timeout| {
+                let server = server.clone();
+                async move { server.exec_detach_probe(req, timeout).await }
+            },
+        )
+        .await
     }
 
-    async fn probe_detach_mode(&self, mode: DetachMode) -> Result<bool> {
-        if matches!(mode, DetachMode::Unknown | DetachMode::DirectOnly) {
-            return Ok(false);
-        }
-
-        let job_id = make_job_id();
-        let marker = format!("__SSH_MCP_AUTODETECT_OK={job_id}");
-        let probe_command = format!("printf '%s\\n' \"{marker}\"");
-
-        let (log_path_buf, _log_path_str) = self
-            .default_local_log_path(&format!("autodetect-{job_id}"))
-            .map_err(SshMcpError::config)?;
-        self.ensure_local_log_file(&log_path_buf).await?;
-
-        let remote_log_path = remote_job_log_path(&job_id);
-        let wrapper =
-            build_background_wrapper_script(mode, &job_id, &probe_command, &remote_log_path);
-
-        let start_output = self
-            .connection
-            .exec_command(&wrapper, Duration::from_secs(5))
-            .await?;
-
-        let markers = match parse_background_markers(
-            &start_output.stdout,
-            &job_id,
-            &remote_log_path,
-        ) {
-            Ok(m) => m,
-            Err(parse_err) => {
-                debug!(
-                    "detach probe markers parse failed ({mode:?}): {parse_err}; exit_code={:?}; stderr_len={}",
-                    start_output.exit_code,
-                    start_output.stderr.len()
-                );
-                return Ok(false);
-            }
-        };
-
-        Ok(start_output.exit_code == Some(0)
-            && start_output.stderr.is_empty()
-            && markers.remote_log_path == remote_log_path
-            && start_output.stdout.contains(&marker))
+    async fn exec_detach_probe(
+        &self,
+        req: DetachProbeRequest,
+        timeout: Duration,
+    ) -> Result<DetachProbeOutput> {
+        let output = self.connection.exec_command(&req.wrapper, timeout).await?;
+        Ok(DetachProbeOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            exit_code: output.exit_code,
+        })
     }
 
     /// Execute a command (used by exec tool)
@@ -852,7 +381,7 @@ impl SshMcpServer {
 
         // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
-            error!("Failed to ensure SSH connection: {}", e);
+            error!(error = ?e, "Failed to ensure SSH connection");
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "SSH connection error: {}",
                 e
@@ -863,7 +392,7 @@ impl SshMcpServer {
         if self.connection.get_su_password().is_some()
             && let Err(e) = self.connection.ensure_elevated().await
         {
-            debug!("Elevation failed, will run as normal user: {}", e);
+            debug!(error = ?e, "Elevation failed, will run as normal user");
         }
 
         // Foreground execution is detachable-by-design:
@@ -876,7 +405,7 @@ impl SshMcpServer {
             match self.connection.exec_command(&sanitized, timeout).await {
                 Ok(output) => return Ok(Self::calltool_from_command_output(output)),
                 Err(e) => {
-                    error!("Command execution failed: {}", e);
+                    error!(error = ?e, "Command execution failed");
                     let mut msg = format!("Error: {}", e);
                     if matches!(e, SshMcpError::Timeout(_)) {
                         msg.push_str("\nHint: background detach is not supported on this target; rerun with background=true or a larger timeout_ms.");
@@ -971,13 +500,13 @@ impl SshMcpServer {
             Ok(joined) => match joined {
                 Ok(Ok(code)) => code,
                 Ok(Err(e)) => {
-                    error!("streaming failed for job {}: {}", job_id, e);
+                    error!(job_id = ?job_id, error = ?e, "streaming failed");
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "Error: streaming failed: {e}"
                     ))]));
                 }
                 Err(e) => {
-                    error!("streaming task join failed for job {}: {}", job_id, e);
+                    error!(job_id = ?job_id, error = ?e, "streaming task join failed");
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "Error: streaming task join failed: {e}"
                     ))]));
@@ -1119,170 +648,8 @@ impl SshMcpServer {
         command: &str,
         log_path: Option<&str>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        let job_id = make_job_id();
-        let remote_log_path = remote_job_log_path(&job_id);
-
-        let (final_log_path_buf, final_log_path) = match log_path {
-            Some(p) => (PathBuf::from(p), p.to_string()),
-            None => match self.default_local_log_path(&job_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(background_json_err(
-                        &job_id,
-                        "",
-                        Some(&remote_log_path),
-                        &e,
-                        "",
-                    ));
-                }
-            },
-        };
-
-        if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &e.to_string(),
-                "",
-            ));
-        }
-
-        // Sanitize the command
-        let sanitized = match sanitize_command(command, self.max_chars) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e.to_string(),
-                    "",
-                ));
-            }
-        };
-
-        // Ensure connection is established
-        if let Err(e) = self.connection.ensure_connected().await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &format!("SSH connection error: {}", e),
-                "",
-            ));
-        }
-
-        // If su elevation is configured and available, ensure we're elevated (best-effort)
-        if self.connection.get_su_password().is_some()
-            && let Err(e) = self.connection.ensure_elevated().await
-        {
-            debug!("Elevation failed, will run as normal user: {}", e);
-        }
-
-        let detach_mode = self.determine_detach_mode().await;
-        if detach_mode == DetachMode::DirectOnly {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                "Background detach is not supported on this target; run with background=false.",
-                "",
-            ));
-        }
-
-        let wrapper =
-            build_background_wrapper_script(detach_mode, &job_id, &sanitized, &remote_log_path);
-
-        let permit = match self
-            .connection
-            .channel_semaphore
-            .clone()
-            .acquire_owned()
+        self.execute_background_impl(command, log_path, exec::BackgroundPrivilege::Normal)
             .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &format!("Failed to acquire command slot: {e}"),
-                    "",
-                ));
-            }
-        };
-
-        let mut channel = match self.connection.open_channel().await {
-            Ok(ch) => ch,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e.to_string(),
-                    "",
-                ));
-            }
-        };
-
-        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &format!("Failed to exec background wrapper: {e}"),
-                "",
-            ));
-        }
-
-        let (markers, initial_stdout) = match read_background_markers_from_channel(
-            &mut channel,
-            &job_id,
-            &remote_log_path,
-            BACKGROUND_START_TIMEOUT,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e,
-                    "",
-                ));
-            }
-        };
-
-        self.register_running_job(&job_id, markers.pid, final_log_path_buf.clone(), &sanitized)
-            .await;
-
-        let streamer = OutputStreamer::new(
-            job_id.clone(),
-            final_log_path_buf.clone(),
-            Arc::clone(&self.job_registry),
-        );
-
-        let job_id_for_log = job_id.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = streamer.stream_channel(channel, initial_stdout).await {
-                error!(
-                    "streaming failed for background job {}: {}",
-                    job_id_for_log, e
-                );
-            }
-        });
-
-        Ok(background_json_ok(
-            &job_id,
-            markers.pid,
-            &final_log_path,
-            &markers.remote_log_path,
-        ))
     }
 
     /// Execute a command with sudo (used by sudo-exec tool)
@@ -1305,7 +672,7 @@ impl SshMcpServer {
 
         // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
-            error!("Failed to ensure SSH connection: {}", e);
+            error!(error = ?e, "Failed to ensure SSH connection");
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "SSH connection error: {}",
                 e
@@ -1327,7 +694,7 @@ impl SshMcpServer {
         {
             Ok(output) => Ok(Self::calltool_from_command_output(output)),
             Err(e) => {
-                error!("Sudo command execution failed: {}", e);
+                error!(error = ?e, "Sudo command execution failed");
                 let mut msg = format!("Error: {}", e);
                 if matches!(e, SshMcpError::Timeout(_)) {
                     msg.push_str(
@@ -1352,11 +719,11 @@ impl SshMcpServer {
         &self,
         params: CheckProcessParams,
     ) -> std::result::Result<CallToolResult, McpError> {
-        debug!("check-process tool called: job_id={}", params.job_id);
+        debug!(job_id = ?params.job_id, "check-process tool called");
 
         // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
-            error!("Failed to ensure SSH connection: {}", e);
+            error!(error = ?e, "Failed to ensure SSH connection");
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "SSH connection error: {}",
                 e
@@ -1385,7 +752,7 @@ impl SshMcpServer {
                 )]))
             }
             Err(e) => {
-                error!("Check process failed: {}", e);
+                error!(job_id = ?params.job_id, error = ?e, "check-process failed");
                 Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error checking process: {}",
                     e
@@ -1399,182 +766,20 @@ impl SshMcpServer {
         command: &str,
         log_path: Option<&str>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        let job_id = make_job_id();
-        let remote_log_path = remote_job_log_path(&job_id);
-
-        let (final_log_path_buf, final_log_path) = match log_path {
-            Some(p) => (PathBuf::from(p), p.to_string()),
-            None => match self.default_local_log_path(&job_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(background_json_err(
-                        &job_id,
-                        "",
-                        Some(&remote_log_path),
-                        &e,
-                        "",
-                    ));
-                }
-            },
-        };
-
-        if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &e.to_string(),
-                "",
-            ));
-        }
-
-        let sanitized = match sanitize_command(command, self.max_chars) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e.to_string(),
-                    "",
-                ));
-            }
-        };
-
-        if let Err(e) = self.connection.ensure_connected().await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &format!("SSH connection error: {}", e),
-                "",
-            ));
-        }
-
-        // Wrap the command with sudo, then start it in the background.
         let sudo_password = self.connection.get_sudo_password();
-        let wrapped_command = wrap_sudo_command(&sanitized, sudo_password);
-        debug!(
-            "Wrapped sudo command (password hidden): sudo -n sh -c '...' or printf '...' | sudo ..."
-        );
-
-        let detach_mode = self.determine_detach_mode().await;
-        if detach_mode == DetachMode::DirectOnly {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                "Background detach is not supported on this target; run with background=false.",
-                "",
-            ));
-        }
-
-        let wrapper = build_background_wrapper_script(
-            detach_mode,
-            &job_id,
-            &wrapped_command,
-            &remote_log_path,
-        );
-
-        let permit = match self
-            .connection
-            .channel_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &format!("Failed to acquire command slot: {e}"),
-                    "",
-                ));
-            }
-        };
-
-        let mut channel = match self.connection.open_channel().await {
-            Ok(ch) => ch,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e.to_string(),
-                    "",
-                ));
-            }
-        };
-
-        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &format!("Failed to exec background wrapper: {e}"),
-                "",
-            ));
-        }
-
-        let (markers, initial_stdout) = match read_background_markers_from_channel(
-            &mut channel,
-            &job_id,
-            &remote_log_path,
-            BACKGROUND_START_TIMEOUT,
+        self.execute_background_impl(
+            command,
+            log_path,
+            exec::BackgroundPrivilege::Sudo {
+                password: sudo_password,
+            },
         )
         .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e,
-                    "",
-                ));
-            }
-        };
-
-        self.register_running_job(
-            &job_id,
-            markers.pid,
-            final_log_path_buf.clone(),
-            &format!("sudo {sanitized}"),
-        )
-        .await;
-
-        let streamer = OutputStreamer::new(
-            job_id.clone(),
-            final_log_path_buf.clone(),
-            Arc::clone(&self.job_registry),
-        );
-
-        let job_id_for_log = job_id.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = streamer.stream_channel(channel, initial_stdout).await {
-                error!(
-                    "streaming failed for background sudo job {}: {}",
-                    job_id_for_log, e
-                );
-            }
-        });
-
-        Ok(background_json_ok(
-            &job_id,
-            markers.pid,
-            &final_log_path,
-            &markers.remote_log_path,
-        ))
     }
 
     fn sanitize_or_tool_error(&self, command: &str) -> std::result::Result<String, CallToolResult> {
         sanitize_command(command, self.max_chars).map_err(|e| {
-            error!("Command sanitization failed: {}", e);
+            error!(error = ?e, "Command sanitization failed");
             CallToolResult::error(vec![Content::text(format!("Error: {}", e))])
         })
     }
@@ -1597,124 +802,24 @@ impl SshMcpServer {
         }
     }
 
-    fn command_tool(
-        name: &'static str,
-        tool_description: &'static str,
-        command_description: &'static str,
-    ) -> Tool {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": command_description
-                },
-                "background": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "timeout_ms": {
-                    "type": "integer"
-                },
-                "log_path": {
-                    "type": "string"
-                }
-            },
-            "required": ["command"]
-        });
-
-        // Convert Value to JsonObject (Map<String, Value>)
-        let schema_obj = schema.as_object().cloned().unwrap_or_default();
-
-        Tool::new(name, tool_description, Arc::new(schema_obj))
-    }
-
     /// Build exec tool definition (compact)
     fn exec_tool() -> Tool {
-        Self::command_tool(
-            "exec",
-            "Execute shell command on remote host. Use background=true for long tasks.",
-            "Shell command to execute",
-        )
+        tools::exec_tool()
     }
 
     /// Build sudo-exec tool definition (compact)
     fn sudo_exec_tool() -> Tool {
-        Self::command_tool(
-            "sudo-exec",
-            "Execute shell command via sudo. Use background=true for long tasks.",
-            "Shell command to execute with sudo",
-        )
+        tools::sudo_exec_tool()
     }
 
     /// Build transfer tool definition (compact)
     fn transfer_tool() -> Tool {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["put", "get"]
-                },
-                "local_path": {
-                    "type": "string"
-                },
-                "remote_path": {
-                    "type": "string"
-                },
-                "transport": {
-                    "type": "string",
-                    "enum": ["auto", "exec-raw", "sftp", "scp", "rsync"],
-                    "default": "auto",
-                    "description": "Transfer method: auto (fallback chain), sftp/scp/rsync (need --key), exec-raw (pure SSH)"
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["file", "directory"]
-                },
-                "overwrite": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "timeout_ms": {
-                    "type": "integer"
-                }
-            },
-            "required": ["operation", "local_path", "remote_path"]
-        });
-
-        let schema_obj = schema.as_object().cloned().unwrap_or_default();
-        Tool::new(
-            "transfer",
-            "Transfer files via SSH. Supports: auto/sftp/scp/rsync/exec-raw. Requires --key for sftp/scp/rsync.",
-            Arc::new(schema_obj),
-        )
+        tools::transfer_tool()
     }
 
     /// Build check-process tool definition
     fn check_process_tool() -> Tool {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "job_id": {
-                    "type": "string",
-                    "description": "Job ID returned by exec/sudo-exec (required)"
-                },
-                "tail_lines": {
-                    "type": "integer",
-                    "default": 50,
-                    "description": "Number of lines to read from local log (default 50)"
-                }
-            },
-            "required": ["job_id"]
-        });
-
-        let schema_obj = schema.as_object().cloned().unwrap_or_default();
-        Tool::new(
-            "check-process",
-            "Check status of a background process started by exec/sudo-exec tools. Useful for monitoring long-running commands and retrieving results after timeout.",
-            Arc::new(schema_obj),
-        )
+        tools::check_process_tool()
     }
 
     /// Get extended documentation for a tool by name
@@ -1722,12 +827,7 @@ impl SshMcpServer {
     /// Returns the full documentation text that was removed from compact tool definitions
     /// to save tokens in the MCP protocol.
     pub fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
-        match tool_name {
-            "exec" => Some(tool_docs::EXEC),
-            "sudo-exec" => Some(tool_docs::SUDO_EXEC),
-            "transfer" => Some(tool_docs::TRANSFER),
-            _ => None,
-        }
+        tools::get_tool_documentation(tool_name)
     }
 }
 
@@ -1849,13 +949,12 @@ impl ServerHandler for SshMcpServer {
 
         let mut tools = vec![Self::exec_tool()];
 
-        tools.push(Self::transfer_tool());
-        tools.push(Self::check_process_tool());
-
-        // Add sudo-exec tool if enabled
+        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer.
         if !self.config.disable_sudo {
             tools.push(Self::sudo_exec_tool());
         }
+        tools.push(Self::check_process_tool());
+        tools.push(Self::transfer_tool());
 
         Ok(ListToolsResult {
             tools,
@@ -1875,92 +974,10 @@ impl ServerHandler for SshMcpServer {
 
         let args = request.arguments.unwrap_or_default();
 
-        let common_args = |args: &serde_json::Map<String, serde_json::Value>| {
-            let command = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    McpError::invalid_params("Missing required parameter: command", None)
-                })?
-                .to_string();
-
-            let background = args
-                .get("background")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            let timeout_ms: Option<u64> = match args.get("timeout_ms") {
-                None => None,
-                Some(v) if v.is_null() => None,
-                Some(v) => {
-                    if let Some(u) = v.as_u64() {
-                        Some(u)
-                    } else if let Some(i) = v.as_i64() {
-                        if i < 0 {
-                            return Err(McpError::invalid_params(
-                                "timeout_ms must be a non-negative integer",
-                                None,
-                            ));
-                        }
-                        Some(i as u64)
-                    } else {
-                        return Err(McpError::invalid_params(
-                            "timeout_ms must be an integer",
-                            None,
-                        ));
-                    }
-                }
-            };
-
-            if let Some(0) = timeout_ms {
-                return Err(McpError::invalid_params("timeout_ms must be > 0", None));
-            }
-
-            let log_path: Option<String> = if background {
-                match args.get("log_path") {
-                    None => None,
-                    Some(v) if v.is_null() => None,
-                    Some(v) => {
-                        let s = v.as_str().ok_or_else(|| {
-                            McpError::invalid_params("log_path must be a string", None)
-                        })?;
-                        validate_background_log_path(self.spooler.base_dir(), s)
-                            .map_err(|msg| McpError::invalid_params(msg, None))?;
-
-                        Some(s.to_string())
-                    }
-                }
-            } else {
-                // Foreground behavior: keep existing permissive parsing even though log_path is
-                // ignored when background=false.
-                match args.get("log_path") {
-                    None => None,
-                    Some(v) if v.is_null() => None,
-                    Some(v) => {
-                        let s = v.as_str().ok_or_else(|| {
-                            McpError::invalid_params("log_path must be a string", None)
-                        })?;
-                        let trimmed = s.trim();
-                        if trimmed.is_empty() {
-                            return Err(McpError::invalid_params("log_path cannot be empty", None));
-                        }
-                        Some(trimmed.to_string())
-                    }
-                }
-            };
-
-            Ok(CommonToolArgs {
-                command,
-                background,
-                timeout_ms,
-                log_path,
-            })
-        };
-
         // Route to the appropriate tool
         match tool_name {
             "exec" => {
-                let parsed = common_args(&args)?;
+                let parsed = self.parse_common_tool_args(&args)?;
 
                 if parsed.background {
                     self.execute_background_command(&parsed.command, parsed.log_path.as_deref())
@@ -1980,7 +997,7 @@ impl ServerHandler for SshMcpServer {
                     return Err(McpError::invalid_params("sudo-exec tool is disabled", None));
                 }
 
-                let parsed = common_args(&args)?;
+                let parsed = self.parse_common_tool_args(&args)?;
 
                 if parsed.background {
                     self.execute_background_sudo_command(
@@ -2066,6 +1083,9 @@ impl ServerHandler for SshMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::background::response::{
+        BACKGROUND_JSON_SNIPPET_LIMIT_CHARS, background_json_err, background_json_timeout,
+    };
 
     fn extract_text_from_result(result: &CallToolResult) -> String {
         result
@@ -2165,30 +1185,6 @@ mod tests {
         );
         assert!(
             validate_background_log_path(Path::new("/tmp/ssh-mcp"), "/tmp/x\rrm -rf /").is_err()
-        );
-    }
-
-    #[test]
-    fn test_select_detach_mode_ladder() {
-        assert_eq!(select_detach_mode(true, true), DetachMode::Full);
-        assert_eq!(select_detach_mode(true, false), DetachMode::Full);
-        assert_eq!(select_detach_mode(false, true), DetachMode::Portable);
-        assert_eq!(select_detach_mode(false, false), DetachMode::DirectOnly);
-    }
-
-    #[test]
-    fn test_parse_background_markers() {
-        let remote_log = remote_job_log_path("abc-123");
-        let stdout =
-            format!("__SSH_MCP_JOB_ID=abc-123\n__SSH_MCP_PID=456\n__SSH_MCP_LOG={remote_log}\n");
-        let markers = parse_background_markers(&stdout, "abc-123", &remote_log).unwrap();
-        assert_eq!(
-            markers,
-            BackgroundMarkers {
-                job_id: "abc-123".to_string(),
-                pid: 456,
-                remote_log_path: remote_log,
-            }
         );
     }
 

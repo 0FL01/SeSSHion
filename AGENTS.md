@@ -40,7 +40,12 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 ├── src/                        # Source code
 │   ├── main.rs                 # Application entry point
 │   ├── lib.rs                  # Library root
-│   ├── server.rs               # MCP protocol server implementation
+│   ├── server.rs               # MCP protocol server implementation (orchestrator)
+│   ├── server/                 # Server submodules (extracted from server.rs)
+│   │   ├── tools.rs            # MCP tool schemas and documentation
+│   │   ├── args.rs             # Common tool argument parsing
+│   │   └── exec.rs             # Shared background execution (exec/sudo-exec deduplication)
+│   ├── shell_escape.rs         # Shell string escaping utilities (neutral, no ssh/background deps)
 │   ├── config.rs               # Configuration and CLI argument parsing
 │   ├── error.rs                # Centralized error handling
 │   ├── logging.rs              # Logging configuration and initialization
@@ -53,8 +58,18 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── elevation.rs        # Privileged execution (su/sudo) logic
 │   │   ├── sanitize.rs         # Input validation and command safety
 │   │   └── config.rs           # SSH-specific configuration structures
-│   ├── tools/                  # MCP tool definitions
-│   │   └── mod.rs              # Tool registration and dispatch (exec, sudo-exec, check-process)
+│   ├── background/             # Background job subsystem (extracted from server.rs)
+│   │   ├── mod.rs              # Module exports
+│   │   ├── job.rs              # Job state and management
+│   │   ├── registry.rs         # Job registry (in-memory tracking)
+│   │   ├── spooler.rs          # Local log file spooling
+│   │   ├── streamer.rs         # Output streaming for background jobs
+│   │   ├── detach.rs           # Detach mode detection and caching (Full/Portable/DirectOnly)
+│   │   ├── marker.rs           # Background marker parsing (stdout marker extraction)
+│   │   ├── response.rs         # JSON response formatting for background tools
+│   │   └── wrapper.rs          # Background wrapper script generation
+│   ├── tools/                  # MCP tool definitions (legacy, mostly empty after refactor)
+│   │   └── mod.rs              # Re-exports (tool logic moved to server/tools.rs)
 │   └── transfer/               # File transfer operations
 │       ├── mod.rs              # Transfer module definition
 │       ├── skeleton.rs         # Shared staging/orchestration helpers (put/get file/dir deduplication)

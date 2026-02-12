@@ -159,7 +159,7 @@ impl SshConnectionManager {
         let mut session = match connect_result {
             Ok(Ok(session)) => session,
             Ok(Err(e)) => {
-                error!("SSH connection failed: {}", e);
+                error!(error = ?e, "SSH connection failed");
                 return Err(SshMcpError::connection(e.to_string()));
             }
             Err(_) => {
@@ -190,10 +190,7 @@ impl SshConnectionManager {
             debug!("su_password configured, attempting elevation...");
             if let Err(e) = self.ensure_elevated().await {
                 // Don't fail connection if elevation fails, just log it
-                warn!(
-                    "Failed to elevate to root: {}. Commands will run as normal user.",
-                    e
-                );
+                warn!(error = ?e, "Failed to elevate to root. Commands will run as normal user.");
             }
         }
 
@@ -384,7 +381,7 @@ impl SshConnectionManager {
         let mut channel = match self.open_channel().await {
             Ok(ch) => ch,
             Err(e) => {
-                debug!("Failed to open channel for timeout detection: {}", e);
+                debug!(error = ?e, "Failed to open channel for timeout detection");
                 return false;
             }
         };
@@ -552,7 +549,7 @@ impl SshConnectionManager {
                         ChannelMsg::Data { data } => {
                             let text = String::from_utf8_lossy(&data);
                             buffer.push_str(&text);
-                            debug!("su buffer: {}", buffer.replace('\n', "\\n"));
+                            debug!(su_buffer_len = buffer.len(), "su buffer received");
 
                             // Check for password prompt
                             if !password_sent && buffer.to_lowercase().contains("password") {
@@ -679,7 +676,7 @@ impl SshConnectionManager {
     /// This clears the session handle, su_channel, and resets elevation state.
     /// Used when a connection is detected as broken and needs reconnection.
     pub async fn invalidate_session(&self, reason: &str) {
-        warn!("Invalidating SSH session: {}", reason);
+        warn!(reason = ?reason, "Invalidating SSH session");
 
         // Take channel out of mutex before awaiting to avoid deadlock
         let channel = {
@@ -701,7 +698,7 @@ impl SshConnectionManager {
             }
         }
 
-        debug!("Session invalidated: {}", reason);
+        debug!(reason = ?reason, "Session invalidated");
     }
 
     /// Force a reconnection by invalidating the current session and reconnecting

@@ -37,6 +37,7 @@ pub mod logging;
 #[cfg(unix)]
 pub(crate) mod platform;
 pub mod server;
+mod shell_escape;
 pub mod ssh;
 pub mod tools;
 pub mod transfer;

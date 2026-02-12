@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -10,6 +9,7 @@ use crate::error::{Result, SshMcpError};
 use crate::ssh::{SshConnectionManager, escape_for_shell};
 
 use super::exec_raw;
+use super::process;
 use super::staging;
 use super::types::{
     StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferOperation, TransferStaging,
@@ -177,69 +177,13 @@ struct ProcessOutput {
 
 async fn wait_child_with_timeout(
     _transport: OpenSshTransport,
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     timeout: Duration,
 ) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
-    let mut stdout_pipe = child.stdout.take().ok_or_else(|| {
-        super::TransportAttemptError::Other(SshMcpError::connection("missing stdout pipe"))
-    })?;
-    let mut stderr_pipe = child.stderr.take().ok_or_else(|| {
-        super::TransportAttemptError::Other(SshMcpError::connection("missing stderr pipe"))
-    })?;
-
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stdout_pipe.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stderr_pipe.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
-
-    let status = tokio::select! {
-        res = child.wait() => {
-            res.map_err(SshMcpError::Io).map_err(super::TransportAttemptError::Other)?
-        }
-        _ = &mut sleep => {
-            stdout_task.abort();
-            stderr_task.abort();
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(super::TransportAttemptError::Other(SshMcpError::Timeout(
-                timeout.as_millis() as u64,
-            )));
-        }
-    };
-
-    let _stdout_bytes = match stdout_task.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
-        Err(_) => {
-            return Err(super::TransportAttemptError::Other(
-                SshMcpError::connection("stdout task join failed"),
-            ));
-        }
-    };
-
-    let stderr_bytes = match stderr_task.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
-        Err(_) => {
-            return Err(super::TransportAttemptError::Other(
-                SshMcpError::connection("stderr task join failed"),
-            ));
-        }
-    };
-
+    let captured = process::wait_child_with_timeout(child, timeout).await?;
     Ok(ProcessOutput {
-        status,
-        stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
+        status: captured.status,
+        stderr: String::from_utf8_lossy(&captured.stderr).to_string(),
     })
 }
 
@@ -247,20 +191,16 @@ fn classify_spawn_error(
     transport: OpenSshTransport,
     err: std::io::Error,
 ) -> super::TransportAttemptError {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        let bin = match transport {
-            OpenSshTransport::Sftp => "sftp",
-            OpenSshTransport::Scp => "scp",
-        };
-        return super::TransportAttemptError::Unsupported {
-            transport: match transport {
-                OpenSshTransport::Sftp => super::TransferTransport::Sftp,
-                OpenSshTransport::Scp => super::TransferTransport::Scp,
-            },
-            reason: format!("missing local OpenSSH binary '{bin}'"),
-        };
-    }
-    super::TransportAttemptError::Other(SshMcpError::Io(err))
+    let (bin, transfer_transport) = match transport {
+        OpenSshTransport::Sftp => ("sftp", super::TransferTransport::Sftp),
+        OpenSshTransport::Scp => ("scp", super::TransferTransport::Scp),
+    };
+
+    process::classify_spawn_error_with_reason(
+        err,
+        transfer_transport,
+        format!("missing local OpenSSH binary '{bin}'"),
+    )
 }
 
 fn classify_openssh_failure(
@@ -485,39 +425,7 @@ async fn get_file(
 }
 
 async fn count_dir_no_symlinks(root: &Path) -> Result<TransferCounts> {
-    let meta = tokio::fs::symlink_metadata(root).await?;
-    if !meta.is_dir() {
-        return Err(SshMcpError::invalid_params("local_path is not a directory"));
-    }
-
-    let mut counts = TransferCounts::zero();
-
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut rd = tokio::fs::read_dir(&dir).await?;
-        while let Some(ent) = rd.next_entry().await? {
-            let p = ent.path();
-            let m = tokio::fs::symlink_metadata(&p).await?;
-            if m.file_type().is_symlink() {
-                return Err(SshMcpError::invalid_params(
-                    "symlinks are not supported by directory transfer",
-                ));
-            }
-            if m.is_dir() {
-                counts.directories += 1;
-                stack.push(p);
-            } else if m.is_file() {
-                counts.files += 1;
-                counts.bytes += m.len();
-            } else {
-                return Err(SshMcpError::invalid_params(
-                    "unsupported file type in directory transfer",
-                ));
-            }
-        }
-    }
-
-    Ok(counts)
+    super::walk::count_dir_no_symlinks(root).await
 }
 
 async fn put_dir(

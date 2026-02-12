@@ -57,6 +57,8 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   └── mod.rs              # Tool registration and dispatch (exec, sudo-exec, check-process)
 │   └── transfer/               # File transfer operations
 │       ├── mod.rs              # Transfer module definition
+│       ├── process.rs          # Shared process spawn/capture/timeout helpers
+│       ├── walk.rs             # Shared directory traversal helpers (no-symlink)
 │       ├── exec_raw.rs         # Raw command execution for transfers
 │       ├── openssh.rs          # OpenSSH compatibility layer
 │       ├── tar.rs              # TAR archive operations

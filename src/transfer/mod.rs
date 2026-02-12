@@ -9,10 +9,12 @@
 mod exec_raw;
 mod local_root;
 mod openssh;
+mod process;
 mod rsync;
 mod staging;
 mod tar;
 mod types;
+mod walk;
 
 pub use types::{
     CompactTransferResponse, ResolvedPaths, RsyncOptions, StagingLocal, StagingRemote,

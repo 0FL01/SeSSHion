@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::SshConnectionManager;
 
 use super::exec_raw;
+use super::process;
 use super::staging;
 use super::types::{
     RsyncOptions, StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferOperation,
@@ -126,7 +126,7 @@ async fn run_rsync(
     src: &str,
     dst: &str,
     timeout_duration: Duration,
-) -> std::result::Result<RsyncOutput, super::TransportAttemptError> {
+) -> std::result::Result<TransferCounts, super::TransportAttemptError> {
     let ssh_opts = build_ssh_options(endpoint);
     let mut cmd = Command::new("rsync");
 
@@ -154,94 +154,17 @@ async fn run_rsync(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // Spawn child separately to allow proper cleanup on timeout
-    let mut child = cmd.spawn().map_err(classify_spawn_error)?;
+    let child = cmd.spawn().map_err(classify_spawn_error)?;
+    let captured = process::wait_child_with_timeout(child, timeout_duration).await?;
 
-    // Take stdout/stderr handles before select! to read them separately
-    let mut stdout_pipe = child.stdout.take().ok_or_else(|| {
-        super::TransportAttemptError::Other(SshMcpError::connection("missing stdout pipe"))
-    })?;
-    let mut stderr_pipe = child.stderr.take().ok_or_else(|| {
-        super::TransportAttemptError::Other(SshMcpError::connection("missing stderr pipe"))
-    })?;
+    let stdout = String::from_utf8_lossy(&captured.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&captured.stderr).to_string();
 
-    // Spawn tasks to read stdout and stderr
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stdout_pipe.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stderr_pipe.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-
-    // Use select! for timeout handling with proper cleanup
-    let status = tokio::select! {
-        res = child.wait() => {
-            res.map_err(|e| {
-                super::TransportAttemptError::Other(SshMcpError::Io(e))
-            })?
-        }
-        _ = tokio::time::sleep(timeout_duration) => {
-            // Kill the child process on timeout
-            stdout_task.abort();
-            stderr_task.abort();
-            let _ = child.kill().await;
-            let _ = child.wait().await; // Reap the process
-            return Err(super::TransportAttemptError::Other(
-                SshMcpError::Timeout(timeout_duration.as_millis() as u64)
-            ));
-        }
-    };
-
-    // Collect stdout/stderr after child completes
-    let stdout_bytes = match stdout_task.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
-        Err(_) => {
-            return Err(super::TransportAttemptError::Other(
-                SshMcpError::connection("stdout task join failed"),
-            ));
-        }
-    };
-
-    let stderr_bytes = match stderr_task.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
-        Err(_) => {
-            return Err(super::TransportAttemptError::Other(
-                SshMcpError::connection("stderr task join failed"),
-            ));
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-
-    if !status.success() {
-        return Err(classify_rsync_failure(status.code(), &stderr));
+    if !captured.status.success() {
+        return Err(classify_rsync_failure(captured.status.code(), &stderr));
     }
 
-    let counts = parse_rsync_stats(&stdout);
-
-    Ok(RsyncOutput {
-        status,
-        stdout,
-        stderr,
-        counts,
-    })
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct RsyncOutput {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-    counts: TransferCounts,
+    Ok(parse_rsync_stats(&stdout))
 }
 
 fn parse_rsync_stats(stdout: &str) -> TransferCounts {
@@ -282,13 +205,11 @@ fn parse_rsync_stats(stdout: &str) -> TransferCounts {
 }
 
 fn classify_spawn_error(err: std::io::Error) -> super::TransportAttemptError {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        return super::TransportAttemptError::Unsupported {
-            transport: super::TransferTransport::Rsync,
-            reason: "missing local rsync binary".to_string(),
-        };
-    }
-    super::TransportAttemptError::Other(SshMcpError::Io(err))
+    process::classify_spawn_error_with_reason(
+        err,
+        super::TransferTransport::Rsync,
+        "missing local rsync binary".to_string(),
+    )
 }
 
 fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> super::TransportAttemptError {
@@ -458,39 +379,7 @@ async fn get_file(
 }
 
 async fn count_local_dir_no_symlinks(root: &Path) -> Result<TransferCounts> {
-    let meta = tokio::fs::symlink_metadata(root).await?;
-    if !meta.is_dir() {
-        return Err(SshMcpError::invalid_params("local_path is not a directory"));
-    }
-
-    let mut counts = TransferCounts::zero();
-
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut rd = tokio::fs::read_dir(&dir).await?;
-        while let Some(ent) = rd.next_entry().await? {
-            let p = ent.path();
-            let m = tokio::fs::symlink_metadata(&p).await?;
-            if m.file_type().is_symlink() {
-                return Err(SshMcpError::invalid_params(
-                    "symlinks are not supported by directory transfer",
-                ));
-            }
-            if m.is_dir() {
-                counts.directories += 1;
-                stack.push(p);
-            } else if m.is_file() {
-                counts.files += 1;
-                counts.bytes += m.len();
-            } else {
-                return Err(SshMcpError::invalid_params(
-                    "unsupported file type in directory transfer",
-                ));
-            }
-        }
-    }
-
-    Ok(counts)
+    super::walk::count_dir_no_symlinks(root).await
 }
 
 async fn put_dir(

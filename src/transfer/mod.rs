@@ -33,6 +33,10 @@ use tokio::time::Instant;
 use crate::error::{Result, SshMcpError};
 use crate::ssh::SshConnectionManager;
 
+fn io_to_transport_attempt(err: std::io::Error) -> TransportAttemptError {
+    TransportAttemptError::Other(SshMcpError::Io(err))
+}
+
 struct StepCtx<'a> {
     conn: &'a SshConnectionManager,
     remote_home: &'a str,

@@ -52,7 +52,7 @@ pub(super) async fn wait_child_with_timeout(
 
     let status = tokio::select! {
         res = child.wait() => {
-            res.map_err(SshMcpError::Io).map_err(TransportAttemptError::Other)?
+            res.map_err(super::io_to_transport_attempt)?
         }
         _ = &mut sleep => {
             stdout_task.abort();

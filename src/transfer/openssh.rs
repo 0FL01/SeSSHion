@@ -47,12 +47,17 @@ pub async fn run_transfer(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    match (args.operation, args.kind) {
-        (TransferOperation::Put, TransferKind::File) => put_file(endpoint, args).await,
-        (TransferOperation::Get, TransferKind::File) => get_file(endpoint, args).await,
-        (TransferOperation::Put, TransferKind::Directory) => put_dir(endpoint, args).await,
-        (TransferOperation::Get, TransferKind::Directory) => get_dir(endpoint, args).await,
-    }
+    skeleton::dispatch_transfer(skeleton::DispatchTransferArgs {
+        operation: args.operation,
+        kind: args.kind,
+        endpoint,
+        args,
+        put_file,
+        get_file,
+        put_dir,
+        get_dir,
+    })
+    .await
 }
 
 // Remote staging helpers are implemented in `super::staging`.
@@ -134,8 +139,7 @@ async fn run_sftp_batch(
         stdin
             .write_all(batch.as_bytes())
             .await
-            .map_err(SshMcpError::Io)
-            .map_err(super::TransportAttemptError::Other)?;
+            .map_err(super::io_to_transport_attempt)?;
         let _ = stdin.shutdown().await;
     }
 

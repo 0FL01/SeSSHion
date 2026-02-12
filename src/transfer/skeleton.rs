@@ -8,7 +8,64 @@ use crate::ssh::{SshConnectionManager, escape_for_shell};
 use super::TransportAttemptError;
 use super::exec_raw;
 use super::staging;
-use super::types::{StagingLocal, StagingRemote, TransferCounts, TransferStaging};
+use super::types::{
+    StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferOperation, TransferStaging,
+};
+
+pub(in crate::transfer) struct DispatchTransferArgs<E, A, PF, GF, PD, GD> {
+    pub(in crate::transfer) operation: TransferOperation,
+    pub(in crate::transfer) kind: TransferKind,
+    pub(in crate::transfer) endpoint: E,
+    pub(in crate::transfer) args: A,
+    pub(in crate::transfer) put_file: PF,
+    pub(in crate::transfer) get_file: GF,
+    pub(in crate::transfer) put_dir: PD,
+    pub(in crate::transfer) get_dir: GD,
+}
+
+pub(in crate::transfer) async fn dispatch_transfer<
+    E,
+    A,
+    R,
+    PF,
+    GF,
+    PD,
+    GD,
+    PFut,
+    GFut,
+    PDFut,
+    GDFut,
+>(
+    args: DispatchTransferArgs<E, A, PF, GF, PD, GD>,
+) -> R
+where
+    PF: FnOnce(E, A) -> PFut,
+    GF: FnOnce(E, A) -> GFut,
+    PD: FnOnce(E, A) -> PDFut,
+    GD: FnOnce(E, A) -> GDFut,
+    PFut: Future<Output = R>,
+    GFut: Future<Output = R>,
+    PDFut: Future<Output = R>,
+    GDFut: Future<Output = R>,
+{
+    let DispatchTransferArgs {
+        operation,
+        kind,
+        endpoint,
+        args,
+        put_file,
+        get_file,
+        put_dir,
+        get_dir,
+    } = args;
+
+    match (operation, kind) {
+        (TransferOperation::Put, TransferKind::File) => put_file(endpoint, args).await,
+        (TransferOperation::Get, TransferKind::File) => get_file(endpoint, args).await,
+        (TransferOperation::Put, TransferKind::Directory) => put_dir(endpoint, args).await,
+        (TransferOperation::Get, TransferKind::Directory) => get_dir(endpoint, args).await,
+    }
+}
 
 pub(in crate::transfer) struct PutFileWithRemoteStagingArgs<'a> {
     pub(in crate::transfer) conn: &'a SshConnectionManager,
@@ -58,8 +115,7 @@ where
 {
     let meta = tokio::fs::symlink_metadata(args.local_path)
         .await
-        .map_err(SshMcpError::Io)
-        .map_err(TransportAttemptError::Other)?;
+        .map_err(super::io_to_transport_attempt)?;
     if !meta.is_file() {
         return Err(TransportAttemptError::Other(SshMcpError::invalid_params(
             "local_path is not a file",
@@ -143,8 +199,7 @@ where
 
     let meta = tokio::fs::metadata(&tmp)
         .await
-        .map_err(SshMcpError::Io)
-        .map_err(TransportAttemptError::Other)?;
+        .map_err(super::io_to_transport_attempt)?;
     let bytes = meta.len();
 
     if args.overwrite {

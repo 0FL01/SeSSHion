@@ -127,13 +127,7 @@ impl SshMcpServer {
             &remote_log_path,
         );
 
-        let permit = match self
-            .connection
-            .channel_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-        {
+        let permit = match self.connection.acquire_command_slot_raw().await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(background_json_err(

@@ -415,13 +415,7 @@ impl SshMcpServer {
         let wrapper =
             build_background_wrapper_script(detach_mode, &job_id, &sanitized, &remote_log_path);
 
-        let permit = match self
-            .connection
-            .channel_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-        {
+        let permit = match self.connection.acquire_command_slot_raw().await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(

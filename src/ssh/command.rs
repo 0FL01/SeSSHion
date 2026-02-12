@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
@@ -185,14 +184,7 @@ impl SshConnectionManager {
         timeout_duration: Duration,
     ) -> Result<CommandOutput> {
         // Acquire semaphore permit to limit concurrent command execution
-        let _permit: OwnedSemaphorePermit = self
-            .channel_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| {
-                SshMcpError::connection(format!("Failed to acquire command slot: {}", e))
-            })?;
+        let _permit = self.acquire_command_slot().await?;
 
         // Ensure we're connected
         self.ensure_connected().await?;
@@ -923,12 +915,7 @@ impl SshConnectionManager {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let _permit: OwnedSemaphorePermit = self
-            .channel_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| SshMcpError::connection(format!("Failed to acquire command slot: {e}")))?;
+        let _permit = self.acquire_command_slot().await?;
 
         self.ensure_connected().await?;
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 use russh::Channel;
 use russh::client::{self, Handle};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -78,6 +78,18 @@ impl SshConnectionManager {
             has_timeout_cmd: AtomicBool::new(false),
             channel_semaphore: Arc::new(Semaphore::new(CHANNEL_SEMAPHORE_CAPACITY)),
         }
+    }
+
+    pub(crate) async fn acquire_command_slot_raw(
+        &self,
+    ) -> std::result::Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.channel_semaphore.clone().acquire_owned().await
+    }
+
+    pub(crate) async fn acquire_command_slot(&self) -> Result<OwnedSemaphorePermit> {
+        self.acquire_command_slot_raw()
+            .await
+            .map_err(|e| SshMcpError::connection(format!("Failed to acquire command slot: {e}")))
     }
 
     /// Establish SSH connection

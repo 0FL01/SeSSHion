@@ -68,8 +68,8 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── marker.rs           # Background marker parsing (stdout marker extraction)
 │   │   ├── response.rs         # JSON response formatting for background tools
 │   │   └── wrapper.rs          # Background wrapper script generation
-│   ├── tools/                  # MCP tool definitions (legacy, mostly empty after refactor)
-│   │   └── mod.rs              # Re-exports (tool logic moved to server/tools.rs)
+│   ├── tools/                  # MCP tool parameter structs
+│   │   └── mod.rs              # Parameter definitions (ExecParams, SudoExecParams, CheckProcessParams)
 │   └── transfer/               # File transfer operations
 │       ├── mod.rs              # Transfer module definition
 │       ├── skeleton.rs         # Shared staging/orchestration helpers (put/get file/dir deduplication)

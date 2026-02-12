@@ -8,12 +8,9 @@ use tokio::process::Command;
 use crate::error::{Result, SshMcpError};
 use crate::ssh::{SshConnectionManager, escape_for_shell};
 
-use super::exec_raw;
 use super::process;
-use super::staging;
-use super::types::{
-    StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferOperation, TransferStaging,
-};
+use super::skeleton;
+use super::types::{TransferCounts, TransferKind, TransferOperation, TransferStaging};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenSshTransport {
@@ -259,169 +256,134 @@ async fn put_file(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    let meta = tokio::fs::symlink_metadata(&args.local_path)
-        .await
-        .map_err(SshMcpError::Io)
-        .map_err(super::TransportAttemptError::Other)?;
-    if !meta.is_file() {
-        return Err(super::TransportAttemptError::Other(
-            SshMcpError::invalid_params("local_path is not a file"),
-        ));
-    }
-    let size = meta.len();
+    let OpenSshTransferArgs {
+        transport,
+        conn,
+        remote_home,
+        local_root: _,
+        id,
+        timeout,
+        operation: _,
+        kind: _,
+        local_path,
+        remote_path,
+        overwrite,
+    } = args;
 
-    let stage = staging::remote_prepare_put_file_stage(
-        args.conn,
-        args.remote_home,
-        &args.remote_path,
-        args.overwrite,
-        args.id,
-        args.timeout,
-    )
-    .await
-    .map_err(super::TransportAttemptError::Other)?;
+    let local_path_str = local_path.display().to_string();
 
-    match args.transport {
-        OpenSshTransport::Sftp => {
-            let batch = format!(
-                "put {} {}\n",
-                sftp_quote_token(&args.local_path.display().to_string()),
-                sftp_quote_token(&stage.stage_path)
-            );
-            let out = run_sftp_batch(&endpoint, &batch, args.timeout).await?;
-            if !out.status.success() {
-                return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
-            }
-        }
-        OpenSshTransport::Scp => {
-            let remote = scp_remote_spec(&endpoint, &stage.stage_path);
-            let try_o = vec![
-                "-O".to_string(),
-                args.local_path.display().to_string(),
-                remote.clone(),
-            ];
-            let out_o = run_scp(&endpoint, &try_o, args.timeout).await?;
-            if !out_o.status.success() {
-                let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                    let no_o = vec![args.local_path.display().to_string(), remote];
-                    let out = run_scp(&endpoint, &no_o, args.timeout).await?;
+    skeleton::put_file_with_remote_staging(
+        skeleton::PutFileWithRemoteStagingArgs {
+            conn,
+            remote_home,
+            remote_path,
+            overwrite,
+            id,
+            timeout,
+            local_path: &local_path,
+        },
+        move |stage_path| async move {
+            match transport {
+                OpenSshTransport::Sftp => {
+                    let batch = format!(
+                        "put {} {}\n",
+                        sftp_quote_token(&local_path_str),
+                        sftp_quote_token(&stage_path)
+                    );
+                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
                     if !out.status.success() {
-                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                        return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
-                } else {
-                    return Err(classified);
+                }
+                OpenSshTransport::Scp => {
+                    let remote = scp_remote_spec(&endpoint, &stage_path);
+                    let try_o = vec!["-O".to_string(), local_path_str.clone(), remote.clone()];
+                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    if !out_o.status.success() {
+                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
+                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
+                            let no_o = vec![local_path_str, remote];
+                            let out = run_scp(&endpoint, &no_o, timeout).await?;
+                            if !out.status.success() {
+                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                            }
+                        } else {
+                            return Err(classified);
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    staging::remote_finalize_put_file(
-        args.conn,
-        &args.remote_path,
-        &stage.stage_path,
-        args.overwrite,
-        args.timeout,
+            Ok(())
+        },
     )
     .await
-    .map_err(super::TransportAttemptError::Other)?;
-
-    Ok((
-        TransferStaging {
-            local: None,
-            remote: Some(StagingRemote {
-                staging_path: stage.stage_path,
-                backup_path: None,
-                final_path: args.remote_path,
-                staging_base_home: stage.stage_base,
-            }),
-        },
-        TransferCounts {
-            bytes: size,
-            files: 1,
-            directories: 0,
-        },
-    ))
 }
 
 async fn get_file(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    exec_raw::validate_remote_user_file_path(&args.remote_path, "remote_path")
-        .map_err(super::TransportAttemptError::Other)?;
+    let OpenSshTransferArgs {
+        transport,
+        conn: _,
+        remote_home: _,
+        local_root,
+        id,
+        timeout,
+        operation: _,
+        kind: _,
+        local_path,
+        remote_path,
+        overwrite,
+    } = args;
 
-    let (tmp, f) =
-        exec_raw::create_unique_local_staging_file(args.local_root, &args.local_path, args.id)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-    drop(f);
+    let remote_path_for_download = remote_path.clone();
 
-    match args.transport {
-        OpenSshTransport::Sftp => {
-            let batch = format!(
-                "get {} {}\n",
-                sftp_quote_token(&args.remote_path),
-                sftp_quote_token(&tmp.display().to_string())
-            );
-            let out = run_sftp_batch(&endpoint, &batch, args.timeout).await?;
-            if !out.status.success() {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
-            }
-        }
-        OpenSshTransport::Scp => {
-            let remote = scp_remote_spec(&endpoint, &args.remote_path);
-            let try_o = vec!["-O".to_string(), remote.clone(), tmp.display().to_string()];
-            let out_o = run_scp(&endpoint, &try_o, args.timeout).await?;
-            if !out_o.status.success() {
-                let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                    let no_o = vec![remote, tmp.display().to_string()];
-                    let out = run_scp(&endpoint, &no_o, args.timeout).await?;
+    skeleton::get_file_with_local_staging(
+        skeleton::GetFileWithLocalStagingArgs {
+            local_root,
+            local_path: &local_path,
+            remote_path: remote_path.as_str(),
+            overwrite,
+            id,
+        },
+        move |tmp_path| async move {
+            match transport {
+                OpenSshTransport::Sftp => {
+                    let batch = format!(
+                        "get {} {}\n",
+                        sftp_quote_token(&remote_path_for_download),
+                        sftp_quote_token(&tmp_path)
+                    );
+                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
                     if !out.status.success() {
-                        let _ = tokio::fs::remove_file(&tmp).await;
-                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                        return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
-                } else {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(classified);
+                }
+                OpenSshTransport::Scp => {
+                    let remote = scp_remote_spec(&endpoint, &remote_path_for_download);
+                    let try_o = vec!["-O".to_string(), remote.clone(), tmp_path.clone()];
+                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    if !out_o.status.success() {
+                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
+                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
+                            let no_o = vec![remote, tmp_path];
+                            let out = run_scp(&endpoint, &no_o, timeout).await?;
+                            if !out.status.success() {
+                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                            }
+                        } else {
+                            return Err(classified);
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    let meta = tokio::fs::metadata(&tmp)
-        .await
-        .map_err(SshMcpError::Io)
-        .map_err(super::TransportAttemptError::Other)?;
-    let bytes = meta.len();
-
-    if args.overwrite {
-        exec_raw::atomic_replace_file(&tmp, &args.local_path)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-    } else {
-        exec_raw::atomic_install_file_overwrite_false(&tmp, &args.local_path)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-    }
-
-    Ok((
-        TransferStaging {
-            local: Some(StagingLocal {
-                staging_path: tmp.display().to_string(),
-                backup_path: None,
-                final_path: args.local_path.display().to_string(),
-            }),
-            remote: None,
+            Ok(())
         },
-        TransferCounts {
-            bytes,
-            files: 1,
-            directories: 0,
-        },
-    ))
+    )
+    .await
 }
 
 async fn count_dir_no_symlinks(root: &Path) -> Result<TransferCounts> {
@@ -432,200 +394,150 @@ async fn put_dir(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    let counts = count_dir_no_symlinks(&args.local_path)
+    let OpenSshTransferArgs {
+        transport,
+        conn,
+        remote_home,
+        id,
+        timeout,
+        local_path,
+        remote_path,
+        overwrite,
+        ..
+    } = args;
+
+    let counts = count_dir_no_symlinks(&local_path)
         .await
         .map_err(super::TransportAttemptError::Other)?;
 
-    let stage = staging::remote_prepare_put_dir_stage(
-        args.conn,
-        args.remote_home,
-        &args.remote_path,
-        args.overwrite,
-        args.id,
-        args.timeout,
-    )
-    .await
-    .map_err(super::TransportAttemptError::Other)?;
-
-    let upload_target = stage.stage_path.clone();
-
-    match args.transport {
-        OpenSshTransport::Sftp => {
-            let local_dot = format!("{}/.", args.local_path.display());
-            let batch = format!(
-                "put -r {} {}\n",
-                sftp_quote_token(&local_dot),
-                sftp_quote_token(&upload_target)
-            );
-            let out = run_sftp_batch(&endpoint, &batch, args.timeout).await?;
-            if !out.status.success() {
-                return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
-            }
-        }
-        OpenSshTransport::Scp => {
-            let local_dot = format!("{}/.", args.local_path.display());
-            let remote = scp_remote_spec(&endpoint, &upload_target);
-            let try_o = vec![
-                "-O".to_string(),
-                "-r".to_string(),
-                local_dot.clone(),
-                remote.clone(),
-            ];
-            let out_o = run_scp(&endpoint, &try_o, args.timeout).await?;
-            if !out_o.status.success() {
-                let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                    let no_o = vec!["-r".to_string(), local_dot, remote];
-                    let out = run_scp(&endpoint, &no_o, args.timeout).await?;
+    skeleton::put_dir_with_remote_staging(
+        skeleton::PutDirWithRemoteStagingArgs {
+            conn,
+            remote_home,
+            remote_path,
+            overwrite,
+            id,
+            timeout,
+            counts,
+        },
+        move |stage_path| async move {
+            match transport {
+                OpenSshTransport::Sftp => {
+                    let local_dot = format!("{}/.", local_path.display());
+                    let batch = format!(
+                        "put -r {} {}\n",
+                        sftp_quote_token(&local_dot),
+                        sftp_quote_token(&stage_path)
+                    );
+                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
                     if !out.status.success() {
-                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                        return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
-                } else {
-                    return Err(classified);
+                }
+                OpenSshTransport::Scp => {
+                    let local_dot = format!("{}/.", local_path.display());
+                    let remote = scp_remote_spec(&endpoint, &stage_path);
+                    let try_o = vec![
+                        "-O".to_string(),
+                        "-r".to_string(),
+                        local_dot.clone(),
+                        remote.clone(),
+                    ];
+                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    if !out_o.status.success() {
+                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
+                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
+                            let no_o = vec!["-r".to_string(), local_dot, remote];
+                            let out = run_scp(&endpoint, &no_o, timeout).await?;
+                            if !out.status.success() {
+                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                            }
+                        } else {
+                            return Err(classified);
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    let backup_path = if args.overwrite {
-        staging::remote_finalize_put_dir_overwrite_true(
-            args.conn,
-            args.remote_home,
-            &args.remote_path,
-            &stage.stage_path,
-            args.id,
-            args.timeout,
-        )
-        .await
-        .map_err(super::TransportAttemptError::Other)?
-    } else {
-        None
-    };
-
-    Ok((
-        TransferStaging {
-            local: None,
-            remote: Some(StagingRemote {
-                staging_path: stage.stage_path,
-                backup_path,
-                final_path: args.remote_path,
-                staging_base_home: stage.stage_base,
-            }),
+            Ok(())
         },
-        counts,
-    ))
+    )
+    .await
 }
 
 async fn get_dir(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    exec_raw::validate_remote_user_path(&args.remote_path, "remote_path")
-        .map_err(super::TransportAttemptError::Other)?;
+    let OpenSshTransferArgs {
+        transport,
+        conn,
+        remote_home: _,
+        local_root,
+        id,
+        timeout,
+        operation: _,
+        kind: _,
+        local_path,
+        remote_path,
+        overwrite,
+    } = args;
 
-    staging::remote_validate_dir_contents(args.conn, &args.remote_path, args.timeout)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
+    let remote_path_for_download = remote_path.clone();
 
-    let (extract_target, local_backup) = if args.overwrite {
-        let stage =
-            exec_raw::create_unique_local_staging_dir(args.local_root, &args.local_path, args.id)
-                .await
-                .map_err(super::TransportAttemptError::Other)?;
-        let backup = exec_raw::local_backup_dir_sibling(&args.local_path, args.id);
-        (stage, Some(backup))
-    } else {
-        match tokio::fs::create_dir(&args.local_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(super::TransportAttemptError::Other(
-                    SshMcpError::invalid_params(
-                        "local destination exists and overwrite=false. Use overwrite=true to replace it.",
-                    ),
-                ));
-            }
-            Err(e) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
-        }
-        (args.local_path.clone(), None)
-    };
-
-    match args.transport {
-        OpenSshTransport::Sftp => {
-            let remote_dot = format!("{}/.", args.remote_path);
-            let batch = format!(
-                "get -r {} {}\n",
-                sftp_quote_token(&remote_dot),
-                sftp_quote_token(&extract_target.display().to_string())
-            );
-            let out = run_sftp_batch(&endpoint, &batch, args.timeout).await?;
-            if !out.status.success() {
-                let _ = tokio::fs::remove_dir_all(&extract_target).await;
-                return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
-            }
-        }
-        OpenSshTransport::Scp => {
-            let remote_dot = format!("{}/.", args.remote_path);
-            let remote = scp_remote_spec(&endpoint, &remote_dot);
-            let try_o = vec![
-                "-O".to_string(),
-                "-r".to_string(),
-                remote.clone(),
-                extract_target.display().to_string(),
-            ];
-            let out_o = run_scp(&endpoint, &try_o, args.timeout).await?;
-            if !out_o.status.success() {
-                let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                    let no_o = vec![
-                        "-r".to_string(),
-                        remote,
-                        extract_target.display().to_string(),
-                    ];
-                    let out = run_scp(&endpoint, &no_o, args.timeout).await?;
+    skeleton::get_dir_with_local_staging(
+        skeleton::GetDirWithLocalStagingArgs {
+            conn,
+            local_root,
+            local_path: &local_path,
+            remote_path: remote_path.as_str(),
+            overwrite,
+            id,
+            timeout,
+        },
+        move |extract_target| async move {
+            match transport {
+                OpenSshTransport::Sftp => {
+                    let remote_dot = format!("{}/.", remote_path_for_download);
+                    let batch = format!(
+                        "get -r {} {}\n",
+                        sftp_quote_token(&remote_dot),
+                        sftp_quote_token(&extract_target)
+                    );
+                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
                     if !out.status.success() {
-                        let _ = tokio::fs::remove_dir_all(&extract_target).await;
-                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                        return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
-                } else {
-                    let _ = tokio::fs::remove_dir_all(&extract_target).await;
-                    return Err(classified);
+                }
+                OpenSshTransport::Scp => {
+                    let remote_dot = format!("{}/.", remote_path_for_download);
+                    let remote = scp_remote_spec(&endpoint, &remote_dot);
+                    let try_o = vec![
+                        "-O".to_string(),
+                        "-r".to_string(),
+                        remote.clone(),
+                        extract_target.clone(),
+                    ];
+                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    if !out_o.status.success() {
+                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
+                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
+                            let no_o = vec!["-r".to_string(), remote, extract_target];
+                            let out = run_scp(&endpoint, &no_o, timeout).await?;
+                            if !out.status.success() {
+                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
+                            }
+                        } else {
+                            return Err(classified);
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    let counts = count_dir_no_symlinks(&extract_target)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
-
-    let (staging_path, backup_path) = if args.overwrite {
-        let backup = local_backup.as_ref().ok_or_else(|| {
-            super::TransportAttemptError::Other(SshMcpError::connection(
-                "missing local backup path",
-            ))
-        })?;
-        exec_raw::atomic_replace_dir(&extract_target, &args.local_path, backup)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-        (
-            extract_target.display().to_string(),
-            Some(backup.display().to_string()),
-        )
-    } else {
-        (args.local_path.display().to_string(), None)
-    };
-
-    Ok((
-        TransferStaging {
-            local: Some(StagingLocal {
-                staging_path,
-                backup_path,
-                final_path: args.local_path.display().to_string(),
-            }),
-            remote: None,
+            Ok(())
         },
-        counts,
-    ))
+    )
+    .await
 }
 
 #[cfg(test)]

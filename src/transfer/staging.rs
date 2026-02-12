@@ -74,6 +74,7 @@ pub(crate) fn ensure_remote_exec_success(
 pub(crate) struct RemoteStage {
     pub(crate) stage_path: String,
     pub(crate) stage_base: String,
+    pub(crate) stage_is_destination: bool,
 }
 
 pub(crate) async fn remote_prepare_put_file_stage(
@@ -130,6 +131,7 @@ pub(crate) async fn remote_prepare_put_file_stage(
     Ok(RemoteStage {
         stage_path,
         stage_base,
+        stage_is_destination: false,
     })
 }
 
@@ -216,6 +218,7 @@ pub(crate) async fn remote_prepare_put_dir_stage(
     Ok(RemoteStage {
         stage_path,
         stage_base,
+        stage_is_destination: !overwrite,
     })
 }
 

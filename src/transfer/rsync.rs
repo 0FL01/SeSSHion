@@ -5,14 +5,12 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{Result, SshMcpError};
-use crate::ssh::SshConnectionManager;
+use crate::ssh::{SshConnectionManager, escape_for_shell};
 
-use super::exec_raw;
 use super::process;
-use super::staging;
+use super::skeleton;
 use super::types::{
-    RsyncOptions, StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferOperation,
-    TransferStaging,
+    RsyncOptions, TransferCounts, TransferKind, TransferOperation, TransferStaging,
 };
 
 // Staging/marker helpers live in `super::staging`.
@@ -91,6 +89,16 @@ async fn check_remote_rsync(conn: &SshConnectionManager, timeout: Duration) -> R
     Ok(out.exit_code == Some(0) && !out.stdout.trim().is_empty())
 }
 
+#[cfg(unix)]
+fn null_known_hosts_path() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(windows)]
+fn null_known_hosts_path() -> &'static str {
+    "NUL"
+}
+
 fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
     let mut opts = vec![
         "-o".to_string(),
@@ -98,7 +106,7 @@ fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
         "-o".to_string(),
         "StrictHostKeyChecking=no".to_string(),
         "-o".to_string(),
-        "UserKnownHostsFile=/dev/null".to_string(),
+        format!("UserKnownHostsFile={}", null_known_hosts_path()),
         "-o".to_string(),
         "LogLevel=ERROR".to_string(),
     ];
@@ -110,7 +118,10 @@ fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
 
     if let Some(ref key) = endpoint.key_path {
         opts.push("-i".to_string());
-        opts.push(key.display().to_string());
+        let key_str = key.display().to_string();
+        let escaped = escape_for_shell(&key_str);
+        // rsync -e passes a single command string; ensure key_path stays a single token.
+        opts.push(format!("'{}'", escaped));
     }
 
     opts.join(" ")
@@ -258,124 +269,78 @@ async fn put_file(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    let meta = tokio::fs::symlink_metadata(args.local_path)
-        .await
-        .map_err(SshMcpError::Io)
-        .map_err(super::TransportAttemptError::Other)?;
-    if !meta.is_file() {
-        return Err(super::TransportAttemptError::Other(
-            SshMcpError::invalid_params("local_path is not a file"),
-        ));
-    }
-    let size = meta.len();
+    let RsyncTransferArgs {
+        conn,
+        remote_home,
+        local_root: _,
+        id,
+        timeout,
+        operation: _,
+        kind: _,
+        local_path,
+        remote_path,
+        overwrite,
+        rsync_options,
+    } = args;
 
-    let stage = staging::remote_prepare_put_file_stage(
-        args.conn,
-        args.remote_home,
-        args.remote_path,
-        args.overwrite,
-        args.id,
-        args.timeout,
+    let local_path_str = local_path.display().to_string();
+    let remote_path = remote_path.to_string();
+
+    skeleton::put_file_with_remote_staging(
+        skeleton::PutFileWithRemoteStagingArgs {
+            conn,
+            remote_home,
+            remote_path,
+            overwrite,
+            id,
+            timeout,
+            local_path,
+        },
+        move |stage_path| async move {
+            let remote = rsync_remote_spec(&endpoint, &stage_path);
+            run_rsync(&endpoint, &rsync_options, &local_path_str, &remote, timeout)
+                .await
+                .map(|_| ())
+        },
     )
     .await
-    .map_err(super::TransportAttemptError::Other)?;
-
-    let local_path_str = args.local_path.display().to_string();
-    let remote = rsync_remote_spec(&endpoint, &stage.stage_path);
-
-    run_rsync(
-        &endpoint,
-        &args.rsync_options,
-        &local_path_str,
-        &remote,
-        args.timeout,
-    )
-    .await?;
-
-    staging::remote_finalize_put_file(
-        args.conn,
-        args.remote_path,
-        &stage.stage_path,
-        args.overwrite,
-        args.timeout,
-    )
-    .await
-    .map_err(super::TransportAttemptError::Other)?;
-
-    Ok((
-        TransferStaging {
-            local: None,
-            remote: Some(StagingRemote {
-                staging_path: stage.stage_path,
-                backup_path: None,
-                final_path: args.remote_path.to_string(),
-                staging_base_home: stage.stage_base,
-            }),
-        },
-        TransferCounts {
-            bytes: size,
-            files: 1,
-            directories: 0,
-        },
-    ))
 }
 
 async fn get_file(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    exec_raw::validate_remote_user_file_path(args.remote_path, "remote_path")
-        .map_err(super::TransportAttemptError::Other)?;
+    let RsyncTransferArgs {
+        conn: _,
+        remote_home: _,
+        local_root,
+        id,
+        timeout,
+        operation: _,
+        kind: _,
+        local_path,
+        remote_path,
+        overwrite,
+        rsync_options,
+    } = args;
 
-    let (tmp, f) =
-        exec_raw::create_unique_local_staging_file(args.local_root, args.local_path, args.id)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-    drop(f);
+    let remote = rsync_remote_spec(&endpoint, remote_path);
 
-    let remote = rsync_remote_spec(&endpoint, args.remote_path);
-    let tmp_str = tmp.display().to_string();
-
-    run_rsync(
-        &endpoint,
-        &args.rsync_options,
-        &remote,
-        &tmp_str,
-        args.timeout,
+    skeleton::get_file_with_local_staging(
+        skeleton::GetFileWithLocalStagingArgs {
+            local_root,
+            local_path,
+            remote_path,
+            overwrite,
+            id,
+        },
+        move |tmp_path| async move {
+            run_rsync(&endpoint, &rsync_options, &remote, &tmp_path, timeout)
+                .await
+                .map(|_| ())
+        },
     )
-    .await?;
-
-    let meta = tokio::fs::metadata(&tmp)
-        .await
-        .map_err(SshMcpError::Io)
-        .map_err(super::TransportAttemptError::Other)?;
-    let bytes = meta.len();
-
-    if args.overwrite {
-        exec_raw::atomic_replace_file(&tmp, args.local_path)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-    } else {
-        exec_raw::atomic_install_file_overwrite_false(&tmp, args.local_path)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-    }
-
-    Ok((
-        TransferStaging {
-            local: Some(StagingLocal {
-                staging_path: tmp.display().to_string(),
-                backup_path: None,
-                final_path: args.local_path.display().to_string(),
-            }),
-            remote: None,
-        },
-        TransferCounts {
-            bytes,
-            files: 1,
-            directories: 0,
-        },
-    ))
+    .await
 }
 
 async fn count_local_dir_no_symlinks(root: &Path) -> Result<TransferCounts> {
@@ -386,150 +351,89 @@ async fn put_dir(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    let counts = count_local_dir_no_symlinks(args.local_path)
+    let RsyncTransferArgs {
+        conn,
+        remote_home,
+        id,
+        timeout,
+        local_path,
+        remote_path,
+        overwrite,
+        rsync_options,
+        ..
+    } = args;
+
+    let counts = count_local_dir_no_symlinks(local_path)
         .await
         .map_err(super::TransportAttemptError::Other)?;
 
-    let stage = staging::remote_prepare_put_dir_stage(
-        args.conn,
-        args.remote_home,
-        args.remote_path,
-        args.overwrite,
-        args.id,
-        args.timeout,
+    let remote_path = remote_path.to_string();
+
+    skeleton::put_dir_with_remote_staging(
+        skeleton::PutDirWithRemoteStagingArgs {
+            conn,
+            remote_home,
+            remote_path,
+            overwrite,
+            id,
+            timeout,
+            counts,
+        },
+        move |stage_path| async move {
+            let local_dot = format!("{}/.", local_path.display());
+            let remote = rsync_remote_spec(&endpoint, &stage_path);
+            run_rsync(&endpoint, &rsync_options, &local_dot, &remote, timeout)
+                .await
+                .map(|_| ())
+        },
     )
     .await
-    .map_err(super::TransportAttemptError::Other)?;
-
-    let local_dot = format!("{}/.", args.local_path.display());
-    let remote = rsync_remote_spec(&endpoint, &stage.stage_path);
-
-    run_rsync(
-        &endpoint,
-        &args.rsync_options,
-        &local_dot,
-        &remote,
-        args.timeout,
-    )
-    .await?;
-
-    let backup_path = if args.overwrite {
-        staging::remote_finalize_put_dir_overwrite_true(
-            args.conn,
-            args.remote_home,
-            args.remote_path,
-            &stage.stage_path,
-            args.id,
-            args.timeout,
-        )
-        .await
-        .map_err(super::TransportAttemptError::Other)?
-    } else {
-        None
-    };
-
-    Ok((
-        TransferStaging {
-            local: None,
-            remote: Some(StagingRemote {
-                staging_path: stage.stage_path,
-                backup_path,
-                final_path: args.remote_path.to_string(),
-                staging_base_home: stage.stage_base,
-            }),
-        },
-        counts,
-    ))
 }
 
 async fn get_dir(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
-    exec_raw::validate_remote_user_path(args.remote_path, "remote_path")
-        .map_err(super::TransportAttemptError::Other)?;
+    let RsyncTransferArgs {
+        conn,
+        remote_home: _,
+        local_root,
+        id,
+        timeout,
+        operation: _,
+        kind: _,
+        local_path,
+        remote_path,
+        overwrite,
+        rsync_options,
+    } = args;
 
-    staging::remote_validate_dir_contents(args.conn, args.remote_path, args.timeout)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
-
-    let (extract_target, local_backup) = if args.overwrite {
-        let stage =
-            exec_raw::create_unique_local_staging_dir(args.local_root, args.local_path, args.id)
-                .await
-                .map_err(super::TransportAttemptError::Other)?;
-        let backup = exec_raw::local_backup_dir_sibling(args.local_path, args.id);
-        (stage, Some(backup))
-    } else {
-        match tokio::fs::create_dir(args.local_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(super::TransportAttemptError::Other(
-                    SshMcpError::invalid_params(
-                        "local destination exists and overwrite=false. Use overwrite=true to replace it.",
-                    ),
-                ));
-            }
-            Err(e) => return Err(super::TransportAttemptError::Other(SshMcpError::Io(e))),
-        }
-        (args.local_path.to_path_buf(), None)
-    };
-
-    let remote_dot = format!("{}/.", args.remote_path);
+    let remote_dot = format!("{}/.", remote_path);
     let remote = rsync_remote_spec(&endpoint, &remote_dot);
-    let extract_str = extract_target.display().to_string();
 
-    let result = run_rsync(
-        &endpoint,
-        &args.rsync_options,
-        &remote,
-        &extract_str,
-        args.timeout,
-    )
-    .await;
-
-    if let Err(e) = result {
-        let _ = tokio::fs::remove_dir_all(&extract_target).await;
-        return Err(e);
-    }
-
-    let counts = count_local_dir_no_symlinks(&extract_target)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
-
-    let (staging_path, backup_path) = if args.overwrite {
-        let backup = local_backup.as_ref().ok_or_else(|| {
-            super::TransportAttemptError::Other(SshMcpError::connection(
-                "missing local backup path",
-            ))
-        })?;
-        exec_raw::atomic_replace_dir(&extract_target, args.local_path, backup)
-            .await
-            .map_err(super::TransportAttemptError::Other)?;
-        (
-            extract_target.display().to_string(),
-            Some(backup.display().to_string()),
-        )
-    } else {
-        (args.local_path.display().to_string(), None)
-    };
-
-    Ok((
-        TransferStaging {
-            local: Some(StagingLocal {
-                staging_path,
-                backup_path,
-                final_path: args.local_path.display().to_string(),
-            }),
-            remote: None,
+    skeleton::get_dir_with_local_staging(
+        skeleton::GetDirWithLocalStagingArgs {
+            conn,
+            local_root,
+            local_path,
+            remote_path,
+            overwrite,
+            id,
+            timeout,
         },
-        counts,
-    ))
+        move |extract_target| async move {
+            run_rsync(&endpoint, &rsync_options, &remote, &extract_target, timeout)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::escape_for_shell;
 
     #[test]
     fn test_parse_rsync_stats() {
@@ -566,15 +470,26 @@ Total bytes received: 172"#;
 
     #[test]
     fn test_build_ssh_options() {
+        let key_path = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\Alice\My Keys\id_rsa")
+        } else {
+            PathBuf::from("/home/alice/my keys/id_rsa")
+        };
+
         let endpoint = RsyncEndpoint {
             host: "example.com".to_string(),
             port: 2222,
             user: "alice".to_string(),
-            key_path: Some(PathBuf::from("/home/alice/.ssh/id_rsa")),
+            key_path: Some(key_path.clone()),
         };
         let opts = build_ssh_options(&endpoint);
         assert!(opts.contains("-p 2222"));
-        assert!(opts.contains("-i /home/alice/.ssh/id_rsa"));
+
+        let key_str = key_path.display().to_string();
+        assert!(opts.contains(&format!("-i '{}'", escape_for_shell(&key_str))));
         assert!(opts.contains("BatchMode=yes"));
+
+        let null_hosts = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        assert!(opts.contains(&format!("UserKnownHostsFile={null_hosts}")));
     }
 }

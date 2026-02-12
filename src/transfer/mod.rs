@@ -11,6 +11,7 @@ mod local_root;
 mod openssh;
 mod process;
 mod rsync;
+mod skeleton;
 mod staging;
 mod tar;
 mod types;
@@ -315,7 +316,7 @@ impl TransferEngine {
                 ctx.response.staging = Some(staging);
                 ctx.response.counts = Some(counts);
                 ctx.response.semantics = Some(
-                    "directory transfer stages into a sibling temp dir under the remote destination parent when possible for atomic rename; if that staging location is not writable it falls back to $HOME/.ssh-mcp/staging and then moves into place; if the destination existed, it may be moved aside to a backup path which is removed on success (backup may remain if swap fails)"
+                    "directory transfer behavior depends on overwrite: if overwrite=true, it stages into a temp dir (sibling under destination parent when possible, else $HOME/.ssh-mcp/staging) and then swaps into place via rename, optionally moving an existing destination to a backup path removed on success (backup may remain if swap fails); if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)"
                         .to_string(),
                 );
                 Ok(())
@@ -467,7 +468,7 @@ impl TransferEngine {
         response.counts = Some(counts);
         if kind == TransferKind::Directory {
             response.semantics = Some(match operation {
-                TransferOperation::Put => "directory transfer stages into a sibling temp dir under the remote destination parent when possible for atomic rename; if that staging location is not writable it falls back to $HOME/.ssh-mcp/staging and then moves into place; if the destination existed, it may be moved aside to a backup path which is removed on success (backup may remain if swap fails)".to_string(),
+                TransferOperation::Put => "directory transfer behavior depends on overwrite: if overwrite=true, it stages into a temp dir (sibling under destination parent when possible, else $HOME/.ssh-mcp/staging) and then swaps into place via rename, optionally moving an existing destination to a backup path removed on success (backup may remain if swap fails); if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)".to_string(),
                 TransferOperation::Get => "directory transfer writes into a sibling staging dir under local_root, then swaps into place via rename; local_path must not normalize to '.'; if the destination existed, it is first renamed to a sibling backup path and removed after the swap (backup may remain if swap fails)".to_string(),
             });
         }
@@ -545,7 +546,7 @@ impl TransferEngine {
         response.counts = Some(counts);
         if kind == TransferKind::Directory {
             response.semantics = Some(match operation {
-                TransferOperation::Put => "directory transfer stages into a sibling temp dir under the remote destination parent when possible for atomic rename; if that staging location is not writable it falls back to $HOME/.ssh-mcp/staging and then moves into place; if the destination existed, it may be moved aside to a backup path which is removed on success (backup may remain if swap fails)".to_string(),
+                TransferOperation::Put => "directory transfer behavior depends on overwrite: if overwrite=true, it stages into a temp dir (sibling under destination parent when possible, else $HOME/.ssh-mcp/staging) and then swaps into place via rename, optionally moving an existing destination to a backup path removed on success (backup may remain if swap fails); if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)".to_string(),
                 TransferOperation::Get => "directory transfer writes into a sibling staging dir under local_root, then swaps into place via rename; local_path must not normalize to '.'; if the destination existed, it is first renamed to a sibling backup path and removed after the swap (backup may remain if swap fails)".to_string(),
             });
         }

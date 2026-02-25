@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tracing::info;
 use tracing_appender::{non_blocking, non_blocking::WorkerGuard, rolling};
-use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 use crate::config::Args;
 use crate::error::{Result, SshMcpError};
@@ -72,7 +72,7 @@ pub fn init_logging(args: &Args) -> Result<Option<WorkerGuard>> {
         let rotation_note = match args.log_rotation.as_str() {
             "daily" => format!(" (actual file: {}.YYYY-MM-DD)", log_file.display()),
             "hourly" => format!(" (actual file: {}.YYYY-MM-DD-HH)", log_file.display()),
-            _ => "".to_string(),
+            _ => String::new(),
         };
         info!(
             "Logging initialized: file={}, format={}, rotation={}{}",

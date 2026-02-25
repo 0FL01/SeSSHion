@@ -4,12 +4,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
 
-A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution and administrative tasks.
+A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution and administrative tasks.
 
 > This project is a comprehensive Rust port of the [TypeScript SSH MCP Server](https://github.com/tufantunc/ssh-mcp). It aims for complete feature parity with the original implementation while introducing unique, advanced features in the future.
 
 ## ✨ Features
 
+- **DevOps-Optimized**: Purpose-built for CI/CD, infrastructure automation, deployment pipelines, and system administration workflows.
 - **Persistent Connections**: Maintains a single SSH session across multiple tool calls for maximum speed.
 - **Auto-Reconnect**: Automatically restores the connection if it drops.
 - **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.

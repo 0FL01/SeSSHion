@@ -61,7 +61,7 @@ multiple_unsafe_ops_per_block = "warn"
 # Качество кода и производительность
 perf = { level = "warn", priority = -1 }
 # Помогает избежать лишних аллокаций
-manual_string_new = "warn"
+manual_string_new = "deny"
 
 # Code quality - set to lower priority so specific lints can override
 all = { level = "warn", priority = -1 }

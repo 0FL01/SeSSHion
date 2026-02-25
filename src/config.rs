@@ -308,7 +308,7 @@ mod tests {
             sanitize_password(Some("secret".to_string())),
             Some("secret".to_string())
         );
-        assert_eq!(sanitize_password(Some("".to_string())), None);
+        assert_eq!(sanitize_password(Some(String::new())), None);
         assert_eq!(sanitize_password(None), None);
     }
 

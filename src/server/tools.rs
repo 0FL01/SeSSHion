@@ -12,7 +12,7 @@ PARAMETERS:
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
   (+ remote_log_path deprecated)
 - timeout_ms (integer): Foreground-only. Ignored when background=true (not validated in that mode).
-- log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under /tmp/ssh-mcp.
+- log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
 
 BACKGROUND MODE:
 For commands longer than RPC timeout, use background=true:
@@ -38,7 +38,7 @@ PARAMETERS:
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
 - timeout_ms (integer): Foreground-only. Ignored when background=true (not validated in that mode).
-- log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under /tmp/ssh-mcp.
+- log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
 
 EXAMPLE:
 {"command": "systemctl restart nginx", "background": false}"#;

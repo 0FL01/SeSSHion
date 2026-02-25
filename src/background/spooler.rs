@@ -1,3 +1,4 @@
+use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -8,8 +9,6 @@ use tokio::fs;
 use tracing::warn;
 
 use super::{BackgroundError, Result};
-
-const DEFAULT_SPOOL_DIR: &str = "/tmp/ssh-mcp";
 
 /// Local-only log spooler.
 ///
@@ -27,7 +26,7 @@ impl LocalLogSpooler {
     }
 
     pub fn new_default() -> Self {
-        Self::new(PathBuf::from(DEFAULT_SPOOL_DIR))
+        Self::new(env::temp_dir().join("ssh-mcp"))
     }
 
     pub fn base_dir(&self) -> &Path {

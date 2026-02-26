@@ -85,6 +85,31 @@ pub fn escape_command_for_shell(command: &str) -> String {
     )
 }
 
+/// Wrap a command for execution via POSIX shell.
+///
+/// The command payload is escaped for safe single-quoted embedding before
+/// constructing either `sh -c` or `sh -lc`.
+///
+/// # Arguments
+/// * `command` - Raw command to wrap
+/// * `login` - Use login shell mode (`sh -lc`) when true
+///
+/// # Examples
+/// ```
+/// use ssh_mcp::ssh::sanitize::wrap_in_posix_shell;
+///
+/// assert_eq!(wrap_in_posix_shell("echo hello", false), "sh -c 'echo hello'");
+/// assert_eq!(wrap_in_posix_shell("echo hello", true), "sh -lc 'echo hello'");
+/// ```
+pub fn wrap_in_posix_shell(command: &str, login: bool) -> String {
+    let escaped = escape_for_timeout_wrapper(command);
+    if login {
+        format!("sh -lc '{escaped}'")
+    } else {
+        format!("sh -c '{escaped}'")
+    }
+}
+
 /// Escapes a command for safe inclusion inside single quotes in timeout wrapper
 ///
 /// This function escapes characters that would break out of single quotes
@@ -263,5 +288,47 @@ mod tests {
     fn test_escape_for_timeout_wrapper_multiple_quotes() {
         let escaped = escape_for_timeout_wrapper("echo 'a' 'b'");
         assert_eq!(escaped, "echo '\"'\"'a'\"'\"' '\"'\"'b'\"'\"'");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_non_login() {
+        let wrapped = wrap_in_posix_shell("ls -la", false);
+        assert_eq!(wrapped, "sh -c 'ls -la'");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_login() {
+        let wrapped = wrap_in_posix_shell("ls -la", true);
+        assert_eq!(wrapped, "sh -lc 'ls -la'");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_with_embedded_single_quotes() {
+        let wrapped = wrap_in_posix_shell("echo 'hello'", false);
+        assert_eq!(wrapped, "sh -c 'echo '\"'\"'hello'\"'\"''");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_empty_command() {
+        let wrapped = wrap_in_posix_shell("", false);
+        assert_eq!(wrapped, "sh -c ''");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_preserves_dollar_syntax() {
+        let wrapped = wrap_in_posix_shell("echo $HOME", false);
+        assert_eq!(wrapped, "sh -c 'echo $HOME'");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_preserves_pipe_syntax() {
+        let wrapped = wrap_in_posix_shell("printf test | wc -c", false);
+        assert_eq!(wrapped, "sh -c 'printf test | wc -c'");
+    }
+
+    #[test]
+    fn test_wrap_in_posix_shell_preserves_command_substitution_syntax() {
+        let wrapped = wrap_in_posix_shell("echo `whoami` $(pwd)", false);
+        assert_eq!(wrapped, "sh -c 'echo `whoami` $(pwd)'");
     }
 }

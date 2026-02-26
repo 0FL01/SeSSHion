@@ -378,7 +378,8 @@ impl SshConnectionManager {
 
     /// Detect whether the `timeout` command is available on the remote system
     ///
-    /// This performs a one-time detection check by running `command -v timeout`
+    /// This performs a one-time detection check by running
+    /// `sh -c 'command -v timeout'`
     /// on the remote system. The result is cached for the lifetime of the
     /// connection.
     ///
@@ -399,9 +400,12 @@ impl SshConnectionManager {
         };
 
         // Run detection command
-        let exec_result = channel.exec(true, "command -v timeout").await.map_err(|e| {
-            SshMcpError::connection(format!("Failed to exec detection command: {}", e))
-        });
+        let exec_result = channel
+            .exec(true, "sh -c 'command -v timeout'")
+            .await
+            .map_err(|e| {
+                SshMcpError::connection(format!("Failed to exec detection command: {}", e))
+            });
 
         if exec_result.is_err() {
             debug!("Failed to exec timeout detection command");

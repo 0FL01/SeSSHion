@@ -4,10 +4,10 @@ use rmcp::model::Tool;
 
 mod tool_docs {
     pub const EXEC: &str = r#"EXEC TOOL
-Execute shell commands on remote SSH server.
+Execute commands on remote SSH server via POSIX-compatible sh.
 
 PARAMETERS:
-- command (string, required): Shell command to execute
+- command (string, required): Command string executed by POSIX-compatible sh (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
   (+ remote_log_path deprecated)
@@ -23,22 +23,27 @@ For commands longer than RPC timeout, use background=true:
 
 NOTE:
 - remote_log_path is kept for backward compatibility only (deprecated) and will be removed in a future version.
+- Commands are evaluated by POSIX-compatible sh on the remote host. Prefer portable shell syntax over shell-specific extensions.
 
 EXAMPLE:
 {"command": "apt update && apt install -y nginx", "background": true}"#;
 
     pub const SUDO_EXEC: &str = r#"SUDO-EXEC TOOL
-Execute shell commands with sudo privileges.
+Execute commands with sudo privileges via POSIX-compatible sh.
 
-Same parameters and behavior as exec tool, but runs with sudo.
+Same parameters as exec tool, but timeout behavior differs.
 Requires passwordless sudo or pre-configured sudo password.
 
 PARAMETERS:
-- command (string, required): Shell command to execute with sudo
+- command (string, required): Command string executed by POSIX-compatible sh under sudo (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
-- timeout_ms (integer): Foreground-only. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo-exec returns a timeout error (no auto-detach). Ignored when background=true (not validated in that mode).
 - log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
+
+NOTE:
+- Commands are evaluated by POSIX-compatible sh on the remote host. Prefer portable shell syntax over shell-specific extensions.
+- Auto-detach on foreground timeout applies to exec only. For long-running sudo commands, set background=true.
 
 EXAMPLE:
 {"command": "systemctl restart nginx", "background": false}"#;
@@ -103,16 +108,16 @@ fn command_tool(
 pub(super) fn exec_tool() -> Tool {
     command_tool(
         "exec",
-        "Execute shell command on remote host. Use background=true for long tasks.",
-        "Shell command to execute",
+        "Execute command via POSIX-compatible sh on remote host. Use background=true for long tasks.",
+        "Command string executed by POSIX-compatible sh",
     )
 }
 
 pub(super) fn sudo_exec_tool() -> Tool {
     command_tool(
         "sudo-exec",
-        "Execute shell command via sudo. Use background=true for long tasks.",
-        "Shell command to execute with sudo",
+        "Execute command via POSIX-compatible sh under sudo. Use background=true for long tasks.",
+        "Command string executed by POSIX-compatible sh under sudo",
     )
 }
 

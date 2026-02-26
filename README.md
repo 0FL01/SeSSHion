@@ -184,9 +184,9 @@ When using `--log-rotation=daily`, log files are suffixed with the date: `<log_f
 The server exposes the following MCP tools:
 
 ### `exec`
-Execute a shell command as the connected user.
+Execute a command as the connected user via POSIX-compatible `sh`.
 - **Arguments**:
-  - `command` (string, required): The shell command to execute.
+  - `command` (string, required): Command string evaluated by POSIX-compatible `sh`; use portable shell syntax.
   - `background` (boolean, default: false): If true, return immediately and continue streaming output to a local log on the MCP server. The job is tracked via `job_id` in an in-memory registry and the response includes `{job_id, pid, log_path}`. Recommended for long-running operations to avoid client timeouts.
   - `timeout_ms` (integer, optional): Override the default command timeout (ms) for foreground runs. If the foreground command exceeds this timeout, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`. When `background=true`, `timeout_ms` is ignored and NOT validated.
   - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. Defaults to `/tmp/ssh-mcp/<job_id>.log`. When `background=false`, `log_path` is ignored and NOT validated.
@@ -196,19 +196,19 @@ Execute a shell command as the connected user.
   - `remote_log_path` (string, deprecated): Compatibility field for backward compatibility. Does NOT represent an actual remote log file in the current architecture. Output is streamed locally; use `log_path` for local log access.
 
 ### `sudo-exec`
-Execute a command with root privileges using `sudo`.
+Execute a command with root privileges using `sudo` via POSIX-compatible `sh`.
 - **Arguments**:
-  - `command` (string, required): The shell command to execute with sudo.
+  - `command` (string, required): Command string evaluated by POSIX-compatible `sh` under sudo; use portable shell syntax.
   - `background` (boolean, default: false): Same behavior as `exec` - return immediately and stream output to a local log.
-  - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. Same auto-detach behavior on timeout. When `background=true`, `timeout_ms` is ignored and NOT validated.
+  - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. On timeout, `sudo-exec` foreground returns a timeout error (no auto-detach). Auto-detach-on-timeout applies to `exec` foreground only. When `background=true`, `timeout_ms` is ignored and NOT validated.
   - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. When `background=false`, `log_path` is ignored and NOT validated.
-- **Note**: This tool uses the `--sudo-password` provided at startup.
+- **Note**: This tool uses the `--sudo-password` provided at startup. For long-running sudo tasks, use `background=true` and monitor via `check-process`.
 
 ### `check-process`
 Check if a background job is still running and read the tail of its local log (stored on the MCP server).
 
 - **Arguments**:
-  - `job_id` (string, required): Job ID returned by `exec`/`sudo-exec` when `background=true` (or timeout auto-detach).
+  - `job_id` (string, required): Job ID returned by `exec`/`sudo-exec` when `background=true`, or by `exec` foreground timeout auto-detach.
   - `tail_lines` (integer, default: 50): Number of last lines to read from the local log.
 
 ### `transfer`

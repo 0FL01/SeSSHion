@@ -17,7 +17,7 @@ use tracing::{debug, error, warn};
 
 use super::config::TIMEOUT_KILL_AFTER_SECS;
 use super::connection::SshConnectionManager;
-use super::sanitize::{escape_command_for_shell, escape_for_timeout_wrapper};
+use super::sanitize::{escape_command_for_shell, escape_for_timeout_wrapper, wrap_in_posix_shell};
 use crate::background::{JobRegistry, JobStatus};
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
@@ -123,6 +123,10 @@ pub fn wrap_command_with_timeout(command: &str, duration_secs: f64) -> String {
         "timeout -k {}s {}s sh -lc '{}'",
         TIMEOUT_KILL_AFTER_SECS, duration_secs, escaped_command
     )
+}
+
+fn wrap_command_for_channel_exec(command: &str) -> String {
+    wrap_in_posix_shell(command, false)
 }
 
 fn validate_timeout_duration(timeout_duration: Duration) -> Result<f64> {
@@ -368,8 +372,9 @@ impl SshConnectionManager {
         channel: &mut russh::Channel<russh::client::Msg>,
         command: &str,
     ) -> std::result::Result<(), SuSendError> {
+        let wrapped_command = wrap_command_for_channel_exec(command);
         channel
-            .data(format!("{}\n", command).as_bytes())
+            .data(format!("{}\n", wrapped_command).as_bytes())
             .await
             .map_err(|e| SuSendError::SendFailed(e.to_string()))
     }
@@ -591,8 +596,9 @@ impl SshConnectionManager {
             .map_err(|e| PreExecError::ChannelOpen(e.to_string()))?;
 
         debug!("Executing command: cmd_len={}", command.len());
+        let wrapped_command = wrap_command_for_channel_exec(command);
         channel
-            .exec(true, command)
+            .exec(true, wrapped_command.as_str())
             .await
             .map_err(|e| PreExecError::ExecSend(format!("Failed to exec command: {}", e)))?;
 
@@ -1463,5 +1469,41 @@ mod tests {
         assert!(cmd.contains("sh -lc"));
         // Single quotes are escaped as '"'"'
         assert!(cmd.contains("'\"'\"'"));
+    }
+
+    #[test]
+    fn test_wrap_command_for_channel_exec_non_login_shell() {
+        let cmd = wrap_command_for_channel_exec("echo hello");
+        assert_eq!(cmd, "sh -c 'echo hello'");
+    }
+
+    #[test]
+    fn test_wrap_command_for_channel_exec_timeout_wrapper_payload() {
+        let timeout_wrapped = wrap_command_with_timeout("echo hello", 1.0);
+        assert_eq!(timeout_wrapped, "timeout -k 2s 1s sh -lc 'echo hello'");
+
+        let cmd = wrap_command_for_channel_exec(&timeout_wrapped);
+        assert_eq!(
+            cmd,
+            "sh -c 'timeout -k 2s 1s sh -lc '\"'\"'echo hello'\"'\"''"
+        );
+    }
+
+    #[test]
+    fn test_wrap_command_for_channel_exec_timeout_wrapper_payload_with_single_quotes() {
+        let timeout_wrapped = wrap_command_with_timeout("echo 'hello'", 1.0);
+        assert_eq!(
+            timeout_wrapped,
+            "timeout -k 2s 1s sh -lc 'echo '\"'\"'hello'\"'\"''"
+        );
+
+        let cmd = wrap_command_for_channel_exec(&timeout_wrapped);
+        assert!(cmd.starts_with("sh -c '"));
+        assert!(cmd.ends_with('\''));
+
+        let inner = &cmd[7..cmd.len() - 1];
+        let unescaped_once = inner.replace("'\"'\"'", "'");
+        assert_eq!(unescaped_once, timeout_wrapped);
+        assert!(cmd.contains("hello"));
     }
 }

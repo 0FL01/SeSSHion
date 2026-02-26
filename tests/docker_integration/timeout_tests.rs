@@ -7,6 +7,75 @@
 use super::common::*;
 use std::time::Instant;
 
+fn docker_test_config(host: &str, port: u16) -> Config {
+    Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: Some("secret".to_string()),
+        key: None,
+        su_password: None,
+        sudo_password: None,
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        max_output_tokens: Some(12000),
+        disable_sudo: true,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+    }
+}
+
+async fn create_server_with_readiness_poll(host: &str, port: u16) -> SshMcpServer {
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    let poll_interval = tokio::time::Duration::from_millis(250);
+
+    loop {
+        match SshMcpServer::new(docker_test_config(host, port)).await {
+            Ok(server) => {
+                let readiness = server
+                    .test_execute_command_with_timeout_ms("echo READY", 3000)
+                    .await;
+
+                match readiness {
+                    Ok(output) => {
+                        let text = extract_text_from_result(&output);
+                        if text.contains("READY") && !text.contains("SSH connection error") {
+                            return server;
+                        }
+
+                        if Instant::now() >= deadline {
+                            panic!(
+                                "SSH server not ready at {}:{} within 20s; readiness output: {}",
+                                host, port, text
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if Instant::now() >= deadline {
+                            panic!(
+                                "SSH server not ready at {}:{} within 20s; readiness error: {}",
+                                host, port, err
+                            );
+                        }
+                    }
+                }
+
+                server.shutdown().await;
+            }
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    panic!(
+                        "SSH server not ready at {}:{} within 20s; last error: {}",
+                        host, port, err
+                    );
+                }
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Test that sub-second timeouts (500ms) work correctly
 /// This test reproduces the bug where timeout_ms=500 was rejected because
 /// as_secs() returned 0 for durations < 1000ms
@@ -252,4 +321,163 @@ async fn test_timeout_actually_fires_with_precision() {
 
     server.shutdown().await;
     tracing::info!("Timeout precision test passed - fired after ~800ms");
+}
+
+/// Regression: preserve $HOME expansion through pipe composition
+#[tokio::test]
+async fn test_posix_home_pipe_semantics_preserved() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    let host_text = host.to_string();
+    let server = create_server_with_readiness_poll(&host_text, port).await;
+    tracing::info!("Container reachable at {}:{}", host_text, port);
+
+    let result = server
+        .test_execute_command_with_timeout_ms(
+            "[ -n \"$HOME\" ] && [ \"$HOME\" != '$HOME' ] && printf '%s\\n' \"$HOME\" | grep -Fx \"$HOME\" >/dev/null && echo HOME_EXPANDED_PIPE_OK",
+            5000,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "$HOME + pipe command should succeed: {:?}",
+        result
+    );
+
+    let output = result.unwrap();
+    let text = extract_text_from_result(&output);
+    assert!(
+        text.contains("HOME_EXPANDED_PIPE_OK"),
+        "Expected HOME_EXPANDED_PIPE_OK marker in output: {}",
+        text
+    );
+
+    server.shutdown().await;
+}
+
+/// Regression: preserve stderr redirection and pipe behavior (2>&1 | grep)
+#[tokio::test]
+async fn test_posix_stderr_pipe_semantics_preserved() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    let host_text = host.to_string();
+    let server = create_server_with_readiness_poll(&host_text, port).await;
+    tracing::info!("Container reachable at {}:{}", host_text, port);
+
+    let result = server
+        .test_execute_command_with_timeout_ms(
+            "cat /definitely_missing_file_ssh_mcp 2>&1 | grep -F 'definitely_missing_file_ssh_mcp' >/dev/null && echo STDERR_PIPE_OK",
+            5000,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "2>&1 | grep command should succeed: {:?}",
+        result
+    );
+
+    let output = result.unwrap();
+    let text = extract_text_from_result(&output);
+    assert!(
+        text.contains("STDERR_PIPE_OK"),
+        "Expected STDERR_PIPE_OK marker in output: {}",
+        text
+    );
+
+    server.shutdown().await;
+}
+
+/// Regression: preserve POSIX variable assignment and expansion across commands
+#[tokio::test]
+async fn test_posix_variable_assignment_semantics_preserved() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    let host_text = host.to_string();
+    let server = create_server_with_readiness_poll(&host_text, port).await;
+    tracing::info!("Container reachable at {}:{}", host_text, port);
+
+    let result = server
+        .test_execute_command_with_timeout_ms(
+            "VAR=POSIX_ASSIGN_OK; [ \"$VAR\" = 'POSIX_ASSIGN_OK' ] && echo VAR_ASSIGN_OK",
+            5000,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "VAR=value; echo $VAR command should succeed: {:?}",
+        result
+    );
+
+    let output = result.unwrap();
+    let text = extract_text_from_result(&output);
+    assert!(
+        text.contains("VAR_ASSIGN_OK"),
+        "Expected VAR_ASSIGN_OK in output: {}",
+        text
+    );
+
+    server.shutdown().await;
 }

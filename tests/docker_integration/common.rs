@@ -12,8 +12,11 @@ pub use std::sync::Mutex;
 pub static IMAGE_BUILD_ONCE: Once = Once::new();
 pub static IMAGE_BUILD_RESULT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
-/// Build the custom Debian SSH Docker images if not already present
-/// Checks and builds both ssh-mcp-debian-sshd:latest and ssh-mcp-debian-sshd-norsync:latest
+/// Build the custom Debian SSH Docker images if not already present.
+/// Checks and builds:
+/// - ssh-mcp-debian-sshd:latest
+/// - ssh-mcp-debian-sshd-norsync:latest
+/// - ssh-mcp-debian-sshd-fish:latest
 pub fn ensure_debian_sshd_image() -> Result<(), String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let mut errors = Vec::new();
@@ -67,6 +70,15 @@ pub fn ensure_debian_sshd_image() -> Result<(), String> {
         "ssh-mcp-debian-sshd-norsync:latest",
         &norsync_dockerfile_path,
     ) {
+        errors.push(e);
+    }
+
+    // Check and build third image (fish login shell variant)
+    let fish_dockerfile_path = format!(
+        "{}/tests/fixtures/debian-sshd-fish/Dockerfile",
+        manifest_dir
+    );
+    if let Err(e) = check_and_build("ssh-mcp-debian-sshd-fish:latest", &fish_dockerfile_path) {
         errors.push(e);
     }
 

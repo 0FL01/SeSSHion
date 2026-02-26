@@ -10,6 +10,7 @@ use crate::background::detach::DetachMode;
 use crate::background::marker::read_background_markers_from_channel;
 use crate::background::response::{background_json_err, background_json_ok};
 use crate::background::wrapper::remote_job_log_path;
+use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{sanitize_command, wrap_sudo_command};
 
 use super::SshMcpServer;
@@ -153,7 +154,8 @@ impl SshMcpServer {
             }
         };
 
-        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
+        let wrapped_wrapper = wrap_in_posix_shell(&wrapper, false);
+        if let Err(e) = channel.exec(true, wrapped_wrapper.as_str()).await {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,

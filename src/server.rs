@@ -32,6 +32,7 @@ use crate::config::Config;
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
+use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
@@ -433,7 +434,8 @@ impl SshMcpServer {
             }
         };
 
-        if let Err(e) = channel.exec(true, wrapper.as_str()).await {
+        let wrapped_wrapper = wrap_in_posix_shell(&wrapper, false);
+        if let Err(e) = channel.exec(true, wrapped_wrapper.as_str()).await {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error: Failed to exec background wrapper: {e}"
             ))]));

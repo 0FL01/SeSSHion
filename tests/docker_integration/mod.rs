@@ -5,6 +5,7 @@ pub mod check_process_tests;
 pub mod common;
 pub mod exec_raw_tests;
 pub mod fallback_tests;
+pub mod fish_tests;
 pub mod oom_tests;
 pub mod overwrite_tests;
 pub mod rsync_tests;

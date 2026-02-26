@@ -6,8 +6,6 @@
 
 A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution and administrative tasks.
 
-> This project is a comprehensive Rust port of the [TypeScript SSH MCP Server](https://github.com/tufantunc/ssh-mcp). It aims for complete feature parity with the original implementation while introducing unique, advanced features in the future.
-
 ## ✨ Features
 
 - **DevOps-Optimized**: Purpose-built for CI/CD, infrastructure automation, deployment pipelines, and system administration workflows.
@@ -19,28 +17,6 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 - **Command Sanitization**: Built-in safety checks for command inputs.
 - **Output Control**: Configurable output length limits to prevent token overflow.
 - **Cross-Platform**: Compiled binary runs on any system with SSH access.
-
-## 📊 Performance
-
-| Metric | TypeScript (Node.js) | Rust (Native) | Difference |
-|--------|----------------------|---------------|------------|
-| **RAM (RSS)** | ~82.5 MB | ~5.4 MB | **~15x more efficient** |
-| **CPU Time (Start)** | 0.55s | 0.01s | **Near-zero overhead** |
-| **Response Speed** | Instant | Instant | Limited by SSH latency |
-| **Context Usage** | ~800 tokens | ~500 tokens | **~1.6x more efficient** (compact tool definitions) |
-
-### 🛠️ Test Methodology
-
-To evaluate performance, the following scenarios were executed:
-
-1.  **Warmup**: A simple `echo` command to verify connectivity.
-2.  **Listing**: The command `find /usr -maxdepth 2 | head -n 50` to generate a data stream.
-
-**Monitoring Details:**
-
--   **Tools**: A monitoring script polled `/proc/[PID]/stat` every 100ms.
--   **Memory**: The TypeScript process demonstrated stable memory usage around **82 MB** (typical for Node.js runtime), whereas the Rust process consumed only **~5.4 MB**, highlighting a massive reduction in base overhead.
--   **CPU**: Both implementations showed minimal load during command execution (<10ms CPU time for the sequence), indicating high I/O efficiency. However, Rust demonstrated significantly lower initialization time (accumulated CPU time).
 
 ## 🛠 Installation
 
@@ -114,26 +90,55 @@ The server is configured via CLI arguments or environment variables.
 Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
 Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
 
-## 📝 JSON Log Format
-
-When `--log-file` is specified with `--log-format=json`, logs are written in structured JSON format:
-
-```json
-{"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v1.4.0 starting...","target":"ssh_mcp"}
-{"timestamp":"2024-01-24T10:15:23.458Z","level":"INFO","message":"Connecting to admin@prod-server:22","target":"ssh_mcp"}
-{"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 60000ms","target":"ssh_mcp::command"}
-```
-
-Use `jq` for pretty printing:
-```bash
-# Daily rotation writes to a date-suffixed filename
-tail -f "/var/log/ssh-mcp/app.log.$(date +%Y-%m-%d)" | jq
-
-# Or disable rotation for a stable filename
-# tail -f /var/log/ssh-mcp/app.log | jq
-```
-
 ## 🚀 Adding to MCP Clients
+
+### OpenCode
+
+Add this to your `opencode.jsonc`:
+
+**With SSH key (recommended for best transfer performance):**
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ssh-remote": {
+      "type": "local",
+      "command": [
+        "/absolute/path/to/ssh-mcp",
+        "--host=192.168.1.10",
+        "--port=22",
+        "--user=agent-nc",
+        "--key=/path/to/private/key",
+        "--timeout=30000",
+        "--maxChars=1000"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
+
+**With password (file transfer uses exec-raw transport):**
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ssh-remote": {
+      "type": "local",
+      "command": [
+        "/absolute/path/to/ssh-mcp",
+        "--host=192.168.1.10",
+        "--port=22",
+        "--user=agent-nc",
+        "--password=your-password",
+        "--timeout=30000",
+        "--maxChars=1000"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
 
 ### Claude Desktop
 
@@ -176,8 +181,6 @@ Add this to your `claude_desktop_config.json`:
   }
 }
 ```
-
-When using `--log-rotation=daily`, log files are suffixed with the date: `<log_file>.YYYY-MM-DD` (in the same directory as `--log-file`).
 
 ## 🛠 Tools
 
@@ -317,17 +320,29 @@ Example response:
 2. Get `{job_id, pid, log_path}` immediately
 3. Sleep 2-5s, then check status/output with `check-process` using `job_id`
 4. For long jobs, increase interval to 10-30s
-5. Confirm completion when `check-process` reports `running=false` and an `exit_code`
+   5. Confirm completion when `check-process` reports `running=false` and an `exit_code`
 
-## Migration from Remote Logs
+When using `--log-rotation=daily`, log files are suffixed with the date: `<log_file>.YYYY-MM-DD` (in the same directory as `--log-file`).
 
-Previous versions wrote background logs to the remote target host. Current versions write and serve logs locally on the MCP server.
+## 📝 JSON Log Format
 
-Changes:
-- `log_path` in responses is now a LOCAL path on the MCP server (`/tmp/ssh-mcp/<job_id>.log`)
-- `check-process` now requires `job_id` (no more `pid` + `remote_log_path`)
-- `remote_log_path` is a deprecated compatibility field and will be removed in a future version
+When `--log-file` is specified with `--log-format=json`, logs are written in structured JSON format:
 
+```json
+{"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v1.4.0 starting...","target":"ssh_mcp"}
+{"timestamp":"2024-01-24T10:15:23.458Z","level":"INFO","message":"Connecting to admin@prod-server:22","target":"ssh_mcp"}
+{"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 60000ms","target":"ssh_mcp::command"}
+```
+
+Use `jq` for pretty printing:
+```bash
+# Daily rotation writes to a date-suffixed filename
+tail -f "/var/log/ssh-mcp/app.log.$(date +%Y-%m-%d)" | jq
+
+# Or disable rotation for a stable filename
+# tail -f /var/log/ssh-mcp/app.log | jq
+```
+   
 ## 🔒 Security
 
 - **Stdio Transport**: Communicates using JSON-RPC over stdin/stdout, ensuring no exposed ports.

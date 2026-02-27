@@ -15,7 +15,7 @@ use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
@@ -34,9 +34,10 @@ use crate::error::{Result, SshMcpError};
 use crate::platform::O_NOFOLLOW_FLAG;
 use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{
-    CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
+    CommandOutput, SshConfig, SshConnectionManager, escape_for_shell, sanitize_command,
+    wrap_sudo_command,
 };
-use crate::tools::CheckProcessParams;
+use crate::tools::{ApplyFileEditParams, CheckProcessParams, ReadFileMode, ReadFileParams};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 use crate::validate::validate_basic_path_str;
 
@@ -45,6 +46,43 @@ mod exec;
 mod tools;
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
+const READ_FILE_ERROR_MARKER: &str = "__SSH_MCP_READ_FILE_ERR__";
+const APPLY_FILE_EDIT_ERROR_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_ERR__";
+const READ_FILE_BYTES_PER_TOKEN: usize = 4;
+const READ_FILE_HARD_MAX_BYTES: usize = 1024 * 1024;
+const READ_FILE_DEFAULT_PREVIEW_LINES: usize = 800;
+const READ_FILE_MAX_LINE_WINDOW: usize = 10_000;
+const READ_FILE_STDERR_SNIPPET_LIMIT_CHARS: usize = 256;
+const SHA256_HEX_LEN: usize = 64;
+const APPLY_FILE_EDIT_HARD_MAX_BYTES: usize = 1024 * 1024;
+const APPLY_FILE_EDIT_PREVIOUS_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_PREVIOUS_SHA__";
+const APPLY_FILE_EDIT_NEW_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_NEW_SHA__";
+const APPLY_FILE_EDIT_ACTUAL_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_ACTUAL_SHA__";
+const APPLY_FILE_EDIT_BASELINE_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_BASELINE_SHA__";
+const APPLY_FILE_EDIT_CONFLICT_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_CONFLICT__";
+const APPLY_FILE_EDIT_MISSING_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyFileEditFaultInjection {
+    None,
+    FailBeforeFinalize,
+    Sha256Unavailable,
+    PartialDeleteBeforeWrite,
+    PartialMutateBeforeWrite,
+}
+
+#[derive(Debug)]
+enum ApplyFileEditMode {
+    Full {
+        new_content: String,
+    },
+    Partial {
+        old_text: String,
+        new_text: String,
+        replace_all: bool,
+    },
+}
 
 const JOB_COMPLETED_RETENTION: Duration = Duration::from_secs(60 * 60);
 
@@ -108,6 +146,267 @@ fn validate_background_log_path(
     }
 
     Ok(())
+}
+
+fn validate_read_file_path(remote_path: &str) -> std::result::Result<(), String> {
+    validate_basic_path_str(remote_path, "remote_path")?;
+
+    if !remote_path.starts_with('/') {
+        return Err("remote_path must be an absolute path".to_string());
+    }
+
+    if remote_path.ends_with('/') {
+        return Err("remote_path must not end with '/'".to_string());
+    }
+
+    Ok(())
+}
+
+fn parse_read_file_error_marker(stderr: &str) -> Option<&str> {
+    stderr.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(READ_FILE_ERROR_MARKER)
+            .map(str::trim)
+    })
+}
+
+fn parse_apply_file_edit_error_marker(stderr: &str) -> Option<&str> {
+    parse_apply_file_edit_marker_value(stderr, APPLY_FILE_EDIT_ERROR_MARKER)
+}
+
+fn parse_apply_file_edit_marker_value<'a>(stderr: &'a str, prefix: &str) -> Option<&'a str> {
+    stderr.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn has_apply_file_edit_conflict_marker(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim() == APPLY_FILE_EDIT_CONFLICT_MARKER)
+}
+
+fn extract_text_from_call_tool_result(result: &CallToolResult) -> String {
+    let mut combined = String::new();
+
+    for item in &result.content {
+        if let Some(text) = item.raw.as_text() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&text.text);
+        }
+    }
+
+    combined
+}
+
+fn normalize_sha256_hex(value: &str, field: &str) -> std::result::Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() != SHA256_HEX_LEN {
+        return Err(format!(
+            "{field} must be a {SHA256_HEX_LEN}-character lowercase hex string"
+        ));
+    }
+    if !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{field} must be a {SHA256_HEX_LEN}-character lowercase hex string"
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn resolve_read_file_max_bytes(max_output_tokens: Option<usize>) -> usize {
+    max_output_tokens
+        .and_then(|tokens| tokens.checked_mul(READ_FILE_BYTES_PER_TOKEN))
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(READ_FILE_HARD_MAX_BYTES)
+        .min(READ_FILE_HARD_MAX_BYTES)
+}
+
+fn estimate_tokens_from_bytes(byte_len: usize) -> usize {
+    byte_len.saturating_add(READ_FILE_BYTES_PER_TOKEN.saturating_sub(1)) / READ_FILE_BYTES_PER_TOKEN
+}
+
+fn resolve_read_file_line_limit(
+    mode: ReadFileMode,
+    lines: Option<usize>,
+) -> std::result::Result<Option<usize>, String> {
+    match mode {
+        ReadFileMode::Full => Ok(None),
+        ReadFileMode::Preview | ReadFileMode::Head | ReadFileMode::Tail => {
+            let value = lines.unwrap_or(READ_FILE_DEFAULT_PREVIEW_LINES);
+            if value == 0 {
+                return Err("lines must be a positive integer".to_string());
+            }
+            if value > READ_FILE_MAX_LINE_WINDOW {
+                return Err(format!("lines must be <= {READ_FILE_MAX_LINE_WINDOW}"));
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+fn read_file_line_starts(content: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    if content.is_empty() {
+        return starts;
+    }
+
+    starts.push(0);
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            let next = idx.saturating_add(1);
+            if next < content.len() {
+                starts.push(next);
+            }
+        }
+    }
+
+    starts
+}
+
+fn read_file_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+
+    let newline_count = content.bytes().filter(|byte| *byte == b'\n').count();
+    if content.ends_with('\n') {
+        newline_count
+    } else {
+        newline_count.saturating_add(1)
+    }
+}
+
+fn build_read_file_hint(mode: ReadFileMode, line_limit: usize, truncated: bool) -> Option<String> {
+    match mode {
+        ReadFileMode::Preview => Some(format!(
+            "Preview mode returns up to {line_limit} lines. Re-run with mode=\"full\" to read the entire file, or mode=\"tail\" to inspect the file end"
+        )),
+        ReadFileMode::Head | ReadFileMode::Tail if truncated => Some(format!(
+            "Output truncated to {line_limit} lines in {} mode. Re-run with mode=\"full\" to read the entire file",
+            mode.as_str()
+        )),
+        _ => None,
+    }
+}
+
+struct ReadFileWindow {
+    content: String,
+    returned_lines: usize,
+    truncated: bool,
+    hint: Option<String>,
+}
+
+fn apply_read_file_window(
+    content: &str,
+    mode: ReadFileMode,
+    line_limit: Option<usize>,
+) -> ReadFileWindow {
+    if matches!(mode, ReadFileMode::Full) {
+        return ReadFileWindow {
+            content: content.to_string(),
+            returned_lines: read_file_line_count(content),
+            truncated: false,
+            hint: None,
+        };
+    }
+
+    let limit = line_limit.unwrap_or(READ_FILE_DEFAULT_PREVIEW_LINES);
+    let line_starts = read_file_line_starts(content);
+    let total_lines = line_starts.len();
+    let returned_lines = total_lines.min(limit);
+    let truncated = total_lines > returned_lines;
+
+    let content_slice = if matches!(mode, ReadFileMode::Tail) {
+        let start = if returned_lines >= total_lines {
+            0
+        } else {
+            line_starts[total_lines - returned_lines]
+        };
+        content[start..].to_string()
+    } else {
+        let end = if returned_lines >= total_lines {
+            content.len()
+        } else {
+            line_starts[returned_lines]
+        };
+        content[..end].to_string()
+    };
+
+    ReadFileWindow {
+        content: content_slice,
+        returned_lines,
+        truncated,
+        hint: build_read_file_hint(mode, limit, truncated),
+    }
+}
+
+fn read_file_too_large_error(max_bytes: usize) -> String {
+    format!(
+        "Error: remote file exceeds read-file size limit ({max_bytes} bytes). Use transfer for large files"
+    )
+}
+
+fn apply_file_edit_too_large_error(max_bytes: usize) -> String {
+    format!(
+        "Error: new_content exceeds apply-file-edit size limit ({max_bytes} bytes). Use transfer for large files"
+    )
+}
+
+fn sanitize_read_file_stderr_snippet(stderr: &str) -> Option<String> {
+    let mut snippet = String::new();
+    let mut truncated = false;
+    let mut prev_space = false;
+    let mut char_count = 0usize;
+
+    for ch in stderr.trim().chars() {
+        if char_count >= READ_FILE_STDERR_SNIPPET_LIMIT_CHARS {
+            truncated = true;
+            break;
+        }
+
+        let normalized = if ch.is_control() { ' ' } else { ch };
+        if normalized.is_whitespace() {
+            if !prev_space {
+                snippet.push(' ');
+                prev_space = true;
+                char_count = char_count.saturating_add(1);
+            }
+        } else {
+            snippet.push(normalized);
+            prev_space = false;
+            char_count = char_count.saturating_add(1);
+        }
+    }
+
+    let mut normalized = snippet.trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    if truncated {
+        normalized.push_str("...");
+    }
+
+    Some(normalized)
+}
+
+fn build_read_file_remote_failure(exit_code: Option<u32>, stderr: &str) -> String {
+    let mut message = match exit_code {
+        Some(code) => format!("Error reading file: remote command failed with exit_code={code}"),
+        None => "Error reading file: remote command did not provide an exit status".to_string(),
+    };
+
+    if let Some(snippet) = sanitize_read_file_stderr_snippet(stderr) {
+        message.push_str(&format!("; stderr={snippet}"));
+    }
+
+    message
 }
 
 /// SSH MCP Server
@@ -737,6 +1036,806 @@ impl SshMcpServer {
         }
     }
 
+    async fn execute_read_file(
+        &self,
+        params: ReadFileParams,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let ReadFileParams {
+            remote_path,
+            mode,
+            lines,
+            timeout_ms,
+        } = params;
+
+        debug!(
+            remote_path = ?remote_path,
+            mode = mode.as_str(),
+            lines = ?lines,
+            "read-file tool called"
+        );
+
+        validate_read_file_path(&remote_path).map_err(|msg| McpError::invalid_params(msg, None))?;
+
+        let line_limit = resolve_read_file_line_limit(mode, lines)
+            .map_err(|msg| McpError::invalid_params(msg, None))?;
+
+        let timeout = match timeout_ms {
+            Some(0) => {
+                return Err(McpError::invalid_params(
+                    "timeout_ms must be a positive integer",
+                    None,
+                ));
+            }
+            Some(ms) => Duration::from_millis(ms),
+            None => self.timeout,
+        };
+        let max_read_bytes = resolve_read_file_max_bytes(self.config.max_output_tokens);
+
+        if let Err(e) = self.connection.ensure_connected().await {
+            error!(error = ?e, "Failed to ensure SSH connection");
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "SSH connection error: {}",
+                e
+            ))]));
+        }
+
+        let capture_path = self
+            .spooler
+            .base_dir()
+            .join(format!("read-file-{}.tmp", make_job_id()));
+
+        let mut capture_opts = tokio::fs::OpenOptions::new();
+        capture_opts.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            capture_opts.custom_flags(O_NOFOLLOW_FLAG);
+        }
+
+        let mut capture_file = match capture_opts.open(&capture_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to create local read capture file: {e}"
+                ))]));
+            }
+        };
+
+        let escaped_path = escape_for_shell(&remote_path);
+        let read_cmd = format!(
+            r#"sh -c 'set -eu; p=$1; max_bytes=$2; if [ ! -e "$p" ]; then printf "%s\n" "{READ_FILE_ERROR_MARKER}not_found" >&2; exit 1; fi; if [ ! -f "$p" ]; then printf "%s\n" "{READ_FILE_ERROR_MARKER}not_regular_file" >&2; exit 1; fi; head -c "$((max_bytes + 1))" < "$p"' sh '{escaped_path}' '{max_read_bytes}'"#
+        );
+
+        let mut empty_stdin = tokio::io::empty();
+        let exec_result = self
+            .connection
+            .exec_raw_streaming(
+                &read_cmd,
+                Some(&mut empty_stdin),
+                Some(&mut capture_file),
+                timeout,
+            )
+            .await;
+
+        if let Err(e) = capture_file.flush().await {
+            let _ = tokio::fs::remove_file(&capture_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: failed to flush local read capture file: {e}"
+            ))]));
+        }
+        if let Err(e) = capture_file.sync_all().await {
+            let _ = tokio::fs::remove_file(&capture_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: failed to sync local read capture file: {e}"
+            ))]));
+        }
+        drop(capture_file);
+
+        let exec_out = match exec_result {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&capture_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error reading file: {e}"
+                ))]));
+            }
+        };
+
+        if let Some(marker) = parse_read_file_error_marker(&exec_out.stderr) {
+            let msg = match marker {
+                "not_found" => "Error: remote_path does not exist".to_string(),
+                "not_regular_file" => "Error: remote_path is not a regular file".to_string(),
+                _ => "Error: read-file failed on remote host".to_string(),
+            };
+            let _ = tokio::fs::remove_file(&capture_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(msg)]));
+        }
+
+        match exec_out.exit_code {
+            Some(0) => {}
+            Some(code) => {
+                let _ = tokio::fs::remove_file(&capture_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(
+                    build_read_file_remote_failure(Some(code), &exec_out.stderr),
+                )]));
+            }
+            None => {
+                if !exec_out.stderr.trim().is_empty() {
+                    let _ = tokio::fs::remove_file(&capture_path).await;
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        build_read_file_remote_failure(None, &exec_out.stderr),
+                    )]));
+                }
+            }
+        }
+
+        let metadata = match tokio::fs::metadata(&capture_path).await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&capture_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to inspect local capture file: {e}"
+                ))]));
+            }
+        };
+
+        if metadata.len() > max_read_bytes as u64 {
+            let _ = tokio::fs::remove_file(&capture_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(
+                read_file_too_large_error(max_read_bytes),
+            )]));
+        }
+
+        let mut capture_reader = match tokio::fs::File::open(&capture_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&capture_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to open local capture file: {e}"
+                ))]));
+            }
+        };
+
+        let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_read_bytes));
+        let mut chunk = vec![0u8; 8192];
+        loop {
+            let read = match capture_reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&capture_path).await;
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: failed to read local capture file: {e}"
+                    ))]));
+                }
+            };
+
+            if bytes.len().saturating_add(read) > max_read_bytes {
+                let _ = tokio::fs::remove_file(&capture_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(
+                    read_file_too_large_error(max_read_bytes),
+                )]));
+            }
+
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+
+        let content = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&capture_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: file is not valid UTF-8 text ({})",
+                    e.utf8_error()
+                ))]));
+            }
+        };
+        let _ = tokio::fs::remove_file(&capture_path).await;
+
+        let content_window = apply_read_file_window(&content, mode, line_limit);
+        let returned_content = content_window.content;
+        let approx_tokens_returned = estimate_tokens_from_bytes(returned_content.len());
+        let approx_tokens_total_estimate = estimate_tokens_from_bytes(metadata.len() as usize);
+        let mut result = serde_json::json!({
+            "path": remote_path,
+            "mode": mode.as_str(),
+            "content": returned_content,
+            "returned_lines": content_window.returned_lines,
+            "truncated": content_window.truncated,
+            "approx_tokens_returned": approx_tokens_returned,
+            "approx_tokens_total_estimate": approx_tokens_total_estimate,
+        });
+        if let Some(hint) = content_window.hint {
+            result["hint"] = serde_json::Value::String(hint);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            result.to_string(),
+        )]))
+    }
+
+    async fn execute_apply_file_edit(
+        &self,
+        params: ApplyFileEditParams,
+        fault_injection: ApplyFileEditFaultInjection,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        debug!(remote_path = ?params.remote_path, "apply-file-edit tool called");
+
+        let ApplyFileEditParams {
+            remote_path,
+            new_content,
+            old_text,
+            new_text,
+            replace_all,
+            expected_sha256,
+            timeout_ms,
+        } = params;
+
+        validate_read_file_path(&remote_path).map_err(|msg| McpError::invalid_params(msg, None))?;
+
+        let user_expected_sha256 = match expected_sha256.as_deref() {
+            Some(value) => Some(
+                normalize_sha256_hex(value, "expected_sha256")
+                    .map_err(|msg| McpError::invalid_params(msg, None))?,
+            ),
+            None => None,
+        };
+
+        let timeout = match timeout_ms {
+            Some(0) => {
+                return Err(McpError::invalid_params(
+                    "timeout_ms must be a positive integer",
+                    None,
+                ));
+            }
+            Some(ms) => Duration::from_millis(ms),
+            None => self.timeout,
+        };
+        let mode_error = "apply-file-edit requires exactly one mode: provide new_content for full mode, or provide old_text and new_text for partial mode (replace_all is only valid in partial mode)";
+
+        let edit_mode = match (new_content, old_text, new_text, replace_all) {
+            (Some(new_content), None, None, None) => ApplyFileEditMode::Full { new_content },
+            (None, Some(old_text), Some(new_text), replace_all) => ApplyFileEditMode::Partial {
+                old_text,
+                new_text,
+                replace_all: replace_all.unwrap_or(false),
+            },
+            _ => return Err(McpError::invalid_params(mode_error, None)),
+        };
+
+        let (next_content, partial_baseline_sha256) = match edit_mode {
+            ApplyFileEditMode::Full { new_content } => (new_content, None),
+            ApplyFileEditMode::Partial {
+                old_text,
+                new_text,
+                replace_all,
+            } => {
+                if old_text.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "old_text must not be empty in partial mode",
+                        None,
+                    ));
+                }
+
+                let read_result = self
+                    .execute_read_file(ReadFileParams {
+                        remote_path: remote_path.clone(),
+                        mode: ReadFileMode::Full,
+                        lines: None,
+                        timeout_ms,
+                    })
+                    .await?;
+
+                if read_result.is_error.unwrap_or(false) {
+                    return Ok(read_result);
+                }
+
+                let read_text = extract_text_from_call_tool_result(&read_result);
+                let read_value: serde_json::Value = serde_json::from_str(read_text.trim()).map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "failed to parse read-file response while preparing partial apply-file-edit: {e}"
+                        ),
+                        None,
+                    )
+                })?;
+
+                let current_content = read_value
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        McpError::internal_error(
+                            "read-file response missing content while preparing partial apply-file-edit"
+                                .to_string(),
+                            None,
+                        )
+                    })?;
+
+                let match_count = current_content.matches(old_text.as_str()).count();
+                if match_count == 0 {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Error: old_text was not found in remote file".to_string(),
+                    )]));
+                }
+
+                if !replace_all && match_count != 1 {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: old_text matched {match_count} times; set replace_all=true to replace all matches"
+                    ))]));
+                }
+
+                let partial_baseline_sha256 = if user_expected_sha256.is_none() {
+                    let baseline = match self
+                        .compute_partial_baseline_sha256(current_content, timeout)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(result) => return Ok(result),
+                    };
+                    Some(baseline)
+                } else {
+                    None
+                };
+
+                if let Err(result) = self
+                    .apply_partial_fault_injection(remote_path.as_str(), timeout, fault_injection)
+                    .await
+                {
+                    return Ok(result);
+                }
+
+                let updated_content = if replace_all {
+                    current_content.replace(old_text.as_str(), new_text.as_str())
+                } else {
+                    current_content.replacen(old_text.as_str(), new_text.as_str(), 1)
+                };
+
+                (updated_content, partial_baseline_sha256)
+            }
+        };
+
+        let expected_sha256 = user_expected_sha256.or(partial_baseline_sha256);
+
+        self.execute_apply_file_edit_write_transaction(
+            remote_path.as_str(),
+            next_content.as_str(),
+            expected_sha256,
+            timeout,
+            fault_injection,
+        )
+        .await
+    }
+
+    async fn compute_partial_baseline_sha256(
+        &self,
+        content: &str,
+        timeout: Duration,
+    ) -> std::result::Result<String, CallToolResult> {
+        let hash_cmd = format!(
+            r#"sh -c 'set -eu; sha256_stdin() {{ if command -v sha256sum >/dev/null 2>&1; then set -- $(sha256sum); printf "%s\n" "$1"; return 0; fi; if command -v shasum >/dev/null 2>&1; then set -- $(shasum -a 256); printf "%s\n" "$1"; return 0; fi; return 1; }}; if ! baseline_hash=$(sha256_stdin); then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; printf "%s%s\n" "{APPLY_FILE_EDIT_BASELINE_SHA_MARKER}" "$baseline_hash" >&2'"#
+        );
+
+        let mut input = std::io::Cursor::new(content.as_bytes());
+        let mut sink = tokio::io::sink();
+        let out = match self
+            .connection
+            .exec_raw_streaming(&hash_cmd, Some(&mut input), Some(&mut sink), timeout)
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to hash partial baseline content on remote host: {e}"
+                ))]));
+            }
+        };
+
+        if let Some(marker) = parse_apply_file_edit_error_marker(&out.stderr)
+            && marker == "sha256_unavailable"
+        {
+            return Err(CallToolResult::error(vec![Content::text(
+                "Error: remote host does not provide SHA-256 utilities".to_string(),
+            )]));
+        }
+
+        match out.exit_code {
+            Some(0) => {}
+            Some(code) => {
+                let mut msg = format!(
+                    "Error: failed to hash partial baseline content: remote command failed with exit_code={code}"
+                );
+                if let Some(snippet) = sanitize_read_file_stderr_snippet(&out.stderr) {
+                    msg.push_str(&format!("; stderr={snippet}"));
+                }
+                return Err(CallToolResult::error(vec![Content::text(msg)]));
+            }
+            None => {
+                if !out.stderr.trim().is_empty() {
+                    let mut msg = "Error: failed to hash partial baseline content: remote command did not provide an exit status".to_string();
+                    if let Some(snippet) = sanitize_read_file_stderr_snippet(&out.stderr) {
+                        msg.push_str(&format!("; stderr={snippet}"));
+                    }
+                    return Err(CallToolResult::error(vec![Content::text(msg)]));
+                }
+            }
+        }
+
+        let baseline_raw = match parse_apply_file_edit_marker_value(
+            &out.stderr,
+            APPLY_FILE_EDIT_BASELINE_SHA_MARKER,
+        ) {
+            Some(value) => value,
+            None => {
+                return Err(CallToolResult::error(vec![Content::text(
+                    "Error: missing partial baseline SHA-256 marker".to_string(),
+                )]));
+            }
+        };
+
+        match normalize_sha256_hex(baseline_raw, "partial_baseline_sha256") {
+            Ok(value) => Ok(value),
+            Err(_) => Err(CallToolResult::error(vec![Content::text(
+                "Error: failed to parse remote SHA-256 output".to_string(),
+            )])),
+        }
+    }
+
+    async fn apply_partial_fault_injection(
+        &self,
+        remote_path: &str,
+        timeout: Duration,
+        fault_injection: ApplyFileEditFaultInjection,
+    ) -> std::result::Result<(), CallToolResult> {
+        let injected_cmd = match fault_injection {
+            ApplyFileEditFaultInjection::PartialDeleteBeforeWrite => {
+                let escaped = escape_for_shell(remote_path);
+                Some(format!("sh -c 'set -eu; rm -f -- \"$1\"' sh '{escaped}'"))
+            }
+            ApplyFileEditFaultInjection::PartialMutateBeforeWrite => {
+                let escaped = escape_for_shell(remote_path);
+                Some(format!(
+                    "sh -c 'set -eu; [ -f \"$1\" ]; printf \"__ssh_mcp_race_injected__\\n\" > \"$1\"' sh '{escaped}'"
+                ))
+            }
+            _ => None,
+        };
+
+        let Some(injected_cmd) = injected_cmd else {
+            return Ok(());
+        };
+
+        let mut empty_input = tokio::io::empty();
+        let mut sink = tokio::io::sink();
+        let out = match self
+            .connection
+            .exec_raw_streaming(
+                &injected_cmd,
+                Some(&mut empty_input),
+                Some(&mut sink),
+                timeout,
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to run partial race fault injection: {e}"
+                ))]));
+            }
+        };
+
+        match out.exit_code {
+            Some(0) => Ok(()),
+            Some(code) => Err(CallToolResult::error(vec![Content::text(format!(
+                "Error: partial race fault injection failed with exit_code={code}"
+            ))])),
+            None => Err(CallToolResult::error(vec![Content::text(
+                "Error: partial race fault injection did not report exit status".to_string(),
+            )])),
+        }
+    }
+
+    async fn execute_apply_file_edit_write_transaction(
+        &self,
+        remote_path: &str,
+        new_content: &str,
+        expected_sha256: Option<String>,
+        timeout: Duration,
+        fault_injection: ApplyFileEditFaultInjection,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let bytes_written = new_content.len();
+        if bytes_written > APPLY_FILE_EDIT_HARD_MAX_BYTES {
+            return Ok(CallToolResult::error(vec![Content::text(
+                apply_file_edit_too_large_error(APPLY_FILE_EDIT_HARD_MAX_BYTES),
+            )]));
+        }
+
+        if let Err(e) = self.connection.ensure_connected().await {
+            error!(error = ?e, "Failed to ensure SSH connection");
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "SSH connection error: {}",
+                e
+            ))]));
+        }
+
+        let local_tmp_rel = format!("target/tmp/apply-file-edit-{}.tmp", make_job_id());
+        let local_tmp_path = self.transfer.local_root().join(&local_tmp_rel);
+
+        if let Some(parent) = local_tmp_path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: failed to create local staging directory: {e}"
+            ))]));
+        }
+
+        let mut local_tmp_opts = tokio::fs::OpenOptions::new();
+        local_tmp_opts.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            local_tmp_opts.custom_flags(O_NOFOLLOW_FLAG);
+        }
+
+        let mut local_tmp_file = match local_tmp_opts.open(&local_tmp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to create local staging file: {e}"
+                ))]));
+            }
+        };
+
+        if let Err(e) = local_tmp_file.write_all(new_content.as_bytes()).await {
+            let _ = tokio::fs::remove_file(&local_tmp_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: failed to write local staging file: {e}"
+            ))]));
+        }
+        if let Err(e) = local_tmp_file.flush().await {
+            let _ = tokio::fs::remove_file(&local_tmp_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: failed to flush local staging file: {e}"
+            ))]));
+        }
+        if let Err(e) = local_tmp_file.sync_all().await {
+            let _ = tokio::fs::remove_file(&local_tmp_path).await;
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: failed to sync local staging file: {e}"
+            ))]));
+        }
+        drop(local_tmp_file);
+
+        let remote_lock_dir = format!("{}.ssh-mcp-lock", remote_path);
+        let remote_stage_path = format!("{}.ssh-mcp-stage-{}", remote_path, make_job_id());
+        let expected_for_remote = expected_sha256.clone().unwrap_or_else(|| "-".to_string());
+        let missing_sha_for_remote = APPLY_FILE_EDIT_MISSING_SHA256;
+
+        let dst_escaped = escape_for_shell(remote_path);
+        let expected_escaped = escape_for_shell(&expected_for_remote);
+        let missing_sha_escaped = escape_for_shell(missing_sha_for_remote);
+        let lock_escaped = escape_for_shell(&remote_lock_dir);
+        let stage_escaped = escape_for_shell(&remote_stage_path);
+        let force_fail_before_finalize =
+            if fault_injection == ApplyFileEditFaultInjection::FailBeforeFinalize {
+                "1"
+            } else {
+                "0"
+            };
+        let force_sha256_unavailable =
+            if fault_injection == ApplyFileEditFaultInjection::Sha256Unavailable {
+                "1"
+            } else {
+                "0"
+            };
+        let force_fail_before_finalize_escaped = escape_for_shell(force_fail_before_finalize);
+        let force_sha256_unavailable_escaped = escape_for_shell(force_sha256_unavailable);
+
+        let apply_cmd = format!(
+            r#"sh -c 'set -eu; dst=$1; expected=$2; lock_dir=$3; stage=$4; fail_before_finalize=$5; missing_sha=$6; force_sha_unavailable=$7; \
+             drain_stdin() {{ cat > /dev/null || true; }}; \
+             sha256_file() {{ file=$1; if command -v sha256sum >/dev/null 2>&1; then set -- $(sha256sum -- "$file"); printf "%s\n" "$1"; return 0; fi; if command -v shasum >/dev/null 2>&1; then set -- $(shasum -a 256 -- "$file"); printf "%s\n" "$1"; return 0; fi; return 1; }}; \
+             parent=${{dst%/*}}; if [ -z "$parent" ]; then parent=/; fi; if [ ! -d "$parent" ]; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}parent_not_found" >&2; drain_stdin; exit 1; fi; \
+             lock_spins=0; while ! mkdir -- "$lock_dir" 2>/dev/null; do if [ -d "$lock_dir" ]; then lock_spins=$((lock_spins + 1)); if [ "$lock_spins" -ge 20 ]; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}lock_busy" >&2; drain_stdin; exit 1; fi; sleep 1; continue; fi; printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}lock_acquire_failed" >&2; drain_stdin; exit 1; done; \
+             cleanup() {{ rm -f -- "$stage" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null || true; }}; \
+             trap cleanup EXIT INT TERM; \
+             if [ "$force_sha_unavailable" = "1" ]; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; \
+             if ! sha256_file /dev/null >/dev/null 2>&1; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; \
+             if [ -e "$dst" ]; then if [ ! -f "$dst" ]; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}not_regular_file" >&2; drain_stdin; exit 1; fi; if ! current_hash=$(sha256_file "$dst"); then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; else if [ "$expected" != "-" ]; then printf "%s%s\n" "{APPLY_FILE_EDIT_ACTUAL_SHA_MARKER}" "$missing_sha" >&2; printf "%s\n" "{APPLY_FILE_EDIT_CONFLICT_MARKER}" >&2; drain_stdin; exit 3; fi; current_hash=$missing_sha; fi; \
+             printf "%s%s\n" "{APPLY_FILE_EDIT_PREVIOUS_SHA_MARKER}" "$current_hash" >&2; \
+             if [ "$expected" != "-" ] && [ "$expected" != "$current_hash" ]; then printf "%s%s\n" "{APPLY_FILE_EDIT_ACTUAL_SHA_MARKER}" "$current_hash" >&2; printf "%s\n" "{APPLY_FILE_EDIT_CONFLICT_MARKER}" >&2; drain_stdin; exit 3; fi; \
+             if ! : > "$stage" 2>/dev/null; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}staging_unwritable" >&2; drain_stdin; exit 1; fi; \
+             if ! cat > "$stage"; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}stage_write_failed" >&2; exit 1; fi; \
+             if [ "$fail_before_finalize" = "1" ]; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; \
+             if ! mv -- "$stage" "$dst"; then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; \
+             if ! new_hash=$(sha256_file "$dst"); then printf "%s\n" "{APPLY_FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; \
+             printf "%s%s\n" "{APPLY_FILE_EDIT_NEW_SHA_MARKER}" "$new_hash" >&2; \
+             trap - EXIT INT TERM; cleanup' sh '{dst_escaped}' '{expected_escaped}' '{lock_escaped}' '{stage_escaped}' '{force_fail_before_finalize_escaped}' '{missing_sha_escaped}' '{force_sha256_unavailable_escaped}'"#
+        );
+
+        let mut local_tmp_input = match tokio::fs::File::open(&local_tmp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&local_tmp_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to open local staging file for upload: {e}"
+                ))]));
+            }
+        };
+        let mut sink = tokio::io::sink();
+        let out = match self
+            .connection
+            .exec_raw_streaming(
+                &apply_cmd,
+                Some(&mut local_tmp_input),
+                Some(&mut sink),
+                timeout,
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&local_tmp_path).await;
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error applying file edit: {e}"
+                ))]));
+            }
+        };
+
+        let _ = tokio::fs::remove_file(&local_tmp_path).await;
+
+        if has_apply_file_edit_conflict_marker(&out.stderr) {
+            let expected = match expected_sha256 {
+                Some(value) => value,
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Error: apply-file-edit conflict marker was returned without expected_sha256"
+                            .to_string(),
+                    )]));
+                }
+            };
+
+            let actual_raw =
+                parse_apply_file_edit_marker_value(&out.stderr, APPLY_FILE_EDIT_ACTUAL_SHA_MARKER)
+                    .or_else(|| {
+                        parse_apply_file_edit_marker_value(
+                            &out.stderr,
+                            APPLY_FILE_EDIT_PREVIOUS_SHA_MARKER,
+                        )
+                    });
+            let actual_sha256 = match actual_raw {
+                Some(value) => match normalize_sha256_hex(value, "actual_sha256") {
+                    Ok(normalized) => normalized,
+                    Err(_) => {
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            "Error: failed to parse remote SHA-256 output".to_string(),
+                        )]));
+                    }
+                },
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Error: apply-file-edit conflict response missing actual_sha256"
+                            .to_string(),
+                    )]));
+                }
+            };
+
+            let conflict = serde_json::json!({
+                "error": "conflict",
+                "path": remote_path,
+                "expected_sha256": expected,
+                "actual_sha256": actual_sha256,
+            });
+            return Ok(CallToolResult::error(vec![Content::text(
+                conflict.to_string(),
+            )]));
+        }
+
+        if let Some(marker) = parse_apply_file_edit_error_marker(&out.stderr) {
+            let msg = match marker {
+                "not_found" => "Error: remote_path does not exist".to_string(),
+                "parent_not_found" => "Error: remote parent directory does not exist".to_string(),
+                "not_regular_file" => "Error: remote_path is not a regular file".to_string(),
+                "sha256_unavailable" => {
+                    "Error: remote host does not provide SHA-256 utilities".to_string()
+                }
+                "lock_busy" => {
+                    "Error: remote_path is being edited by another operation; retry shortly"
+                        .to_string()
+                }
+                "lock_acquire_failed" => {
+                    "Error: failed to acquire remote apply-file-edit lock due to filesystem error"
+                        .to_string()
+                }
+                "staging_unwritable" => {
+                    "Error: failed to create remote staging file in destination directory"
+                        .to_string()
+                }
+                "stage_write_failed" => "Error: failed to write remote staging file".to_string(),
+                "finalize_failed" => "Error: failed to atomically replace remote file".to_string(),
+                _ => "Error: apply-file-edit failed on remote host".to_string(),
+            };
+            return Ok(CallToolResult::error(vec![Content::text(msg)]));
+        }
+
+        match out.exit_code {
+            Some(0) => {}
+            Some(code) => {
+                let mut msg = format!(
+                    "Error applying file edit: remote command failed with exit_code={code}"
+                );
+                if let Some(snippet) = sanitize_read_file_stderr_snippet(&out.stderr) {
+                    msg.push_str(&format!("; stderr={snippet}"));
+                }
+                return Ok(CallToolResult::error(vec![Content::text(msg)]));
+            }
+            None => {
+                if !out.stderr.trim().is_empty() {
+                    let mut msg =
+                        "Error applying file edit: remote command did not provide an exit status"
+                            .to_string();
+                    if let Some(snippet) = sanitize_read_file_stderr_snippet(&out.stderr) {
+                        msg.push_str(&format!("; stderr={snippet}"));
+                    }
+                    return Ok(CallToolResult::error(vec![Content::text(msg)]));
+                }
+            }
+        }
+
+        let previous_sha_raw = match parse_apply_file_edit_marker_value(
+            &out.stderr,
+            APPLY_FILE_EDIT_PREVIOUS_SHA_MARKER,
+        ) {
+            Some(value) => value,
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Error: missing previous_sha256 marker from apply-file-edit response"
+                        .to_string(),
+                )]));
+            }
+        };
+        let previous_sha256 = match normalize_sha256_hex(previous_sha_raw, "previous_sha256") {
+            Ok(normalized) => normalized,
+            Err(_) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Error: failed to parse remote SHA-256 output".to_string(),
+                )]));
+            }
+        };
+
+        let new_sha_raw =
+            match parse_apply_file_edit_marker_value(&out.stderr, APPLY_FILE_EDIT_NEW_SHA_MARKER) {
+                Some(value) => value,
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Error: missing new_sha256 marker from apply-file-edit response"
+                            .to_string(),
+                    )]));
+                }
+            };
+        let new_sha256 = match normalize_sha256_hex(new_sha_raw, "new_sha256") {
+            Ok(normalized) => normalized,
+            Err(_) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Error: failed to parse remote SHA-256 output".to_string(),
+                )]));
+            }
+        };
+
+        let changed = previous_sha256 != new_sha256;
+        let result = serde_json::json!({
+            "path": remote_path,
+            "previous_sha256": previous_sha256,
+            "new_sha256": new_sha256,
+            "bytes_written": bytes_written,
+            "changed": changed,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            result.to_string(),
+        )]))
+    }
+
     async fn execute_background_sudo_command(
         &self,
         command: &str,
@@ -798,6 +1897,16 @@ impl SshMcpServer {
         tools::check_process_tool()
     }
 
+    /// Build read-file tool definition
+    fn read_file_tool() -> Tool {
+        tools::read_file_tool()
+    }
+
+    /// Build apply-file-edit tool definition
+    fn apply_file_edit_tool() -> Tool {
+        tools::apply_file_edit_tool()
+    }
+
     /// Get extended documentation for a tool by name
     ///
     /// Returns the full documentation text that was removed from compact tool definitions
@@ -849,6 +1958,195 @@ impl SshMcpServer {
             tail_lines,
         };
         self.execute_check_process(params).await
+    }
+
+    /// Internal method exposed for testing - reads a remote UTF-8 file
+    #[doc(hidden)]
+    pub async fn test_read_file(
+        &self,
+        remote_path: &str,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.test_read_file_with_options(remote_path, ReadFileMode::Preview, None, timeout_ms)
+            .await
+    }
+
+    /// Internal method exposed for testing - reads a remote UTF-8 file with mode controls
+    #[doc(hidden)]
+    pub async fn test_read_file_with_options(
+        &self,
+        remote_path: &str,
+        mode: ReadFileMode,
+        lines: Option<usize>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_read_file(ReadFileParams {
+            remote_path: remote_path.to_string(),
+            mode,
+            lines,
+            timeout_ms,
+        })
+        .await
+    }
+
+    /// Internal method exposed for testing - applies an atomic edit to a remote UTF-8 file
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit(
+        &self,
+        remote_path: &str,
+        new_content: &str,
+        expected_sha256: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(
+            ApplyFileEditParams {
+                remote_path: remote_path.to_string(),
+                new_content: Some(new_content.to_string()),
+                old_text: None,
+                new_text: None,
+                replace_all: None,
+                expected_sha256: expected_sha256.map(str::to_string),
+                timeout_ms,
+            },
+            ApplyFileEditFaultInjection::None,
+        )
+        .await
+    }
+
+    /// Internal method exposed for testing - applies a partial text replacement edit
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit_partial(
+        &self,
+        remote_path: &str,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+        expected_sha256: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(
+            ApplyFileEditParams {
+                remote_path: remote_path.to_string(),
+                new_content: None,
+                old_text: Some(old_text.to_string()),
+                new_text: Some(new_text.to_string()),
+                replace_all: Some(replace_all),
+                expected_sha256: expected_sha256.map(str::to_string),
+                timeout_ms,
+            },
+            ApplyFileEditFaultInjection::None,
+        )
+        .await
+    }
+
+    /// Internal method exposed for testing - runs apply-file-edit with raw params
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit_with_params(
+        &self,
+        params: ApplyFileEditParams,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(params, ApplyFileEditFaultInjection::None)
+            .await
+    }
+
+    /// Internal method exposed for testing - deletes destination after partial read and before write
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit_partial_delete_before_write(
+        &self,
+        remote_path: &str,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+        expected_sha256: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(
+            ApplyFileEditParams {
+                remote_path: remote_path.to_string(),
+                new_content: None,
+                old_text: Some(old_text.to_string()),
+                new_text: Some(new_text.to_string()),
+                replace_all: Some(replace_all),
+                expected_sha256: expected_sha256.map(str::to_string),
+                timeout_ms,
+            },
+            ApplyFileEditFaultInjection::PartialDeleteBeforeWrite,
+        )
+        .await
+    }
+
+    /// Internal method exposed for testing - mutates destination after partial read and before write
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit_partial_mutate_before_write(
+        &self,
+        remote_path: &str,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+        expected_sha256: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(
+            ApplyFileEditParams {
+                remote_path: remote_path.to_string(),
+                new_content: None,
+                old_text: Some(old_text.to_string()),
+                new_text: Some(new_text.to_string()),
+                replace_all: Some(replace_all),
+                expected_sha256: expected_sha256.map(str::to_string),
+                timeout_ms,
+            },
+            ApplyFileEditFaultInjection::PartialMutateBeforeWrite,
+        )
+        .await
+    }
+
+    /// Internal method exposed for testing - injects a failure after stage write and before rename
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit_fail_before_finalize(
+        &self,
+        remote_path: &str,
+        new_content: &str,
+        expected_sha256: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(
+            ApplyFileEditParams {
+                remote_path: remote_path.to_string(),
+                new_content: Some(new_content.to_string()),
+                old_text: None,
+                new_text: None,
+                replace_all: None,
+                expected_sha256: expected_sha256.map(str::to_string),
+                timeout_ms,
+            },
+            ApplyFileEditFaultInjection::FailBeforeFinalize,
+        )
+        .await
+    }
+
+    /// Internal method exposed for testing - injects a SHA-256 preflight failure before mutation
+    #[doc(hidden)]
+    pub async fn test_apply_file_edit_sha256_unavailable(
+        &self,
+        remote_path: &str,
+        new_content: &str,
+        expected_sha256: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_apply_file_edit(
+            ApplyFileEditParams {
+                remote_path: remote_path.to_string(),
+                new_content: Some(new_content.to_string()),
+                old_text: None,
+                new_text: None,
+                replace_all: None,
+                expected_sha256: expected_sha256.map(str::to_string),
+                timeout_ms,
+            },
+            ApplyFileEditFaultInjection::Sha256Unavailable,
+        )
+        .await
     }
 
     /// Internal method exposed for testing - starts an exec command in background=true mode
@@ -925,12 +2223,14 @@ impl ServerHandler for SshMcpServer {
 
         let mut tools = vec![Self::exec_tool()];
 
-        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer.
+        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer, read-file, apply-file-edit.
         if !self.config.disable_sudo {
             tools.push(Self::sudo_exec_tool());
         }
         tools.push(Self::check_process_tool());
         tools.push(Self::transfer_tool());
+        tools.push(Self::read_file_tool());
+        tools.push(Self::apply_file_edit_tool());
 
         Ok(ListToolsResult {
             tools,
@@ -1048,6 +2348,26 @@ impl ServerHandler for SshMcpServer {
 
                 self.execute_check_process(params).await
             }
+            "read-file" | "read_file" => {
+                let params: ReadFileParams =
+                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
+                        McpError::invalid_params(format!("invalid read-file params: {e}"), None)
+                    })?;
+
+                self.execute_read_file(params).await
+            }
+            "apply-file-edit" | "apply_file_edit" => {
+                let params: ApplyFileEditParams =
+                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
+                        McpError::invalid_params(
+                            format!("invalid apply-file-edit params: {e}"),
+                            None,
+                        )
+                    })?;
+
+                self.execute_apply_file_edit(params, ApplyFileEditFaultInjection::None)
+                    .await
+            }
             _ => Err(McpError::invalid_params(
                 format!("Unknown tool: {}", tool_name),
                 None,
@@ -1092,6 +2412,20 @@ mod tests {
     fn test_sudo_exec_tool_definition() {
         let tool = SshMcpServer::sudo_exec_tool();
         assert_eq!(tool.name.as_ref(), "sudo-exec");
+        assert!(tool.description.is_some());
+    }
+
+    #[test]
+    fn test_read_file_tool_definition() {
+        let tool = SshMcpServer::read_file_tool();
+        assert_eq!(tool.name.as_ref(), "read-file");
+        assert!(tool.description.is_some());
+    }
+
+    #[test]
+    fn test_apply_file_edit_tool_definition() {
+        let tool = SshMcpServer::apply_file_edit_tool();
+        assert_eq!(tool.name.as_ref(), "apply-file-edit");
         assert!(tool.description.is_some());
     }
 
@@ -1162,6 +2496,138 @@ mod tests {
         assert!(
             validate_background_log_path(Path::new("/tmp/ssh-mcp"), "/tmp/x\rrm -rf /").is_err()
         );
+    }
+
+    #[test]
+    fn test_validate_read_file_path_requires_absolute() {
+        let err = validate_read_file_path("relative/path").unwrap_err();
+        assert!(err.contains("absolute"));
+    }
+
+    #[test]
+    fn test_validate_read_file_path_rejects_trailing_slash() {
+        let err = validate_read_file_path("/etc/").unwrap_err();
+        assert!(err.contains("must not end with '/'"));
+    }
+
+    #[test]
+    fn test_normalize_sha256_hex_accepts_uppercase_input() {
+        let input = "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899";
+        let normalized = normalize_sha256_hex(input, "expected_sha256").unwrap();
+        assert_eq!(
+            normalized,
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        );
+    }
+
+    #[test]
+    fn test_normalize_sha256_hex_rejects_invalid_length() {
+        let err = normalize_sha256_hex("abcd", "expected_sha256").unwrap_err();
+        assert!(err.contains("64-character"));
+    }
+
+    #[test]
+    fn test_resolve_read_file_max_bytes_uses_token_limit() {
+        assert_eq!(
+            resolve_read_file_max_bytes(Some(12_000)),
+            12_000 * READ_FILE_BYTES_PER_TOKEN
+        );
+    }
+
+    #[test]
+    fn test_resolve_read_file_max_bytes_none_uses_hard_cap() {
+        assert_eq!(resolve_read_file_max_bytes(None), READ_FILE_HARD_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_resolve_read_file_max_bytes_applies_hard_cap() {
+        let very_large_tokens = READ_FILE_HARD_MAX_BYTES;
+        assert_eq!(
+            resolve_read_file_max_bytes(Some(very_large_tokens)),
+            READ_FILE_HARD_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn test_estimate_tokens_from_bytes_rounds_up() {
+        assert_eq!(estimate_tokens_from_bytes(0), 0);
+        assert_eq!(estimate_tokens_from_bytes(1), 1);
+        assert_eq!(estimate_tokens_from_bytes(4), 1);
+        assert_eq!(estimate_tokens_from_bytes(5), 2);
+    }
+
+    #[test]
+    fn test_resolve_read_file_line_limit_defaults_to_preview_window() {
+        let preview = resolve_read_file_line_limit(ReadFileMode::Preview, None)
+            .expect("preview lines should resolve");
+        assert_eq!(preview, Some(READ_FILE_DEFAULT_PREVIEW_LINES));
+
+        let head = resolve_read_file_line_limit(ReadFileMode::Head, None)
+            .expect("head lines should resolve");
+        assert_eq!(head, Some(READ_FILE_DEFAULT_PREVIEW_LINES));
+
+        let tail = resolve_read_file_line_limit(ReadFileMode::Tail, None)
+            .expect("tail lines should resolve");
+        assert_eq!(tail, Some(READ_FILE_DEFAULT_PREVIEW_LINES));
+    }
+
+    #[test]
+    fn test_resolve_read_file_line_limit_for_full_ignores_lines() {
+        let full = resolve_read_file_line_limit(ReadFileMode::Full, Some(123))
+            .expect("full mode should ignore lines");
+        assert_eq!(full, None);
+    }
+
+    #[test]
+    fn test_resolve_read_file_line_limit_rejects_zero() {
+        let err = resolve_read_file_line_limit(ReadFileMode::Head, Some(0)).unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn test_resolve_read_file_line_limit_rejects_too_large() {
+        let err =
+            resolve_read_file_line_limit(ReadFileMode::Tail, Some(READ_FILE_MAX_LINE_WINDOW + 1))
+                .unwrap_err();
+        assert!(err.contains("<="));
+    }
+
+    #[test]
+    fn test_apply_read_file_window_preview_truncates_and_sets_hint() {
+        let text = "line1\nline2\nline3\nline4\n";
+        let window = apply_read_file_window(text, ReadFileMode::Preview, Some(2));
+        assert_eq!(window.content, "line1\nline2\n");
+        assert_eq!(window.returned_lines, 2);
+        assert!(window.truncated);
+        assert!(window.hint.is_some());
+    }
+
+    #[test]
+    fn test_apply_read_file_window_tail_returns_last_lines() {
+        let text = "line1\nline2\nline3\nline4\n";
+        let window = apply_read_file_window(text, ReadFileMode::Tail, Some(2));
+        assert_eq!(window.content, "line3\nline4\n");
+        assert_eq!(window.returned_lines, 2);
+        assert!(window.truncated);
+        assert!(window.hint.is_some());
+    }
+
+    #[test]
+    fn test_apply_read_file_window_full_returns_all_content_without_hint() {
+        let text = "line1\nline2\nline3\n";
+        let window = apply_read_file_window(text, ReadFileMode::Full, Some(1));
+        assert_eq!(window.content, text);
+        assert_eq!(window.returned_lines, 3);
+        assert!(!window.truncated);
+        assert!(window.hint.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_read_file_stderr_snippet_normalizes_whitespace_and_controls() {
+        let stderr = "line1\nline2\t\u{0007}bad\rline3";
+        let snippet = sanitize_read_file_stderr_snippet(stderr)
+            .expect("snippet should be present for non-empty stderr");
+        assert_eq!(snippet, "line1 line2 bad line3");
     }
 
     #[test]
@@ -1283,6 +2749,8 @@ mod tests {
         assert!(SshMcpServer::get_tool_documentation("exec").is_some());
         assert!(SshMcpServer::get_tool_documentation("sudo-exec").is_some());
         assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
+        assert!(SshMcpServer::get_tool_documentation("read-file").is_some());
+        assert!(SshMcpServer::get_tool_documentation("apply-file-edit").is_some());
         assert!(SshMcpServer::get_tool_documentation("unknown").is_none());
     }
 
@@ -1313,11 +2781,30 @@ mod tests {
     }
 
     #[test]
+    fn test_read_file_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("read-file").unwrap();
+        assert!(docs.contains("READ-FILE TOOL"));
+        assert!(docs.contains("remote_path"));
+        assert!(docs.contains("mode"));
+        assert!(docs.contains("UTF-8"));
+    }
+
+    #[test]
+    fn test_apply_file_edit_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("apply-file-edit").unwrap();
+        assert!(docs.contains("APPLY-FILE-EDIT TOOL"));
+        assert!(docs.contains("expected_sha256"));
+        assert!(docs.contains("atomic"));
+    }
+
+    #[test]
     fn test_compact_tool_descriptions() {
         // Verify that tool descriptions are compact (not verbose)
         let exec = SshMcpServer::exec_tool();
         let sudo_exec = SshMcpServer::sudo_exec_tool();
         let transfer = SshMcpServer::transfer_tool();
+        let read_file = SshMcpServer::read_file_tool();
+        let apply_file_edit = SshMcpServer::apply_file_edit_tool();
 
         // Descriptions should be present but concise (under 100 chars)
         if let Some(desc) = exec.description {
@@ -1338,6 +2825,20 @@ mod tests {
             assert!(
                 desc.len() < 100,
                 "transfer description too long: {} chars",
+                desc.len()
+            );
+        }
+        if let Some(desc) = read_file.description {
+            assert!(
+                desc.len() < 100,
+                "read-file description too long: {} chars",
+                desc.len()
+            );
+        }
+        if let Some(desc) = apply_file_edit.description {
+            assert!(
+                desc.len() < 100,
+                "apply-file-edit description too long: {} chars",
                 desc.len()
             );
         }

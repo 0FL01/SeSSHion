@@ -71,6 +71,56 @@ SAFETY:
 
 EXAMPLE:
 {"operation": "put", "local_path": "config.yml", "remote_path": "/etc/app/config.yml"}"#;
+
+    pub const READ_FILE: &str = r#"READ-FILE TOOL
+Read UTF-8 text file contents from the remote host via deterministic raw SSH streaming.
+
+PARAMETERS:
+- remote_path (string, required): Absolute remote file path to read
+- mode (string): "preview" (default), "head", "tail", or "full"
+- lines (integer): Line count for preview/head/tail (default: 800, max: 10000)
+- timeout_ms (integer): Optional timeout override in milliseconds
+
+BEHAVIOR:
+- Uses raw streaming transport (no exec output token truncation)
+- Default preview mode returns the first 800 lines to avoid context bombs
+- Returns JSON with path/content/returned_lines/truncated/token estimates and optional hint
+- Enforces deterministic size limits (aligned with max_output_tokens, hard-capped)
+- Returns an error for missing path, non-file paths, oversized files, or invalid UTF-8 content
+
+EXAMPLE:
+{"remote_path": "/etc/nginx/nginx.conf", "mode": "preview"}"#;
+
+    pub const APPLY_FILE_EDIT: &str = r#"APPLY-FILE-EDIT TOOL
+Atomically overwrite/create or patch-replace a remote UTF-8 file with optional optimistic locking.
+
+PARAMETERS:
+- remote_path (string, required): Absolute remote file path to overwrite/create
+- new_content (string): Full replacement content (max 1048576 bytes, full mode)
+- old_text (string): Source text to replace (partial mode)
+- new_text (string): Replacement text (partial mode)
+- replace_all (boolean): Partial mode flag; default false. If false, exactly one match is required.
+- expected_sha256 (string): Optional 64-char hex SHA-256 precondition of current file
+- timeout_ms (integer): Optional timeout override in milliseconds
+
+BEHAVIOR:
+- Validates remote_path like read-file
+- Runtime mode is selected by fields:
+  - Full mode: set new_content only
+  - Partial mode: set old_text and new_text only
+  - Mixed/invalid combinations return invalid_params
+- Acquires a per-file remote lock, computes SHA-256, and performs compare+replace in one transaction
+- Creates the target file atomically when it is missing and the parent directory already exists
+- Partial mode requires an existing regular file and never creates a new file
+- Partial mode returns an error when old_text is not found
+- Partial mode with replace_all=false requires exactly one match; otherwise returns an error asking to use replace_all
+- If expected_sha256 is set and does not match, returns conflict and does not modify file
+- If expected_sha256 is set while file is missing, returns conflict and does not create file
+- Uses a same-directory sibling staging file and atomic rename
+- Returns JSON: {"path":"...","previous_sha256":"...","new_sha256":"...","bytes_written":123,"changed":true}
+
+EXAMPLE:
+{"remote_path":"/etc/app.conf","new_content":"key=value\n","expected_sha256":"d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"}"#;
 }
 
 fn command_tool(
@@ -189,11 +239,114 @@ pub(super) fn check_process_tool() -> Tool {
     )
 }
 
+pub(super) fn read_file_tool() -> Tool {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "remote_path": {
+                "type": "string",
+                "description": "Absolute remote file path to read"
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["preview", "head", "tail", "full"],
+                "default": "preview",
+                "description": "Read mode: safe preview (default), head, tail, or full"
+            },
+            "lines": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "default": 800,
+                "description": "Line count for preview/head/tail modes"
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Optional timeout override in milliseconds"
+            }
+        },
+        "required": ["remote_path"]
+    });
+
+    let schema_obj = schema.as_object().cloned().unwrap_or_default();
+    Tool::new(
+        "read-file",
+        "Read a remote UTF-8 text file with safe preview/head/tail/full modes.",
+        Arc::new(schema_obj),
+    )
+}
+
+pub(super) fn apply_file_edit_tool() -> Tool {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "remote_path": {
+                "type": "string",
+                "description": "Absolute remote file path to overwrite/create"
+            },
+            "new_content": {
+                "type": "string",
+                "description": "Full replacement UTF-8 content (max 1048576 bytes)",
+                "maxLength": 1048576
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Partial mode: source text to replace"
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Partial mode: replacement text"
+            },
+            "replace_all": {
+                "type": "boolean",
+                "default": false,
+                "description": "Partial mode: replace all matches (default false requires exactly one match)"
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional 64-char hex SHA-256 precondition of current file"
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Optional timeout override in milliseconds"
+            }
+        },
+        "required": ["remote_path"],
+        "oneOf": [
+            {
+                "required": ["remote_path", "new_content"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["old_text"]},
+                        {"required": ["new_text"]},
+                        {"required": ["replace_all"]}
+                    ]
+                }
+            },
+            {
+                "required": ["remote_path", "old_text", "new_text"],
+                "not": {
+                    "required": ["new_content"]
+                }
+            }
+        ]
+    });
+
+    let schema_obj = schema.as_object().cloned().unwrap_or_default();
+    Tool::new(
+        "apply-file-edit",
+        "Atomically overwrite/create or patch-replace a remote file with optional SHA-256 precondition.",
+        Arc::new(schema_obj),
+    )
+}
+
 pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "exec" => Some(tool_docs::EXEC),
         "sudo-exec" => Some(tool_docs::SUDO_EXEC),
         "transfer" => Some(tool_docs::TRANSFER),
+        "read-file" => Some(tool_docs::READ_FILE),
+        "apply-file-edit" => Some(tool_docs::APPLY_FILE_EDIT),
         _ => None,
     }
 }

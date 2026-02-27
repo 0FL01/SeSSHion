@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
 
-A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution and administrative tasks.
+A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution, file operations, and administrative tasks.
 
 ## ✨ Features
 
@@ -13,7 +13,9 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 - **Auto-Reconnect**: Automatically restores the connection if it drops.
 - **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.
 - **Sudo Integration**: Provides a `sudo-exec` tool with password wrapping.
-- **File Transfer**: Upload/download files and directories via SFTP, SCP, rsync (delta sync), or streaming (works with both key and password auth).
+- **File Operations**: Read, edit, and transfer files with atomic operations and optimistic locking.
+- **Smart File Reading**: Preview mode prevents context overflow with token estimates and pagination.
+- **Atomic File Editing**: Full replacement or partial text replacement with conflict detection.
 - **Command Sanitization**: Built-in safety checks for command inputs.
 - **Output Control**: Configurable output length limits to prevent token overflow.
 - **Cross-Platform**: Compiled binary runs on any system with SSH access.
@@ -214,6 +216,133 @@ Check if a background job is still running and read the tail of its local log (s
   - `job_id` (string, required): Job ID returned by `exec`/`sudo-exec` when `background=true`, or by `exec` foreground timeout auto-detach.
   - `tail_lines` (integer, default: 50): Number of last lines to read from the local log.
 
+### `read-file`
+Read a remote file with smart preview to prevent context overflow.
+
+- **Arguments**:
+  - `remote_path` (string, required): Absolute path to the remote file.
+  - `mode` (string, optional): Read mode - `"preview"`, `"head"`, `"tail"`, or `"full"`. Default: `"preview"`.
+  - `lines` (integer, optional): Number of lines for preview/head/tail modes. Default: 800, Max: 10000.
+  - `timeout_ms` (integer, optional): Override timeout in milliseconds.
+
+- **Modes**:
+  - `preview` (default): Returns first N lines (default 800) with token estimates and truncation hint. Prevents context bomb from large files.
+  - `head`: Returns first N lines from the beginning of the file.
+  - `tail`: Returns last N lines from the end of the file.
+  - `full`: Returns the entire file content (subject to 1MB size limit).
+
+- **Response**:
+  ```json
+  {
+    "path": "/etc/config.conf",
+    "content": "# First 800 lines...",
+    "mode": "preview",
+    "returned_lines": 800,
+    "truncated": true,
+    "approx_tokens_returned": 2048,
+    "approx_tokens_total_estimate": 8192,
+    "hint": "File has 2400 lines total. Use mode=\"full\" to read entire file."
+  }
+  ```
+
+- **Safety Features**:
+  - Returns error for files larger than 1MB (use `transfer` for large files)
+  - Rejects binary/non-UTF8 files with clear error
+  - Shows approximate token counts to help agents manage context budget
+
+**Example - Preview first 800 lines:**
+```json
+{"remote_path": "/var/log/app.log"}
+```
+
+**Example - Get last 50 lines:**
+```json
+{"remote_path": "/var/log/app.log", "mode": "tail", "lines": 50}
+```
+
+**Example - Read entire file:**
+```json
+{"remote_path": "/etc/nginx/nginx.conf", "mode": "full"}
+```
+
+### `apply-file-edit`
+Atomically edit a remote file with conflict detection and optional partial text replacement.
+
+- **Modes**:
+  - **Full Replacement**: Replace entire file content atomically
+  - **Partial Replacement**: Replace specific text occurrences within the file
+
+- **Full Replacement Arguments**:
+  - `remote_path` (string, required): Absolute path to the remote file.
+  - `new_content` (string, required): Complete new file content (UTF-8, max 1MB).
+  - `expected_sha256` (string, optional): 64-char hex SHA-256 hash for optimistic locking.
+
+- **Partial Replacement Arguments**:
+  - `remote_path` (string, required): Absolute path to the remote file (must exist).
+  - `old_text` (string, required): Text to search for and replace.
+  - `new_text` (string, required): Replacement text.
+  - `replace_all` (boolean, default: false): If false and multiple matches found, returns error (deterministic behavior).
+  - `expected_sha256` (string, optional): Expected SHA-256 hash for optimistic locking.
+
+- **Response**:
+  ```json
+  {
+    "path": "/etc/app.conf",
+    "previous_sha256": "d2d2d2...",
+    "new_sha256": "a3a3a3...",
+    "bytes_written": 1234,
+    "changed": true
+  }
+  ```
+
+- **Error Responses**:
+  - `conflict`: File changed since expected_sha256 (or multiple matches with replace_all=false)
+  - `not_found`: File or parent directory doesn't exist (partial mode only works on existing files)
+  - `sha256_unavailable`: Remote host lacks sha256sum/shasum utilities
+
+- **Safety Features**:
+  - Atomic writes via staging + rename (never leaves partially written files)
+  - Lock directory prevents concurrent edits to same file
+  - Automatic rollback on failure
+  - Conflict detection prevents overwriting concurrent changes
+  - Partial mode always pinned to read baseline SHA (prevents race conditions)
+
+**Example - Full replacement with optimistic lock:**
+```json
+{
+  "remote_path": "/etc/app.conf",
+  "new_content": "key=new_value\n",
+  "expected_sha256": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"
+}
+```
+
+**Example - Partial text replacement (single match):**
+```json
+{
+  "remote_path": "/etc/nginx/nginx.conf",
+  "old_text": "listen 80;",
+  "new_text": "listen 8080;",
+  "expected_sha256": "a1b2c3..."
+}
+```
+
+**Example - Partial replacement (all occurrences):**
+```json
+{
+  "remote_path": "/etc/config.conf",
+  "old_text": "localhost",
+  "new_text": "127.0.0.1",
+  "replace_all": true
+}
+```
+
+**Workflow for editing without losing changes:**
+1. Read file: `read-file` with mode `"preview"` or `"full"`
+2. Note the `approx_tokens_total_estimate` and current SHA (if shown in error context)
+3. Make local edits to content
+4. Apply changes: `apply-file-edit` with `expected_sha256` from step 2
+5. If conflict error: re-read file (it changed), merge changes, retry
+
 ### `transfer`
 Transfer a file or directory over SSH.
 
@@ -348,6 +477,9 @@ tail -f "/var/log/ssh-mcp/app.log.$(date +%Y-%m-%d)" | jq
 - **Stdio Transport**: Communicates using JSON-RPC over stdin/stdout, ensuring no exposed ports.
 - **Credential Storage**: Passwords and keys are only kept in memory and never logged.
 - **Logging**: All internal logs are sent to `stderr` to avoid interfering with the MCP protocol.
+- **File Editing Safety**: Atomic staging with automatic cleanup, lock directories prevent concurrent edits, conflict detection prevents silent overwrites.
+- **Path Validation**: All paths validated for control characters, traversal attempts (`..`), and shell injection.
+- **Binary File Protection**: Text-based tools reject non-UTF8 content to prevent data corruption.
 
 ## 📄 License
 

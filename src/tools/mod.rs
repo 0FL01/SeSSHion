@@ -7,6 +7,8 @@
 //! - `exec` - Execute shell commands on the remote SSH server
 //! - `sudo-exec` - Execute shell commands with sudo privileges
 //! - `check-process` - Check if a process is still running and read its log
+//! - `read-file` - Read UTF-8 text files from the remote SSH server
+//! - `apply-file-edit` - Atomically overwrite or patch-replace a remote file
 //!
 //! See `server.rs` for the implementation.
 
@@ -16,6 +18,10 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+fn default_read_file_mode() -> ReadFileMode {
+    ReadFileMode::Preview
+}
 
 /// Parameters for the exec tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -80,6 +86,72 @@ pub struct CheckProcessParams {
     pub tail_lines: usize,
 }
 
+/// Parameters for the read-file tool
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadFileMode {
+    /// Safe first-read mode that returns the first chunk of lines
+    Preview,
+    /// Return the first N lines
+    Head,
+    /// Return the last N lines
+    Tail,
+    /// Return the full file (subject to existing size safeguards)
+    Full,
+}
+
+impl ReadFileMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Head => "head",
+            Self::Tail => "tail",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ReadFileParams {
+    /// Absolute remote file path to read
+    pub remote_path: String,
+
+    /// Read mode (default: preview)
+    #[serde(default = "default_read_file_mode")]
+    pub mode: ReadFileMode,
+
+    /// Number of lines for preview/head/tail (default: 800)
+    pub lines: Option<usize>,
+
+    /// Optional timeout override in milliseconds
+    pub timeout_ms: Option<u64>,
+}
+
+/// Parameters for the apply-file-edit tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ApplyFileEditParams {
+    /// Absolute remote file path to overwrite/create atomically
+    pub remote_path: String,
+
+    /// Full UTF-8 content that will replace the file atomically (full mode)
+    pub new_content: Option<String>,
+
+    /// Source text to replace in the current file (partial mode)
+    pub old_text: Option<String>,
+
+    /// Replacement text used for partial mode
+    pub new_text: Option<String>,
+
+    /// Partial mode: replace all matches when true (default false)
+    pub replace_all: Option<bool>,
+
+    /// Optional SHA-256 precondition for optimistic locking
+    pub expected_sha256: Option<String>,
+
+    /// Optional timeout override in milliseconds
+    pub timeout_ms: Option<u64>,
+}
+
 fn default_tail_lines() -> usize {
     50
 }
@@ -132,5 +204,95 @@ mod tests {
         let params: CheckProcessParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.job_id, "job-123");
         assert_eq!(params.tail_lines, 100);
+    }
+
+    #[test]
+    fn test_read_file_params_deserialize() {
+        let json = r#"{"remote_path": "/etc/hosts"}"#;
+        let params: ReadFileParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert_eq!(params.mode, ReadFileMode::Preview);
+        assert_eq!(params.lines, None);
+        assert!(params.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn test_read_file_params_deserialize_with_timeout() {
+        let json = r#"{"remote_path": "/etc/hosts", "timeout_ms": 2500}"#;
+        let params: ReadFileParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert_eq!(params.mode, ReadFileMode::Preview);
+        assert_eq!(params.lines, None);
+        assert_eq!(params.timeout_ms, Some(2500));
+    }
+
+    #[test]
+    fn test_read_file_params_deserialize_with_mode_and_lines() {
+        let json = r#"{"remote_path":"/etc/hosts","mode":"tail","lines":120}"#;
+        let params: ReadFileParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert_eq!(params.mode, ReadFileMode::Tail);
+        assert_eq!(params.lines, Some(120));
+        assert!(params.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn test_read_file_mode_serialization_is_lowercase() {
+        let value = serde_json::to_value(ReadFileMode::Full).unwrap();
+        assert_eq!(value, serde_json::json!("full"));
+    }
+
+    #[test]
+    fn test_apply_file_edit_params_deserialize() {
+        let json = r#"{"remote_path":"/etc/hosts","new_content":"127.0.0.1 localhost\n"}"#;
+        let params: ApplyFileEditParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert_eq!(params.new_content.as_deref(), Some("127.0.0.1 localhost\n"));
+        assert!(params.old_text.is_none());
+        assert!(params.new_text.is_none());
+        assert!(params.replace_all.is_none());
+        assert!(params.expected_sha256.is_none());
+        assert!(params.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn test_apply_file_edit_params_deserialize_with_expected_hash_and_timeout() {
+        let json = r#"{"remote_path":"/etc/hosts","new_content":"x","expected_sha256":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","timeout_ms":4000}"#;
+        let params: ApplyFileEditParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert_eq!(params.new_content.as_deref(), Some("x"));
+        assert!(params.old_text.is_none());
+        assert!(params.new_text.is_none());
+        assert!(params.replace_all.is_none());
+        assert_eq!(
+            params.expected_sha256.as_deref(),
+            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(params.timeout_ms, Some(4000));
+    }
+
+    #[test]
+    fn test_apply_file_edit_partial_params_deserialize_defaults_replace_all() {
+        let json = r#"{"remote_path":"/etc/hosts","old_text":"127.0.0.1","new_text":"127.0.0.2"}"#;
+        let params: ApplyFileEditParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert!(params.new_content.is_none());
+        assert_eq!(params.old_text.as_deref(), Some("127.0.0.1"));
+        assert_eq!(params.new_text.as_deref(), Some("127.0.0.2"));
+        assert!(params.replace_all.is_none());
+        assert!(params.expected_sha256.is_none());
+        assert!(params.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn test_apply_file_edit_partial_params_deserialize_replace_all_true() {
+        let json = r#"{"remote_path":"/etc/hosts","old_text":"x","new_text":"y","replace_all":true,"timeout_ms":2000}"#;
+        let params: ApplyFileEditParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.remote_path, "/etc/hosts");
+        assert!(params.new_content.is_none());
+        assert_eq!(params.old_text.as_deref(), Some("x"));
+        assert_eq!(params.new_text.as_deref(), Some("y"));
+        assert_eq!(params.replace_all, Some(true));
+        assert_eq!(params.timeout_ms, Some(2000));
     }
 }

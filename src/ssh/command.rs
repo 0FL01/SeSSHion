@@ -23,6 +23,9 @@ use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
 
+const RAW_STREAM_BYTES_PER_TOKEN: usize = 4;
+const RAW_STREAM_STDERR_HARD_MAX_BYTES: usize = 1024 * 1024;
+
 /// Output from a command execution
 #[derive(Debug, Clone, Default)]
 pub struct CommandOutput {
@@ -139,6 +142,45 @@ fn validate_timeout_duration(timeout_duration: Duration) -> Result<f64> {
         ));
     }
     Ok(duration_secs)
+}
+
+fn resolve_raw_stream_stderr_limit(max_output_tokens: Option<usize>) -> usize {
+    max_output_tokens
+        .and_then(|tokens| tokens.checked_mul(RAW_STREAM_BYTES_PER_TOKEN))
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(RAW_STREAM_STDERR_HARD_MAX_BYTES)
+        .min(RAW_STREAM_STDERR_HARD_MAX_BYTES)
+}
+
+fn utf8_prefix_len(input: &str, max_bytes: usize) -> usize {
+    if input.len() <= max_bytes {
+        return input.len();
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    end
+}
+
+fn append_bounded_lossy_stderr(stderr: &mut String, chunk: &[u8], max_len: usize) -> bool {
+    if stderr.len() >= max_len {
+        return true;
+    }
+
+    let chunk_str = String::from_utf8_lossy(chunk);
+    let remaining = max_len.saturating_sub(stderr.len());
+    if chunk_str.len() <= remaining {
+        stderr.push_str(&chunk_str);
+        return false;
+    }
+
+    let take = utf8_prefix_len(&chunk_str, remaining);
+    if take > 0 {
+        stderr.push_str(&chunk_str[..take]);
+    }
+    true
 }
 
 /// Errors that can occur before exec is successfully sent.
@@ -944,6 +986,9 @@ impl SshConnectionManager {
             }));
 
             let mut output = TransferRawOutput::default();
+            let stderr_limit_bytes = resolve_raw_stream_stderr_limit(self.config.max_output_tokens);
+            let mut total_stderr_bytes = 0usize;
+            let mut stderr_truncated = false;
             let mut stdin_done = stdin.is_none();
             let mut stdin_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> =
                 if stdin_done { None } else { Some(stdin_tx) };
@@ -994,7 +1039,21 @@ impl SshConnectionManager {
                                 }
                             }
                             Some(RawStreamEvent::Stderr(data)) => {
-                                output.stderr.push_str(&String::from_utf8_lossy(&data));
+                                total_stderr_bytes = total_stderr_bytes.saturating_add(data.len());
+                                if !stderr_truncated {
+                                    stderr_truncated = append_bounded_lossy_stderr(
+                                        &mut output.stderr,
+                                        &data,
+                                        stderr_limit_bytes,
+                                    );
+                                    if stderr_truncated {
+                                        warn!(
+                                            total_stderr_bytes,
+                                            stderr_limit_bytes,
+                                            "raw streaming stderr truncated"
+                                        );
+                                    }
+                                }
                             }
                             Some(RawStreamEvent::ExitStatus(code)) => {
                                 output.exit_code = Some(code);
@@ -1008,6 +1067,13 @@ impl SshConnectionManager {
                         }
                     }
                 }
+            }
+
+            if stderr_truncated {
+                output.stderr.push_str(&format!(
+                    "\n[stderr truncated: {} bytes total, limit {} bytes]",
+                    total_stderr_bytes, stderr_limit_bytes
+                ));
             }
 
             if let Some(writer) = stdout.as_mut() {
@@ -1505,5 +1571,45 @@ mod tests {
         let unescaped_once = inner.replace("'\"'\"'", "'");
         assert_eq!(unescaped_once, timeout_wrapped);
         assert!(cmd.contains("hello"));
+    }
+
+    #[test]
+    fn test_resolve_raw_stream_stderr_limit_uses_token_limit() {
+        assert_eq!(
+            resolve_raw_stream_stderr_limit(Some(12_000)),
+            12_000 * RAW_STREAM_BYTES_PER_TOKEN
+        );
+    }
+
+    #[test]
+    fn test_resolve_raw_stream_stderr_limit_none_uses_hard_cap() {
+        assert_eq!(
+            resolve_raw_stream_stderr_limit(None),
+            RAW_STREAM_STDERR_HARD_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn test_resolve_raw_stream_stderr_limit_applies_hard_cap() {
+        assert_eq!(
+            resolve_raw_stream_stderr_limit(Some(RAW_STREAM_STDERR_HARD_MAX_BYTES)),
+            RAW_STREAM_STDERR_HARD_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn test_append_bounded_lossy_stderr_no_truncation() {
+        let mut stderr = String::new();
+        let truncated = append_bounded_lossy_stderr(&mut stderr, b"hello", 16);
+        assert!(!truncated);
+        assert_eq!(stderr, "hello");
+    }
+
+    #[test]
+    fn test_append_bounded_lossy_stderr_truncates_at_utf8_boundary() {
+        let mut stderr = String::new();
+        let truncated = append_bounded_lossy_stderr(&mut stderr, "абв".as_bytes(), 3);
+        assert!(truncated);
+        assert_eq!(stderr, "а");
     }
 }

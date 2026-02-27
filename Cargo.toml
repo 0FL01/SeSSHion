@@ -35,6 +35,11 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 schemars = "1.2"
 
+# Crypto (read-ticket HMAC)
+sha2 = "0.10"
+hmac = "0.12"
+getrandom = "0.2"
+
 # Tracing/Logging
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }

@@ -46,6 +46,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── args.rs             # Common tool argument parsing
 │   │   └── exec.rs             # Shared background execution (exec/sudo-exec deduplication)
 │   ├── shell_escape.rs         # Shell string escaping utilities (neutral, no ssh/background deps)
+│   ├── ticket.rs               # Read-ticket generation and HMAC verification for safe file overwrites
 │   ├── config.rs               # Configuration and CLI argument parsing
 │   ├── error.rs                # Centralized error handling
 │   ├── logging.rs              # Logging configuration and initialization

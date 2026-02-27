@@ -148,6 +148,9 @@ pub struct ApplyFileEditParams {
     /// Optional SHA-256 precondition for optimistic locking
     pub expected_sha256: Option<String>,
 
+    /// Opaque read-ticket from read-file response (required for editing non-empty existing files)
+    pub read_ticket: Option<String>,
+
     /// Optional timeout override in milliseconds
     pub timeout_ms: Option<u64>,
 }

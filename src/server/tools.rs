@@ -84,7 +84,9 @@ PARAMETERS:
 BEHAVIOR:
 - Uses raw streaming transport (no exec output token truncation)
 - Default preview mode returns the first 800 lines to avoid context bombs
-- Returns JSON with path/content/returned_lines/truncated/token estimates and optional hint
+- Returns JSON with path/content/returned_lines/truncated/token estimates, sha256, read_ticket, and optional hint
+- sha256: SHA-256 hex digest of the full file content (always present)
+- read_ticket: opaque token required by apply-file-edit when editing non-empty existing files (valid for 10 minutes)
 - Enforces deterministic size limits (aligned with max_output_tokens, hard-capped)
 - Returns an error for missing path, non-file paths, oversized files, or invalid UTF-8 content
 
@@ -101,6 +103,7 @@ PARAMETERS:
 - new_text (string): Replacement text (partial mode)
 - replace_all (boolean): Partial mode flag; default false. If false, exactly one match is required.
 - expected_sha256 (string): Optional 64-char hex SHA-256 precondition of current file
+- read_ticket (string): Opaque token from read-file response. Required in full mode when editing a non-empty existing file. Not needed for file creation or empty files. Partial mode does not require it.
 - timeout_ms (integer): Optional timeout override in milliseconds
 
 BEHAVIOR:
@@ -117,7 +120,9 @@ BEHAVIOR:
 - If expected_sha256 is set and does not match, returns conflict and does not modify file
 - If expected_sha256 is set while file is missing, returns conflict and does not create file
 - Uses a same-directory sibling staging file and atomic rename
-- Returns JSON: {"path":"...","previous_sha256":"...","new_sha256":"...","bytes_written":123,"changed":true}
+- Full mode requires a valid read_ticket when the target file exists and is non-empty; obtain it by calling read-file first
+- Partial mode does not require read_ticket (file is read internally)
+- Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
 
 EXAMPLE:
 {"remote_path":"/etc/app.conf","new_content":"key=value\n","expected_sha256":"d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"}"#;
@@ -305,6 +310,10 @@ pub(super) fn apply_file_edit_tool() -> Tool {
             "expected_sha256": {
                 "type": "string",
                 "description": "Optional 64-char hex SHA-256 precondition of current file"
+            },
+            "read_ticket": {
+                "type": "string",
+                "description": "Opaque read-ticket from read-file (required when editing a non-empty existing file in full mode)"
             },
             "timeout_ms": {
                 "type": "integer",

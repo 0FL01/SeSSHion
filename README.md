@@ -237,6 +237,8 @@ Read a remote file with smart preview to prevent context overflow.
     "path": "/etc/config.conf",
     "content": "# First 800 lines...",
     "mode": "preview",
+    "sha256": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+    "read_ticket": "rt1.1700000000.abcd...",
     "returned_lines": 800,
     "truncated": true,
     "approx_tokens_returned": 2048,
@@ -276,6 +278,7 @@ Atomically edit a remote file with conflict detection and optional partial text 
   - `remote_path` (string, required): Absolute path to the remote file.
   - `new_content` (string, required): Complete new file content (UTF-8, max 1MB).
   - `expected_sha256` (string, optional): 64-char hex SHA-256 hash for optimistic locking.
+  - `read_ticket` (string, conditionally required): Opaque token from `read-file`. Required when editing an existing non-empty file. Not required for file creation or zero-byte files.
 
 - **Partial Replacement Arguments**:
   - `remote_path` (string, required): Absolute path to the remote file (must exist).
@@ -283,6 +286,7 @@ Atomically edit a remote file with conflict detection and optional partial text 
   - `new_text` (string, required): Replacement text.
   - `replace_all` (boolean, default: false): If false and multiple matches found, returns error (deterministic behavior).
   - `expected_sha256` (string, optional): Expected SHA-256 hash for optimistic locking.
+  - `read_ticket` (string, optional/ignored): Partial mode reads the file internally and does not require a ticket.
 
 - **Response**:
   ```json
@@ -299,6 +303,7 @@ Atomically edit a remote file with conflict detection and optional partial text 
   - `conflict`: File changed since expected_sha256 (or multiple matches with replace_all=false)
   - `not_found`: File or parent directory doesn't exist (partial mode only works on existing files)
   - `sha256_unavailable`: Remote host lacks sha256sum/shasum utilities
+  - `invalid_params`: Missing/invalid/expired/wrong-path `read_ticket`, or full-mode edit attempted on existing non-empty file without calling `read-file` first
 
 - **Safety Features**:
   - Atomic writes via staging + rename (never leaves partially written files)
@@ -307,12 +312,13 @@ Atomically edit a remote file with conflict detection and optional partial text 
   - Conflict detection prevents overwriting concurrent changes
   - Partial mode always pinned to read baseline SHA (prevents race conditions)
 
-**Example - Full replacement with optimistic lock:**
+**Example - Full replacement with optimistic lock (after calling `read-file`):**
 ```json
 {
   "remote_path": "/etc/app.conf",
   "new_content": "key=new_value\n",
-  "expected_sha256": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"
+  "expected_sha256": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+  "read_ticket": "rt1.1700000000.abcd..."
 }
 ```
 
@@ -338,10 +344,11 @@ Atomically edit a remote file with conflict detection and optional partial text 
 
 **Workflow for editing without losing changes:**
 1. Read file: `read-file` with mode `"preview"` or `"full"`
-2. Note the `approx_tokens_total_estimate` and current SHA (if shown in error context)
+2. Capture `read_ticket` from the read-file response (and optionally `sha256`)
 3. Make local edits to content
-4. Apply changes: `apply-file-edit` with `expected_sha256` from step 2
-5. If conflict error: re-read file (it changed), merge changes, retry
+4. Apply changes: `apply-file-edit` with `read_ticket` (required for existing non-empty files)
+5. Optional: also send `expected_sha256` for explicit optimistic locking
+6. If conflict error: re-read file (it changed), merge changes, retry
 
 ### `transfer`
 Transfer a file or directory over SSH.

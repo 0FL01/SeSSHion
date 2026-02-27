@@ -37,6 +37,7 @@ use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, escape_for_shell, sanitize_command,
     wrap_sudo_command,
 };
+use crate::ticket::{DEFAULT_TICKET_TTL_SECS, TicketSigner};
 use crate::tools::{ApplyFileEditParams, CheckProcessParams, ReadFileMode, ReadFileParams};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 use crate::validate::validate_basic_path_str;
@@ -434,6 +435,7 @@ pub struct SshMcpServer {
     job_registry: Arc<JobRegistry>,
 
     transfer: TransferEngine,
+    ticket_signer: Arc<TicketSigner>,
 }
 
 impl SshMcpServer {
@@ -502,6 +504,7 @@ impl SshMcpServer {
             spooler,
             job_registry,
             transfer: TransferEngine::new(local_root),
+            ticket_signer: Arc::new(TicketSigner::new()),
         })
     }
 
@@ -1230,6 +1233,16 @@ impl SshMcpServer {
                 ))]));
             }
         };
+        let content_sha256 = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(content.as_bytes());
+            hash.iter()
+                .fold(String::with_capacity(SHA256_HEX_LEN), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                })
+        };
         let _ = tokio::fs::remove_file(&capture_path).await;
 
         let content_window = apply_read_file_window(&content, mode, line_limit);
@@ -1248,6 +1261,11 @@ impl SshMcpServer {
         if let Some(hint) = content_window.hint {
             result["hint"] = serde_json::Value::String(hint);
         }
+        result["sha256"] = serde_json::Value::String(content_sha256);
+        result["read_ticket"] = serde_json::Value::String(
+            self.ticket_signer
+                .issue(&remote_path, DEFAULT_TICKET_TTL_SECS),
+        );
 
         Ok(CallToolResult::success(vec![Content::text(
             result.to_string(),
@@ -1268,6 +1286,7 @@ impl SshMcpServer {
             new_text,
             replace_all,
             expected_sha256,
+            read_ticket,
             timeout_ms,
         } = params;
 
@@ -1302,6 +1321,39 @@ impl SshMcpServer {
             },
             _ => return Err(McpError::invalid_params(mode_error, None)),
         };
+
+        // ── Read-ticket enforcement ──────────────────────────────────────
+        // Full mode: require a valid read_ticket when editing a non-empty
+        // existing file. Partial mode reads the file internally, so the
+        // precondition is implicitly satisfied.
+        if let ApplyFileEditMode::Full { .. } = &edit_mode {
+            match read_ticket {
+                Some(ref ticket) => {
+                    // Ticket provided — verify it matches the path.
+                    self.ticket_signer
+                        .verify(ticket, &remote_path)
+                        .map_err(|e| {
+                            McpError::invalid_params(
+                                format!("read_ticket verification failed: {e}"),
+                                None,
+                            )
+                        })?;
+                }
+                None => {
+                    // No ticket — check if file exists and is non-empty.
+                    if self
+                        .check_remote_file_nonempty(&remote_path, timeout)
+                        .await?
+                    {
+                        return Err(McpError::invalid_params(
+                            "Error: existing non-empty file must be read before editing. Call read-file first, then pass the returned read_ticket to apply-file-edit.",
+                            None,
+                        ));
+                    }
+                    // File is missing or empty — proceed with creation/overwrite.
+                }
+            }
+        }
 
         let (next_content, partial_baseline_sha256) = match edit_mode {
             ApplyFileEditMode::Full { new_content } => (new_content, None),
@@ -1533,6 +1585,29 @@ impl SshMcpServer {
                 "Error: partial race fault injection did not report exit status".to_string(),
             )])),
         }
+    }
+
+    /// Lightweight remote check: does the file exist and have size > 0?
+    ///
+    /// Returns `true` when the path is a regular file with at least one byte.
+    /// Returns `false` for missing paths, non-files, and zero-byte files.
+    async fn check_remote_file_nonempty(
+        &self,
+        remote_path: &str,
+        timeout: Duration,
+    ) -> std::result::Result<bool, McpError> {
+        let escaped = escape_for_shell(remote_path);
+        let cmd = format!(
+            r#"sh -c 'if [ -f "$1" ] && [ -s "$1" ]; then printf "1"; else printf "0"; fi' sh '{escaped}'"#
+        );
+        let out = self
+            .connection
+            .exec_command(&cmd, timeout)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("failed to check remote file status: {e}"), None)
+            })?;
+        Ok(out.stdout.trim() == "1")
     }
 
     async fn execute_apply_file_edit_write_transaction(
@@ -1996,6 +2071,7 @@ impl SshMcpServer {
         remote_path: &str,
         new_content: &str,
         expected_sha256: Option<&str>,
+        read_ticket: Option<&str>,
         timeout_ms: Option<u64>,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_apply_file_edit(
@@ -2006,6 +2082,7 @@ impl SshMcpServer {
                 new_text: None,
                 replace_all: None,
                 expected_sha256: expected_sha256.map(str::to_string),
+                read_ticket: read_ticket.map(str::to_string),
                 timeout_ms,
             },
             ApplyFileEditFaultInjection::None,
@@ -2032,6 +2109,7 @@ impl SshMcpServer {
                 new_text: Some(new_text.to_string()),
                 replace_all: Some(replace_all),
                 expected_sha256: expected_sha256.map(str::to_string),
+                read_ticket: None,
                 timeout_ms,
             },
             ApplyFileEditFaultInjection::None,
@@ -2068,6 +2146,7 @@ impl SshMcpServer {
                 new_text: Some(new_text.to_string()),
                 replace_all: Some(replace_all),
                 expected_sha256: expected_sha256.map(str::to_string),
+                read_ticket: None,
                 timeout_ms,
             },
             ApplyFileEditFaultInjection::PartialDeleteBeforeWrite,
@@ -2094,6 +2173,7 @@ impl SshMcpServer {
                 new_text: Some(new_text.to_string()),
                 replace_all: Some(replace_all),
                 expected_sha256: expected_sha256.map(str::to_string),
+                read_ticket: None,
                 timeout_ms,
             },
             ApplyFileEditFaultInjection::PartialMutateBeforeWrite,
@@ -2108,6 +2188,7 @@ impl SshMcpServer {
         remote_path: &str,
         new_content: &str,
         expected_sha256: Option<&str>,
+        read_ticket: Option<&str>,
         timeout_ms: Option<u64>,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_apply_file_edit(
@@ -2118,6 +2199,7 @@ impl SshMcpServer {
                 new_text: None,
                 replace_all: None,
                 expected_sha256: expected_sha256.map(str::to_string),
+                read_ticket: read_ticket.map(str::to_string),
                 timeout_ms,
             },
             ApplyFileEditFaultInjection::FailBeforeFinalize,
@@ -2132,6 +2214,7 @@ impl SshMcpServer {
         remote_path: &str,
         new_content: &str,
         expected_sha256: Option<&str>,
+        read_ticket: Option<&str>,
         timeout_ms: Option<u64>,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_apply_file_edit(
@@ -2142,6 +2225,7 @@ impl SshMcpServer {
                 new_text: None,
                 replace_all: None,
                 expected_sha256: expected_sha256.map(str::to_string),
+                read_ticket: read_ticket.map(str::to_string),
                 timeout_ms,
             },
             ApplyFileEditFaultInjection::Sha256Unavailable,

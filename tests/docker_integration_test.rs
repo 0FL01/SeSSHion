@@ -21,6 +21,28 @@ async fn remote_sha256(server: &SshMcpServer, remote_path: &str) -> String {
     extract_text_from_result(&result).trim().to_string()
 }
 
+/// Calls read-file and returns (sha256, read_ticket) from the JSON response.
+async fn read_file_ticket(server: &SshMcpServer, remote_path: &str) -> (String, String) {
+    let result = server
+        .test_read_file(remote_path, None)
+        .await
+        .expect("read-file for ticket extraction failed");
+    let text = extract_text_from_result(&result);
+    let json: serde_json::Value =
+        serde_json::from_str(text.trim()).expect("read-file response should be valid JSON");
+    let sha256 = json
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .expect("read-file response must contain sha256")
+        .to_string();
+    let ticket = json
+        .get("read_ticket")
+        .and_then(|v| v.as_str())
+        .expect("read-file response must contain read_ticket")
+        .to_string();
+    (sha256, ticket)
+}
+
 /// Integration test that runs an SSH server in Docker and tests MCP tools
 ///
 /// This test:
@@ -353,7 +375,7 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to prepare missing-file create fixture");
 
     let create_missing_result = server
-        .test_apply_file_edit(create_path, "created\n", None, Some(30_000))
+        .test_apply_file_edit(create_path, "created\n", None, None, Some(30_000))
         .await
         .expect("apply-file-edit create-missing-file call failed");
     assert!(
@@ -406,7 +428,7 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to remove parent-missing fixture root");
 
     let parent_missing_result = server
-        .test_apply_file_edit(parent_missing_path, "will-fail\n", None, Some(30_000))
+        .test_apply_file_edit(parent_missing_path, "will-fail\n", None, None, Some(30_000))
         .await
         .expect("apply-file-edit parent-missing call failed");
     assert!(
@@ -434,6 +456,7 @@ async fn test_mcp_tools_with_docker() {
             missing_conflict_path,
             "must-not-create\n",
             Some("1111111111111111111111111111111111111111111111111111111111111111"),
+            None,
             Some(30_000),
         )
         .await
@@ -638,6 +661,7 @@ async fn test_mcp_tools_with_docker() {
             new_text: Some("new".to_string()),
             replace_all: None,
             expected_sha256: None,
+            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -657,6 +681,7 @@ async fn test_mcp_tools_with_docker() {
             new_text: None,
             replace_all: Some(true),
             expected_sha256: None,
+            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -676,6 +701,7 @@ async fn test_mcp_tools_with_docker() {
             new_text: None,
             replace_all: None,
             expected_sha256: None,
+            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -695,6 +721,7 @@ async fn test_mcp_tools_with_docker() {
             new_text: Some("new".to_string()),
             replace_all: None,
             expected_sha256: None,
+            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -714,6 +741,7 @@ async fn test_mcp_tools_with_docker() {
             new_text: None,
             replace_all: Some(true),
             expected_sha256: None,
+            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -733,6 +761,7 @@ async fn test_mcp_tools_with_docker() {
             new_text: Some("replacement".to_string()),
             replace_all: Some(false),
             expected_sha256: None,
+            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -873,12 +902,13 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to create apply-file-edit fixture file");
 
-    let previous_hash = remote_sha256(&server, apply_path).await;
+    let (previous_hash, ticket) = read_file_ticket(&server, apply_path).await;
     let apply_ok_result = server
         .test_apply_file_edit(
             apply_path,
             "beta\n",
             Some(previous_hash.as_str()),
+            Some(ticket.as_str()),
             Some(30_000),
         )
         .await
@@ -923,11 +953,13 @@ async fn test_mcp_tools_with_docker() {
     );
 
     // 4a-9. Conflict hash mismatch must not modify file.
+    let (_conflict_hash, conflict_ticket) = read_file_ticket(&server, apply_path).await;
     let conflict_result = server
         .test_apply_file_edit(
             apply_path,
             "gamma\n",
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            Some(conflict_ticket.as_str()),
             Some(30_000),
         )
         .await
@@ -970,11 +1002,13 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to reset apply-file-edit race fixture file");
 
-    let race_expected = remote_sha256(&server, apply_path).await;
+    let (race_expected, race_ticket) = read_file_ticket(&server, apply_path).await;
     let server_a = server.clone();
     let server_b = server.clone();
     let race_expected_a = race_expected.clone();
     let race_expected_b = race_expected.clone();
+    let race_ticket_a = race_ticket.clone();
+    let race_ticket_b = race_ticket.clone();
 
     let (race_a_result, race_b_result) = tokio::join!(
         async move {
@@ -983,6 +1017,7 @@ async fn test_mcp_tools_with_docker() {
                     apply_path,
                     "race-a\n",
                     Some(race_expected_a.as_str()),
+                    Some(race_ticket_a.as_str()),
                     Some(30_000),
                 )
                 .await
@@ -993,6 +1028,7 @@ async fn test_mcp_tools_with_docker() {
                     apply_path,
                     "race-b\n",
                     Some(race_expected_b.as_str()),
+                    Some(race_ticket_b.as_str()),
                     Some(30_000),
                 )
                 .await
@@ -1053,11 +1089,13 @@ async fn test_mcp_tools_with_docker() {
 
     // 4a-11. Oversized new_content must be rejected before remote write.
     let oversized_new_content = "x".repeat(1_048_577);
+    let (_oversized_hash, oversized_ticket) = read_file_ticket(&server, apply_path).await;
     let oversized_apply_result = server
         .test_apply_file_edit(
             apply_path,
             oversized_new_content.as_str(),
             None,
+            Some(oversized_ticket.as_str()),
             Some(30_000),
         )
         .await
@@ -1102,12 +1140,13 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to create lock-error fixture");
 
-    let lock_error_hash = remote_sha256(&server, lock_error_file).await;
+    let (lock_error_hash, lock_error_ticket) = read_file_ticket(&server, lock_error_file).await;
     let lock_error_result = server
         .test_apply_file_edit(
             lock_error_file,
             "should-not-commit\n",
             Some(lock_error_hash.as_str()),
+            Some(lock_error_ticket.as_str()),
             Some(30_000),
         )
         .await
@@ -1144,12 +1183,13 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to create rollback fixture");
 
-    let rollback_hash = remote_sha256(&server, rollback_file).await;
+    let (rollback_hash, rollback_ticket) = read_file_ticket(&server, rollback_file).await;
     let rollback_failure_result = server
         .test_apply_file_edit_fail_before_finalize(
             rollback_file,
             "should-not-commit\n",
             Some(rollback_hash.as_str()),
+            Some(rollback_ticket.as_str()),
             Some(30_000),
         )
         .await
@@ -1216,12 +1256,14 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to create sha-unavailable fixture");
 
-    let sha_unavailable_hash_before = remote_sha256(&server, sha_unavailable_file).await;
+    let (sha_unavailable_hash_before, sha_unavailable_ticket) =
+        read_file_ticket(&server, sha_unavailable_file).await;
     let sha_unavailable_result = server
         .test_apply_file_edit_sha256_unavailable(
             sha_unavailable_file,
             "should-not-commit\n",
             Some(sha_unavailable_hash_before.as_str()),
+            Some(sha_unavailable_ticket.as_str()),
             Some(30_000),
         )
         .await
@@ -1283,6 +1325,187 @@ async fn test_mcp_tools_with_docker() {
         ))
         .await
         .expect("failed to clean sha-unavailable fixture");
+
+    // 4a-RT1. read-file response includes sha256 and read_ticket fields.
+    {
+        let rt_smoke_path = "/tmp/ssh-mcp-read-ticket-smoke.txt";
+        server
+            .test_execute_command(&format!(
+                "printf 'ticket-smoke\\n' > {}",
+                ssh_mcp::escape_for_shell(rt_smoke_path),
+            ))
+            .await
+            .expect("failed to create read-ticket smoke fixture");
+
+        let rt_read_result = server
+            .test_read_file(rt_smoke_path, None)
+            .await
+            .expect("read-file for ticket smoke failed");
+        let rt_text = extract_text_from_result(&rt_read_result);
+        let rt_json: serde_json::Value = serde_json::from_str(rt_text.trim())
+            .expect("read-file ticket smoke should be valid JSON");
+
+        assert!(
+            rt_json.get("sha256").and_then(|v| v.as_str()).is_some(),
+            "read-file response must include sha256 field"
+        );
+        let rt_ticket = rt_json
+            .get("read_ticket")
+            .and_then(|v| v.as_str())
+            .expect("read-file response must include read_ticket field");
+        assert!(
+            rt_ticket.starts_with("rt1."),
+            "read_ticket must start with version prefix: {rt_ticket}"
+        );
+        tracing::info!("read-file sha256 and read_ticket fields verified");
+    }
+
+    // 4a-RT2. Full mode edit on existing non-empty file WITHOUT read_ticket must fail.
+    {
+        let rt_enforce_path = "/tmp/ssh-mcp-read-ticket-enforce.txt";
+        server
+            .test_execute_command(&format!(
+                "printf 'enforce-content\\n' > {}",
+                ssh_mcp::escape_for_shell(rt_enforce_path),
+            ))
+            .await
+            .expect("failed to create enforcement fixture");
+
+        let enforce_result = server
+            .test_apply_file_edit(rt_enforce_path, "new-content\n", None, None, Some(30_000))
+            .await;
+
+        assert!(
+            enforce_result.is_err(),
+            "full-mode edit on non-empty file without read_ticket must be rejected"
+        );
+        let enforce_err = format!("{:?}", enforce_result.unwrap_err());
+        assert!(
+            enforce_err.contains("must be read before editing"),
+            "error should mention read-before-edit: {enforce_err}"
+        );
+        tracing::info!("read_ticket enforcement on non-empty file verified");
+    }
+
+    // 4a-RT3. Full mode edit on missing file without read_ticket should succeed.
+    {
+        let rt_create_dir = "/tmp/ssh-mcp-read-ticket-create";
+        let rt_create_path = "/tmp/ssh-mcp-read-ticket-create/new-file.txt";
+        server
+            .test_execute_command(&format!(
+                "sh -c 'set -eu; rm -rf -- {dir}; mkdir -p -- {dir}'",
+                dir = ssh_mcp::escape_for_shell(rt_create_dir),
+            ))
+            .await
+            .expect("failed to prepare read-ticket create fixture");
+
+        let create_result = server
+            .test_apply_file_edit(rt_create_path, "brand-new\n", None, None, Some(30_000))
+            .await
+            .expect("full-mode create without ticket should succeed");
+
+        assert!(
+            !create_result.is_error.unwrap_or(false),
+            "creating a missing file without read_ticket should succeed"
+        );
+        tracing::info!("read_ticket exemption for missing file verified");
+    }
+
+    // 4a-RT4. Full mode edit on empty (zero-byte) file without read_ticket should succeed.
+    {
+        let rt_empty_path = "/tmp/ssh-mcp-read-ticket-empty.txt";
+        server
+            .test_execute_command(&format!(
+                "sh -c 'set -eu; : > {}'",
+                ssh_mcp::escape_for_shell(rt_empty_path),
+            ))
+            .await
+            .expect("failed to create zero-byte fixture");
+
+        let empty_result = server
+            .test_apply_file_edit(rt_empty_path, "now-has-content\n", None, None, Some(30_000))
+            .await
+            .expect("full-mode edit on empty file without ticket should succeed");
+
+        assert!(
+            !empty_result.is_error.unwrap_or(false),
+            "editing a zero-byte file without read_ticket should succeed"
+        );
+        tracing::info!("read_ticket exemption for zero-byte file verified");
+    }
+
+    // 4a-RT5. Full mode edit with valid read_ticket on non-empty file should succeed.
+    {
+        let rt_valid_path = "/tmp/ssh-mcp-read-ticket-valid.txt";
+        server
+            .test_execute_command(&format!(
+                "printf 'original\\n' > {}",
+                ssh_mcp::escape_for_shell(rt_valid_path),
+            ))
+            .await
+            .expect("failed to create valid-ticket fixture");
+
+        let (valid_sha, valid_ticket) = read_file_ticket(&server, rt_valid_path).await;
+        let valid_result = server
+            .test_apply_file_edit(
+                rt_valid_path,
+                "updated\n",
+                Some(valid_sha.as_str()),
+                Some(valid_ticket.as_str()),
+                Some(30_000),
+            )
+            .await
+            .expect("full-mode edit with valid ticket should succeed");
+
+        assert!(
+            !valid_result.is_error.unwrap_or(false),
+            "editing with valid read_ticket should succeed"
+        );
+        let valid_text = extract_text_from_result(&valid_result);
+        let valid_json: serde_json::Value = serde_json::from_str(valid_text.trim())
+            .expect("valid-ticket edit response should be valid JSON");
+        assert_eq!(
+            valid_json.get("changed").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        tracing::info!("read_ticket valid ticket flow verified");
+    }
+
+    // 4a-RT6. Full mode edit with wrong read_ticket (different path) must fail.
+    {
+        let rt_wrong_path_a = "/tmp/ssh-mcp-read-ticket-wrong-a.txt";
+        let rt_wrong_path_b = "/tmp/ssh-mcp-read-ticket-wrong-b.txt";
+        server
+            .test_execute_command(&format!(
+                "sh -c 'printf \"aaa\\n\" > {}; printf \"bbb\\n\" > {}'",
+                ssh_mcp::escape_for_shell(rt_wrong_path_a),
+                ssh_mcp::escape_for_shell(rt_wrong_path_b),
+            ))
+            .await
+            .expect("failed to create wrong-ticket fixtures");
+
+        let (_sha_a, ticket_a) = read_file_ticket(&server, rt_wrong_path_a).await;
+        let wrong_result = server
+            .test_apply_file_edit(
+                rt_wrong_path_b,
+                "should-fail\n",
+                None,
+                Some(ticket_a.as_str()),
+                Some(30_000),
+            )
+            .await;
+
+        assert!(
+            wrong_result.is_err(),
+            "using read_ticket from a different path must be rejected"
+        );
+        let wrong_err = format!("{:?}", wrong_result.unwrap_err());
+        assert!(
+            wrong_err.contains("verification failed"),
+            "error should mention verification failure: {wrong_err}"
+        );
+        tracing::info!("read_ticket wrong-path rejection verified");
+    }
 
     // 4b. Foreground timeout should auto-detach without killing remote command.
     // We use a small timeout (>= 1s) to force the detach path.

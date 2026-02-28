@@ -45,13 +45,13 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │   ├── tools.rs            # MCP tool schemas and documentation
 │   │   ├── args.rs             # Common tool argument parsing
 │   │   ├── exec.rs             # Shared background execution (exec/sudo-exec deduplication)
-│   │   ├── validation/         # Validation helpers (NEW from refactoring)
+│   │   ├── validation/         # Validation helpers
 │   │   │   ├── mod.rs          # Module exports
 │   │   │   ├── read_file.rs    # Read-file specific validation
 │   │   │   ├── apply_file_edit.rs # Apply-file-edit validation & constants
 │   │   │   └── common.rs       # Common validation utilities
-│   │   ├── testing.rs          # Test helper methods for integration tests (NEW)
-│   │   └── handlers/           # MCP tool handlers (NEW from refactoring)
+│   │   ├── testing.rs          # Test helper methods for integration tests
+│   │   └── handlers/           # MCP tool handlers
 │   │       ├── mod.rs          # Module exports
 │   │       ├── check_process.rs # check-process tool handler
 │   │       ├── read_file.rs    # read-file tool handler

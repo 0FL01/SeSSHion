@@ -33,8 +33,8 @@ async fn test_fallback_from_rsync_to_sftp() {
 
     let (_key_dir, key_path) = setup_test_key();
 
-    // Start SSH container (Alpine-based, no rsync installed)
-    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+    // Start SSH container (Debian-based, no rsync installed)
+    let container = GenericImage::new("ssh-mcp-debian-sshd-norsync", "latest")
         .with_exposed_port(2222u16.into())
         .start()
         .await
@@ -165,8 +165,8 @@ async fn test_fallback_from_rsync_to_scp() {
 
     let (_key_dir, key_path) = setup_test_key();
 
-    // Start SSH container (Alpine-based, no rsync installed)
-    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+    // Start SSH container (Debian-based, no rsync installed)
+    let container = GenericImage::new("ssh-mcp-debian-sshd-norsync", "latest")
         .with_exposed_port(2222u16.into())
         .start()
         .await
@@ -581,6 +581,128 @@ async fn test_fallback_all_the_way_to_execraw() {
     assert!(
         verify2_text.contains("hello via Auto transport fallback"),
         "remote file should contain expected content after Auto transport"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&local_base);
+}
+
+/// Test that fallback tries all transports on generic errors.
+/// This test verifies that when SFTP fails with a generic error (e.g., permission denied),
+/// the system continues to try SCP and ExecRaw rather than breaking early.
+#[tokio::test]
+async fn test_fallback_tries_all_on_generic_error() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    // Skip if local tools are not available
+    if !check_sftp() || !check_scp() {
+        tracing::warn!("skipping: local tools unavailable");
+        return;
+    }
+
+    let (_key_dir, key_path) = setup_test_key();
+
+    // Start SSH container
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let config = Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: None,
+        key: Some(key_path),
+        su_password: None,
+        sudo_password: None,
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        max_output_tokens: Some(12000),
+        disable_sudo: true,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+    };
+
+    let server = SshMcpServer::new(config)
+        .await
+        .expect("Failed to create SshMcpServer");
+
+    // Create local file
+    let unique = format!("{}-fallback-generic-error", std::process::id());
+    let local_base = PathBuf::from("target/tmp").join(&unique);
+    std::fs::create_dir_all(&local_base).expect("create local base");
+
+    let local_file = local_base.join("hello.txt");
+    std::fs::write(&local_file, "content\n").expect("write local file");
+
+    // We intentionally write to a location where 'test' user has no permissions.
+    // This will cause a generic error (Permission denied) in SFTP.
+    // If the bug exists, Auto transport will fail immediately and not try SCP/ExecRaw.
+    // If fixed, it should try ALL transports and the final error should list all of them.
+    let remote_file = "/root/secret_file.txt".to_string();
+
+    let resp = server
+        .test_transfer(TransferParams {
+            operation: TransferOperation::Put,
+            local_path: local_file.to_string_lossy().to_string(),
+            remote_path: remote_file,
+            transport: TransferTransport::Auto,
+            kind: Some(TransferKind::File),
+            overwrite: true,
+            timeout_ms: Some(30000),
+            verbose: false,
+            ..Default::default()
+        })
+        .await;
+
+    // It should fail because we don't have permissions to write to /root
+    assert!(!resp.ok, "Transfer should fail due to permission denied");
+
+    let error_msg = resp.error.unwrap_or_default();
+
+    // If the fix is applied, the error message should indicate that multiple transports were tried.
+    // For example, it should collect "failed_reasons" which includes Sftp, Scp, Rsync, and ExecRaw.
+    let tries_sftp = error_msg.contains("Sftp");
+    let tries_scp = error_msg.contains("Scp");
+    let tries_rsync = error_msg.contains("Rsync");
+    let tries_exec_raw = error_msg.contains("ExecRaw");
+
+    assert!(
+        tries_sftp,
+        "Should try Sftp first. Actual error: {}",
+        error_msg
+    );
+    assert!(
+        tries_scp,
+        "Should try Scp after Sftp fails with generic error. Bug: breaks early. Actual error: {}",
+        error_msg
+    );
+    assert!(
+        tries_rsync,
+        "Should try Rsync after Scp fails. Actual error: {}",
+        error_msg
+    );
+    assert!(
+        tries_exec_raw,
+        "Should try ExecRaw after Rsync fails. Actual error: {}",
+        error_msg
     );
 
     server.shutdown().await;

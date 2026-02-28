@@ -155,6 +155,7 @@ impl TransferEngine {
         };
 
         let mut unsupported_reasons: Vec<String> = Vec::new();
+        let mut failed_reasons: Vec<String> = Vec::new();
 
         for transport in transports {
             response.transport_used = transport;
@@ -226,13 +227,15 @@ impl TransferEngine {
                     response.ok = true;
                     break;
                 }
-                Err(TransportAttemptError::Unsupported { transport, reason })
-                    if response.params.transport == TransferTransport::Auto =>
-                {
+                Err(TransportAttemptError::Unsupported { transport, reason }) => {
                     unsupported_reasons.push(format!("{transport:?}: {reason}"));
                     continue;
                 }
                 Err(e) => {
+                    if response.params.transport == TransferTransport::Auto {
+                        failed_reasons.push(format!("{transport:?}: {e}"));
+                        continue;
+                    }
                     response.set_error(&e.to_string());
                     break;
                 }
@@ -243,12 +246,18 @@ impl TransferEngine {
             && response.error.is_none()
             && response.params.transport == TransferTransport::Auto
         {
-            if unsupported_reasons.is_empty() {
+            // If we have both unsupported and failed errors, include all of them
+            let all_reasons: Vec<String> = unsupported_reasons
+                .into_iter()
+                .chain(failed_reasons)
+                .collect();
+
+            if all_reasons.is_empty() {
                 response.set_error("all transfer transports failed");
             } else {
                 response.set_error(&format!(
-                    "all auto transports were unsupported: {}",
-                    unsupported_reasons.join("; ")
+                    "all auto transports failed: {}",
+                    all_reasons.join("; ")
                 ));
             }
         }

@@ -149,40 +149,26 @@ pub fn setup_test_key() -> (tempfile::TempDir, std::path::PathBuf) {
 
 /// Check if sftp is available locally
 pub fn check_sftp() -> bool {
-    match std::process::Command::new("sftp").arg("-V").output() {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
-            tracing::warn!(
-                "local 'sftp' exists but '-V' failed (status={}); treating as unavailable",
-                out.status
-            );
-            false
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            tracing::warn!("failed to spawn local 'sftp -V': {e}; treating as unavailable");
-            false
-        }
-    }
+    // OpenSSH sftp doesn't have a -V flag, just check if it can be spawned
+    std::process::Command::new("sftp")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|_| true)
+        .unwrap_or(false)
 }
 
 /// Check if scp is available locally
 pub fn check_scp() -> bool {
-    match std::process::Command::new("scp").arg("-V").output() {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
-            tracing::warn!(
-                "local 'scp' exists but '-V' failed (status={}); treating as unavailable",
-                out.status
-            );
-            false
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            tracing::warn!("failed to spawn local 'scp -V': {e}; treating as unavailable");
-            false
-        }
-    }
+    // OpenSSH scp doesn't have a -V flag, just check if it can be spawned
+    std::process::Command::new("scp")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|_| true)
+        .unwrap_or(false)
 }
 
 /// Check if rsync is available locally

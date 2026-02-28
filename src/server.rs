@@ -3,7 +3,7 @@
 //! This module provides the main MCP server that integrates SSH connection
 //! management with the `exec` and `sudo-exec` tools.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
@@ -38,24 +38,32 @@ use crate::ssh::{
     wrap_sudo_command,
 };
 use crate::ticket::{DEFAULT_TICKET_TTL_SECS, TicketSigner};
+use crate::server::validation::{
+    apply_file_edit_too_large_error, apply_read_file_window, build_read_file_remote_failure,
+    estimate_tokens_from_bytes, extract_text_from_call_tool_result,
+    has_apply_file_edit_conflict_marker, normalize_sha256_hex,
+    parse_apply_file_edit_error_marker, parse_apply_file_edit_marker_value,
+    parse_read_file_error_marker, read_file_too_large_error,
+    resolve_read_file_line_limit, resolve_read_file_max_bytes,
+    sanitize_read_file_stderr_snippet, validate_background_log_path,
+    validate_read_file_path, APPLY_FILE_EDIT_HARD_MAX_BYTES, SHA256_HEX_LEN,
+};
+#[cfg(test)]
+use crate::server::validation::{
+    READ_FILE_BYTES_PER_TOKEN, READ_FILE_DEFAULT_PREVIEW_LINES, READ_FILE_HARD_MAX_BYTES,
+    READ_FILE_MAX_LINE_WINDOW,
+};
 use crate::tools::{ApplyFileEditParams, CheckProcessParams, ReadFileMode, ReadFileParams};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
-use crate::validate::validate_basic_path_str;
 
 mod args;
 mod exec;
 mod tools;
+mod validation;
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_FILE_ERROR_MARKER: &str = "__SSH_MCP_READ_FILE_ERR__";
 const APPLY_FILE_EDIT_ERROR_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_ERR__";
-const READ_FILE_BYTES_PER_TOKEN: usize = 4;
-const READ_FILE_HARD_MAX_BYTES: usize = 1024 * 1024;
-const READ_FILE_DEFAULT_PREVIEW_LINES: usize = 800;
-const READ_FILE_MAX_LINE_WINDOW: usize = 10_000;
-const READ_FILE_STDERR_SNIPPET_LIMIT_CHARS: usize = 256;
-const SHA256_HEX_LEN: usize = 64;
-const APPLY_FILE_EDIT_HARD_MAX_BYTES: usize = 1024 * 1024;
 const APPLY_FILE_EDIT_PREVIOUS_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_PREVIOUS_SHA__";
 const APPLY_FILE_EDIT_NEW_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_NEW_SHA__";
 const APPLY_FILE_EDIT_ACTUAL_SHA_MARKER: &str = "__SSH_MCP_APPLY_FILE_EDIT_ACTUAL_SHA__";
@@ -117,298 +125,7 @@ fn build_background_wrapper_script(
     }
 }
 
-fn validate_background_log_path(
-    base_dir: &Path,
-    log_path: &str,
-) -> std::result::Result<(), String> {
-    validate_basic_path_str(log_path, "log_path")?;
 
-    // Current semantics: log_path is a LOCAL path on the MCP server.
-    // Keep it in a single, fixed spool directory to avoid arbitrary local writes.
-    let path = Path::new(log_path);
-    if !path.is_absolute() {
-        return Err("log_path must be an absolute path".to_string());
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-    {
-        return Err("log_path must not contain '.' or '..' path components".to_string());
-    }
-
-    if path.parent() != Some(base_dir) {
-        return Err(format!(
-            "log_path must be directly under {}",
-            base_dir.display()
-        ));
-    }
-    if path.extension().and_then(|s| s.to_str()) != Some("log") {
-        return Err("log_path must have a .log extension".to_string());
-    }
-
-    Ok(())
-}
-
-fn validate_read_file_path(remote_path: &str) -> std::result::Result<(), String> {
-    validate_basic_path_str(remote_path, "remote_path")?;
-
-    if !remote_path.starts_with('/') {
-        return Err("remote_path must be an absolute path".to_string());
-    }
-
-    if remote_path.ends_with('/') {
-        return Err("remote_path must not end with '/'".to_string());
-    }
-
-    Ok(())
-}
-
-fn parse_read_file_error_marker(stderr: &str) -> Option<&str> {
-    stderr.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(READ_FILE_ERROR_MARKER)
-            .map(str::trim)
-    })
-}
-
-fn parse_apply_file_edit_error_marker(stderr: &str) -> Option<&str> {
-    parse_apply_file_edit_marker_value(stderr, APPLY_FILE_EDIT_ERROR_MARKER)
-}
-
-fn parse_apply_file_edit_marker_value<'a>(stderr: &'a str, prefix: &str) -> Option<&'a str> {
-    stderr.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(prefix)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    })
-}
-
-fn has_apply_file_edit_conflict_marker(stderr: &str) -> bool {
-    stderr
-        .lines()
-        .any(|line| line.trim() == APPLY_FILE_EDIT_CONFLICT_MARKER)
-}
-
-fn extract_text_from_call_tool_result(result: &CallToolResult) -> String {
-    let mut combined = String::new();
-
-    for item in &result.content {
-        if let Some(text) = item.raw.as_text() {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(&text.text);
-        }
-    }
-
-    combined
-}
-
-fn normalize_sha256_hex(value: &str, field: &str) -> std::result::Result<String, String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.len() != SHA256_HEX_LEN {
-        return Err(format!(
-            "{field} must be a {SHA256_HEX_LEN}-character lowercase hex string"
-        ));
-    }
-    if !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(format!(
-            "{field} must be a {SHA256_HEX_LEN}-character lowercase hex string"
-        ));
-    }
-
-    Ok(normalized)
-}
-
-fn resolve_read_file_max_bytes(max_output_tokens: Option<usize>) -> usize {
-    max_output_tokens
-        .and_then(|tokens| tokens.checked_mul(READ_FILE_BYTES_PER_TOKEN))
-        .filter(|bytes| *bytes > 0)
-        .unwrap_or(READ_FILE_HARD_MAX_BYTES)
-        .min(READ_FILE_HARD_MAX_BYTES)
-}
-
-fn estimate_tokens_from_bytes(byte_len: usize) -> usize {
-    byte_len.saturating_add(READ_FILE_BYTES_PER_TOKEN.saturating_sub(1)) / READ_FILE_BYTES_PER_TOKEN
-}
-
-fn resolve_read_file_line_limit(
-    mode: ReadFileMode,
-    lines: Option<usize>,
-) -> std::result::Result<Option<usize>, String> {
-    match mode {
-        ReadFileMode::Full => Ok(None),
-        ReadFileMode::Preview | ReadFileMode::Head | ReadFileMode::Tail => {
-            let value = lines.unwrap_or(READ_FILE_DEFAULT_PREVIEW_LINES);
-            if value == 0 {
-                return Err("lines must be a positive integer".to_string());
-            }
-            if value > READ_FILE_MAX_LINE_WINDOW {
-                return Err(format!("lines must be <= {READ_FILE_MAX_LINE_WINDOW}"));
-            }
-            Ok(Some(value))
-        }
-    }
-}
-
-fn read_file_line_starts(content: &str) -> Vec<usize> {
-    let mut starts = Vec::new();
-    if content.is_empty() {
-        return starts;
-    }
-
-    starts.push(0);
-    for (idx, byte) in content.bytes().enumerate() {
-        if byte == b'\n' {
-            let next = idx.saturating_add(1);
-            if next < content.len() {
-                starts.push(next);
-            }
-        }
-    }
-
-    starts
-}
-
-fn read_file_line_count(content: &str) -> usize {
-    if content.is_empty() {
-        return 0;
-    }
-
-    let newline_count = content.bytes().filter(|byte| *byte == b'\n').count();
-    if content.ends_with('\n') {
-        newline_count
-    } else {
-        newline_count.saturating_add(1)
-    }
-}
-
-fn build_read_file_hint(mode: ReadFileMode, line_limit: usize, truncated: bool) -> Option<String> {
-    match mode {
-        ReadFileMode::Preview => Some(format!(
-            "Preview mode returns up to {line_limit} lines. Re-run with mode=\"full\" to read the entire file, or mode=\"tail\" to inspect the file end"
-        )),
-        ReadFileMode::Head | ReadFileMode::Tail if truncated => Some(format!(
-            "Output truncated to {line_limit} lines in {} mode. Re-run with mode=\"full\" to read the entire file",
-            mode.as_str()
-        )),
-        _ => None,
-    }
-}
-
-struct ReadFileWindow {
-    content: String,
-    returned_lines: usize,
-    truncated: bool,
-    hint: Option<String>,
-}
-
-fn apply_read_file_window(
-    content: &str,
-    mode: ReadFileMode,
-    line_limit: Option<usize>,
-) -> ReadFileWindow {
-    if matches!(mode, ReadFileMode::Full) {
-        return ReadFileWindow {
-            content: content.to_string(),
-            returned_lines: read_file_line_count(content),
-            truncated: false,
-            hint: None,
-        };
-    }
-
-    let limit = line_limit.unwrap_or(READ_FILE_DEFAULT_PREVIEW_LINES);
-    let line_starts = read_file_line_starts(content);
-    let total_lines = line_starts.len();
-    let returned_lines = total_lines.min(limit);
-    let truncated = total_lines > returned_lines;
-
-    let content_slice = if matches!(mode, ReadFileMode::Tail) {
-        let start = if returned_lines >= total_lines {
-            0
-        } else {
-            line_starts[total_lines - returned_lines]
-        };
-        content[start..].to_string()
-    } else {
-        let end = if returned_lines >= total_lines {
-            content.len()
-        } else {
-            line_starts[returned_lines]
-        };
-        content[..end].to_string()
-    };
-
-    ReadFileWindow {
-        content: content_slice,
-        returned_lines,
-        truncated,
-        hint: build_read_file_hint(mode, limit, truncated),
-    }
-}
-
-fn read_file_too_large_error(max_bytes: usize) -> String {
-    format!(
-        "Error: remote file exceeds read-file size limit ({max_bytes} bytes). Use transfer for large files"
-    )
-}
-
-fn apply_file_edit_too_large_error(max_bytes: usize) -> String {
-    format!(
-        "Error: new_content exceeds apply-file-edit size limit ({max_bytes} bytes). Use transfer for large files"
-    )
-}
-
-fn sanitize_read_file_stderr_snippet(stderr: &str) -> Option<String> {
-    let mut snippet = String::new();
-    let mut truncated = false;
-    let mut prev_space = false;
-    let mut char_count = 0usize;
-
-    for ch in stderr.trim().chars() {
-        if char_count >= READ_FILE_STDERR_SNIPPET_LIMIT_CHARS {
-            truncated = true;
-            break;
-        }
-
-        let normalized = if ch.is_control() { ' ' } else { ch };
-        if normalized.is_whitespace() {
-            if !prev_space {
-                snippet.push(' ');
-                prev_space = true;
-                char_count = char_count.saturating_add(1);
-            }
-        } else {
-            snippet.push(normalized);
-            prev_space = false;
-            char_count = char_count.saturating_add(1);
-        }
-    }
-
-    let mut normalized = snippet.trim().to_string();
-    if normalized.is_empty() {
-        return None;
-    }
-    if truncated {
-        normalized.push_str("...");
-    }
-
-    Some(normalized)
-}
-
-fn build_read_file_remote_failure(exit_code: Option<u32>, stderr: &str) -> String {
-    let mut message = match exit_code {
-        Some(code) => format!("Error reading file: remote command failed with exit_code={code}"),
-        None => "Error reading file: remote command did not provide an exit status".to_string(),
-    };
-
-    if let Some(snippet) = sanitize_read_file_stderr_snippet(stderr) {
-        message.push_str(&format!("; stderr={snippet}"));
-    }
-
-    message
-}
 
 /// SSH MCP Server
 ///

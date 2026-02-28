@@ -32,7 +32,6 @@ use crate::config::Config;
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
-use crate::server::validation::validate_background_log_path;
 #[cfg(test)]
 use crate::server::validation::read_file::{
     READ_FILE_BYTES_PER_TOKEN, READ_FILE_DEFAULT_PREVIEW_LINES, READ_FILE_HARD_MAX_BYTES,
@@ -43,13 +42,16 @@ use crate::server::validation::read_file::{
     apply_read_file_window, estimate_tokens_from_bytes, resolve_read_file_line_limit,
     resolve_read_file_max_bytes,
 };
+use crate::server::validation::validate_background_log_path;
 use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{
-    CommandOutput, SshConfig, SshConnectionManager, sanitize_command,
-    wrap_sudo_command,
+    CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
 use crate::ticket::TicketSigner;
-use crate::tools::{ApplyFileEditParams, ApplyFileEditFaultInjection, CheckProcessParams, ReadFileMode, ReadFileParams};
+use crate::tools::{
+    ApplyFileEditFaultInjection, ApplyFileEditParams, CheckProcessParams, ReadFileMode,
+    ReadFileParams,
+};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 mod args;
@@ -768,9 +770,8 @@ impl SshMcpServer {
         args: serde_json::Map<String, serde_json::Value>,
         tool_name: &str,
     ) -> std::result::Result<T, McpError> {
-        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-            McpError::invalid_params(format!("invalid {tool_name} params: {e}"), None)
-        })
+        serde_json::from_value(serde_json::Value::Object(args))
+            .map_err(|e| McpError::invalid_params(format!("invalid {tool_name} params: {e}"), None))
     }
 
     /// Execute transfer tool with connection management and JSON serialization.
@@ -789,9 +790,9 @@ impl SshMcpServer {
                 self.transfer.local_root(),
                 &format!("SSH connection error: {e}"),
             );
-            let body = resp.to_json(verbose).unwrap_or_else(|_| {
-                "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
-            });
+            let body = resp
+                .to_json(verbose)
+                .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization_error\"}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(body)]));
         }
 
@@ -811,9 +812,9 @@ impl SshMcpServer {
                 },
             )
             .await;
-        let body = resp.to_json(verbose).unwrap_or_else(|_| {
-            "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
-        });
+        let body = resp
+            .to_json(verbose)
+            .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization_error\"}".to_string());
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }

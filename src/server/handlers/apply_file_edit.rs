@@ -7,13 +7,18 @@ use tracing::{debug, error};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
 use crate::server::SshMcpServer;
+use crate::server::make_job_id;
 use crate::server::validation::apply_file_edit::*;
 use crate::server::validation::common::extract_text_from_call_tool_result;
-use crate::server::validation::read_file::{normalize_sha256_hex, sanitize_read_file_stderr_snippet};
 use crate::server::validation::common::validate_read_file_path;
-use crate::server::make_job_id;
+use crate::server::validation::read_file::{
+    normalize_sha256_hex, sanitize_read_file_stderr_snippet,
+};
 use crate::shell_escape::escape_for_shell;
-use crate::tools::{ApplyFileEditParams, ApplyFileEditMode, ApplyFileEditFaultInjection, ReadFileMode, ReadFileParams};
+use crate::tools::{
+    ApplyFileEditFaultInjection, ApplyFileEditMode, ApplyFileEditParams, ReadFileMode,
+    ReadFileParams,
+};
 
 impl SshMcpServer {
     pub(in crate::server) async fn execute_apply_file_edit(

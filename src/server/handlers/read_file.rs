@@ -6,14 +6,12 @@ use tracing::{debug, error};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
 use crate::server::SshMcpServer;
-use crate::server::validation::{
-    parse_read_file_error_marker, validate_read_file_path,
-};
 use crate::server::validation::read_file::*;
-use crate::server::{make_job_id, READ_FILE_ERROR_MARKER};
+use crate::server::validation::{parse_read_file_error_marker, validate_read_file_path};
+use crate::server::{READ_FILE_ERROR_MARKER, make_job_id};
+use crate::ssh::escape_for_shell;
 use crate::ticket::DEFAULT_TICKET_TTL_SECS;
 use crate::tools::ReadFileParams;
-use crate::ssh::escape_for_shell;
 
 impl SshMcpServer {
     /// Execute read-file tool
@@ -85,8 +83,7 @@ impl SshMcpServer {
         let escaped_path = escape_for_shell(&remote_path);
         let read_cmd = format!(
             r#"sh -c 'set -eu; p=$1; max_bytes=$2; if [ ! -e "$p" ]; then printf "%s\n" "{}not_found" >&2; exit 1; fi; if [ ! -f "$p" ]; then printf "%s\n" "{}not_regular_file" >&2; exit 1; fi; head -c "$((max_bytes + 1))" < "$p"' sh '{escaped_path}' '{max_read_bytes}'"#,
-            READ_FILE_ERROR_MARKER,
-            READ_FILE_ERROR_MARKER,
+            READ_FILE_ERROR_MARKER, READ_FILE_ERROR_MARKER,
         );
 
         let mut empty_stdin = tokio::io::empty();

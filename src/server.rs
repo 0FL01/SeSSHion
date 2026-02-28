@@ -754,6 +754,68 @@ impl SshMcpServer {
     pub fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         tools::get_tool_documentation(tool_name)
     }
+
+    /// Resolve timeout duration from optional milliseconds, falling back to server default.
+    fn resolve_timeout(&self, timeout_ms: Option<u64>) -> Duration {
+        timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout)
+    }
+
+    /// Parse tool parameters from JSON with standardized error handling.
+    fn parse_tool_params<T: serde::de::DeserializeOwned>(
+        &self,
+        args: serde_json::Map<String, serde_json::Value>,
+        tool_name: &str,
+    ) -> std::result::Result<T, McpError> {
+        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
+            McpError::invalid_params(format!("invalid {tool_name} params: {e}"), None)
+        })
+    }
+
+    /// Execute transfer tool with connection management and JSON serialization.
+    async fn execute_transfer(
+        &self,
+        params: TransferParams,
+        verbose: bool,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let timeout = self.resolve_timeout(params.timeout_ms);
+        let key_path = self.config.key.clone();
+
+        // Ensure connection is established (so errors are deterministic).
+        if let Err(e) = self.connection.ensure_connected().await {
+            let resp = crate::transfer::TransferResponse::error(
+                params,
+                self.transfer.local_root(),
+                &format!("SSH connection error: {e}"),
+            );
+            let body = resp.to_json(verbose).unwrap_or_else(|_| {
+                "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
+            });
+            return Ok(CallToolResult::success(vec![Content::text(body)]));
+        }
+
+        let resp = self
+            .transfer
+            .run(
+                &self.connection,
+                params,
+                TransferRunContext {
+                    timeout,
+                    ssh: TransferSshOptions {
+                        host: self.config.host.clone(),
+                        port: self.config.port,
+                        user: self.config.user.clone(),
+                        key_path,
+                    },
+                },
+            )
+            .await;
+        let body = resp.to_json(verbose).unwrap_or_else(|_| {
+            "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
+        });
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
 }
 
 impl ServerHandler for SshMcpServer {
@@ -814,26 +876,23 @@ impl ServerHandler for SshMcpServer {
         match tool_name {
             "exec" => {
                 let parsed = self.parse_common_tool_args(&args)?;
+                let timeout = self.resolve_timeout(parsed.timeout_ms);
 
                 if parsed.background {
                     self.execute_background_command(&parsed.command, parsed.log_path.as_deref())
                         .await
                 } else {
-                    let timeout = parsed
-                        .timeout_ms
-                        .map(Duration::from_millis)
-                        .unwrap_or(self.timeout);
                     self.execute_command_with_timeout(&parsed.command, timeout)
                         .await
                 }
             }
             "sudo_exec" | "sudo-exec" => {
-                // Check if sudo is enabled
                 if self.config.disable_sudo {
                     return Err(McpError::invalid_params("sudo-exec tool is disabled", None));
                 }
 
                 let parsed = self.parse_common_tool_args(&args)?;
+                let timeout = self.resolve_timeout(parsed.timeout_ms);
 
                 if parsed.background {
                     self.execute_background_sudo_command(
@@ -842,89 +901,26 @@ impl ServerHandler for SshMcpServer {
                     )
                     .await
                 } else {
-                    let timeout = parsed
-                        .timeout_ms
-                        .map(Duration::from_millis)
-                        .unwrap_or(self.timeout);
                     self.execute_sudo_command_with_timeout(&parsed.command, timeout)
                         .await
                 }
             }
             "transfer" => {
-                let params: TransferParams =
-                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                        McpError::invalid_params(format!("invalid transfer params: {e}"), None)
-                    })?;
-
-                let timeout = params
-                    .timeout_ms
-                    .map(Duration::from_millis)
-                    .unwrap_or(self.timeout);
-
-                let key_path = self.config.key.clone();
-
-                // Store verbose flag before params is moved
+                let params: TransferParams = self.parse_tool_params(args, "transfer")?;
                 let verbose = params.verbose;
-
-                // Ensure connection is established (so errors are deterministic).
-                if let Err(e) = self.connection.ensure_connected().await {
-                    let resp = crate::transfer::TransferResponse::error(
-                        params,
-                        self.transfer.local_root(),
-                        &format!("SSH connection error: {e}"),
-                    );
-                    let body = resp.to_json(verbose).unwrap_or_else(|_| {
-                        "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
-                    });
-                    return Ok(CallToolResult::success(vec![Content::text(body)]));
-                }
-
-                let resp = self
-                    .transfer
-                    .run(
-                        &self.connection,
-                        params,
-                        TransferRunContext {
-                            timeout,
-                            ssh: TransferSshOptions {
-                                host: self.config.host.clone(),
-                                port: self.config.port,
-                                user: self.config.user.clone(),
-                                key_path,
-                            },
-                        },
-                    )
-                    .await;
-                let body = resp.to_json(verbose).unwrap_or_else(|_| {
-                    "{\"ok\":false,\"error\":\"serialization_error\"}".to_string()
-                });
-                Ok(CallToolResult::success(vec![Content::text(body)]))
+                self.execute_transfer(params, verbose).await
             }
             "check-process" | "check_process" => {
-                let params: CheckProcessParams =
-                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                        McpError::invalid_params(format!("invalid check-process params: {e}"), None)
-                    })?;
-
+                let params: CheckProcessParams = self.parse_tool_params(args, "check-process")?;
                 self.execute_check_process(params).await
             }
             "read-file" | "read_file" => {
-                let params: ReadFileParams =
-                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                        McpError::invalid_params(format!("invalid read-file params: {e}"), None)
-                    })?;
-
+                let params: ReadFileParams = self.parse_tool_params(args, "read-file")?;
                 self.execute_read_file(params).await
             }
             "apply-file-edit" | "apply_file_edit" => {
                 let params: ApplyFileEditParams =
-                    serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                        McpError::invalid_params(
-                            format!("invalid apply-file-edit params: {e}"),
-                            None,
-                        )
-                    })?;
-
+                    self.parse_tool_params(args, "apply-file-edit")?;
                 self.execute_apply_file_edit(params, ApplyFileEditFaultInjection::None)
                     .await
             }

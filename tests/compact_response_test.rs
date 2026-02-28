@@ -16,7 +16,7 @@ fn sample_params() -> TransferParams {
         operation: TransferOperation::Put,
         local_path: "config.yml".to_string(),
         remote_path: "/etc/app/config.yml".to_string(),
-        transport: TransferTransport::ExecRaw,
+        transport: TransferTransport::Auto,
         kind: Some(TransferKind::File),
         overwrite: true,
         timeout_ms: Some(30000),
@@ -42,6 +42,11 @@ fn sample_success_response() -> TransferResponse {
         params: sample_params(),
         kind: Some(TransferKind::File),
         transport_used: TransferTransport::ExecRaw,
+        fallback_chain: vec![
+            TransferTransport::Rsync,
+            TransferTransport::Sftp,
+            TransferTransport::ExecRaw,
+        ],
         remote_home: Some("/home/user".to_string()),
         local_root: "/tmp/test".to_string(),
         resolved_paths: Some(ResolvedPaths {
@@ -74,6 +79,7 @@ fn sample_error_response() -> TransferResponse {
         params: sample_params(),
         kind: None,
         transport_used: TransferTransport::ExecRaw,
+        fallback_chain: vec![TransferTransport::ExecRaw],
         remote_home: None,
         local_root: "/tmp/test".to_string(),
         resolved_paths: None,
@@ -166,11 +172,19 @@ fn test_to_json_false_excludes_verbose_fields() {
         .expect("JSON serialization should succeed");
     let json: serde_json::Value = serde_json::from_str(&json_str).expect("Should parse as JSON");
 
-    // Verify verbose fields are NOT present in non-verbose mode
-    assert!(
-        json.get("transport_used").is_none(),
-        "transport_used should not be in compact JSON"
+    // transport_used should be present in compact JSON (agents need it for caching)
+    assert_eq!(
+        json["transport_used"].as_str(),
+        Some("exec-raw"),
+        "transport_used should be present in compact JSON"
     );
+    // fallback_chain should be present if non-empty
+    assert!(
+        json.get("fallback_chain").is_some(),
+        "fallback_chain should be present when non-empty"
+    );
+
+    // Verify verbose fields are NOT present in non-verbose mode
     assert!(
         json.get("staging").is_none(),
         "staging should not be in compact JSON"
@@ -268,7 +282,7 @@ fn test_to_json_true_includes_all_fields() {
     assert_eq!(params["local_path"].as_str(), Some("config.yml"));
     assert_eq!(params["remote_path"].as_str(), Some("/etc/app/config.yml"));
     assert_eq!(params["operation"].as_str(), Some("put"));
-    assert_eq!(params["transport"].as_str(), Some("exec-raw"));
+    assert_eq!(params["transport"].as_str(), Some("auto"));
 
     // Verify resolved_paths is present
     assert!(
@@ -360,6 +374,92 @@ fn test_compact_response_counts_skipped_when_none() {
 }
 
 #[test]
+fn test_fallback_chain_absent_for_explicit_transport() {
+    // Create a response with an explicit transport (not Auto)
+    let mut params = sample_params();
+    params.transport = TransferTransport::ExecRaw;
+
+    let response = TransferResponse {
+        ok: true,
+        error: None,
+        params,
+        kind: Some(TransferKind::File),
+        transport_used: TransferTransport::ExecRaw,
+        fallback_chain: vec![], // Should remain empty for explicit transport
+        remote_home: Some("/home/user".to_string()),
+        local_root: "/tmp/test".to_string(),
+        resolved_paths: Some(ResolvedPaths {
+            local_path: PathBuf::from("/tmp/test/config.yml"),
+        }),
+        staging: None,
+        counts: Some(sample_counts()),
+        elapsed_ms: Some(100),
+        semantics: None,
+    };
+
+    let compact = response.to_compact();
+    let json_str = response
+        .to_json(false)
+        .expect("JSON serialization should succeed");
+    let json: serde_json::Value = serde_json::from_str(&json_str).expect("Should parse as JSON");
+
+    // fallback_chain should be absent when empty (skip_serializing_if)
+    assert!(
+        json.get("fallback_chain").is_none(),
+        "fallback_chain should be absent for explicit transport"
+    );
+    assert!(
+        compact.fallback_chain.is_empty(),
+        "fallback_chain should be empty for explicit transport"
+    );
+}
+
+#[test]
+fn test_fallback_chain_present_for_auto_transport() {
+    // Create a response with Auto transport
+    let mut params = sample_params();
+    params.transport = TransferTransport::Auto;
+
+    let response = TransferResponse {
+        ok: true,
+        error: None,
+        params,
+        kind: Some(TransferKind::File),
+        transport_used: TransferTransport::Rsync,
+        fallback_chain: vec![
+            TransferTransport::Rsync,
+            TransferTransport::Sftp,
+            TransferTransport::Scp,
+            TransferTransport::ExecRaw,
+        ],
+        remote_home: Some("/home/user".to_string()),
+        local_root: "/tmp/test".to_string(),
+        resolved_paths: Some(ResolvedPaths {
+            local_path: PathBuf::from("/tmp/test/config.yml"),
+        }),
+        staging: None,
+        counts: Some(sample_counts()),
+        elapsed_ms: Some(100),
+        semantics: None,
+    };
+
+    let json_str = response
+        .to_json(false)
+        .expect("JSON serialization should succeed");
+    let json: serde_json::Value = serde_json::from_str(&json_str).expect("Should parse as JSON");
+
+    // fallback_chain should be present when non-empty (Auto transport)
+    assert!(
+        json.get("fallback_chain").is_some(),
+        "fallback_chain should be present for Auto transport"
+    );
+    let chain = json["fallback_chain"]
+        .as_array()
+        .expect("fallback_chain should be an array");
+    assert!(!chain.is_empty(), "fallback_chain should not be empty");
+}
+
+#[test]
 fn test_compact_response_directory_kind() {
     let mut response = sample_success_response();
     response.kind = Some(TransferKind::Directory);
@@ -396,6 +496,7 @@ fn test_to_json_invalid_utf8_paths() {
         params,
         kind: Some(TransferKind::File),
         transport_used: TransferTransport::ExecRaw,
+        fallback_chain: vec![TransferTransport::ExecRaw],
         remote_home: None,
         local_root: "/tmp".to_string(),
         resolved_paths: None,
@@ -442,6 +543,8 @@ fn test_compact_serialization_roundtrip() {
     assert_eq!(deserialized.ok, compact.ok);
     assert_eq!(deserialized.error, compact.error);
     assert_eq!(deserialized.kind, compact.kind);
+    assert_eq!(deserialized.transport_used, compact.transport_used);
+    assert_eq!(deserialized.fallback_chain, compact.fallback_chain);
     assert_eq!(deserialized.local_path, compact.local_path);
     assert_eq!(deserialized.remote_path, compact.remote_path);
     assert_eq!(deserialized.elapsed_ms, compact.elapsed_ms);

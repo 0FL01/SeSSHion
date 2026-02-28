@@ -1893,9 +1893,10 @@ async fn test_compact_response_has_paths() {
     );
 
     // Verify compact response excludes verbose fields
+    // transport_used is now included in compact responses (agents need it for caching)
     assert!(
-        json["transport_used"].is_null(),
-        "compact response should NOT have transport_used"
+        !json["transport_used"].is_null(),
+        "compact response should have transport_used"
     );
     assert!(
         json["staging"].is_null(),

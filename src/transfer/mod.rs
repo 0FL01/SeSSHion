@@ -154,10 +154,12 @@ impl TransferEngine {
             other => vec![other],
         };
 
+        let mut attempted_transports: Vec<TransferTransport> = Vec::new();
         let mut unsupported_reasons: Vec<String> = Vec::new();
         let mut failed_reasons: Vec<String> = Vec::new();
 
         for transport in transports {
+            attempted_transports.push(transport);
             response.transport_used = transport;
             let attempt = match transport {
                 TransferTransport::ExecRaw => self
@@ -240,6 +242,11 @@ impl TransferEngine {
                     break;
                 }
             }
+        }
+
+        // Only populate fallback_chain when the original transport was Auto
+        if response.params.transport == TransferTransport::Auto {
+            response.fallback_chain = attempted_transports;
         }
 
         if !response.ok

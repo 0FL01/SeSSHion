@@ -190,6 +190,8 @@ pub struct TransferResponse {
     pub kind: Option<TransferKind>,
 
     pub transport_used: TransferTransport,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub fallback_chain: Vec<TransferTransport>,
     pub remote_home: Option<String>,
     pub local_root: String,
 
@@ -214,6 +216,7 @@ impl TransferResponse {
             params,
             kind: None,
             transport_used,
+            fallback_chain: Vec::new(),
             remote_home: Some(remote_home.to_string()),
             local_root: local_root.display().to_string(),
             resolved_paths: None,
@@ -229,6 +232,7 @@ impl TransferResponse {
             ok: false,
             error: Some(msg.to_string()),
             transport_used: params.transport,
+            fallback_chain: Vec::new(),
             remote_home: None,
             local_root: local_root.display().to_string(),
             params,
@@ -255,6 +259,9 @@ pub struct CompactTransferResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub kind: Option<TransferKind>,
+    pub transport_used: TransferTransport,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub fallback_chain: Vec<TransferTransport>,
     // Paths are always included for DevOps context
     pub local_path: String,
     pub remote_path: String,
@@ -271,6 +278,8 @@ impl TransferResponse {
             ok: self.ok,
             error: self.error.clone(),
             kind: self.kind,
+            transport_used: self.transport_used,
+            fallback_chain: self.fallback_chain.clone(),
             local_path: self.params.local_path.clone(),
             remote_path: self.params.remote_path.clone(),
             counts: self.counts.clone(),

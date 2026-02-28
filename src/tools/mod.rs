@@ -155,6 +155,34 @@ pub struct ApplyFileEditParams {
     pub timeout_ms: Option<u64>,
 }
 
+/// Edit mode for apply-file-edit operations
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ApplyFileEditMode {
+    /// Full file replacement mode
+    Full { new_content: String },
+    /// Partial text replacement mode
+    Partial {
+        old_text: String,
+        new_text: String,
+        replace_all: bool,
+    },
+}
+
+/// Fault injection modes for apply-file-edit testing
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ApplyFileEditFaultInjection {
+    /// No fault injection
+    None,
+    /// Fail before finalizing the write
+    FailBeforeFinalize,
+    /// Simulate sha256 unavailable
+    Sha256Unavailable,
+    /// Delete file before partial write
+    PartialDeleteBeforeWrite,
+    /// Mutate file before partial write
+    PartialMutateBeforeWrite,
+}
+
 fn default_tail_lines() -> usize {
     50
 }

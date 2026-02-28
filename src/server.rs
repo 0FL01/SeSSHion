@@ -32,32 +32,32 @@ use crate::config::Config;
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
-use crate::ssh::sanitize::wrap_in_posix_shell;
-use crate::ssh::{
-    CommandOutput, SshConfig, SshConnectionManager, escape_for_shell, sanitize_command,
-    wrap_sudo_command,
-};
-use crate::ticket::{DEFAULT_TICKET_TTL_SECS, TicketSigner};
 use crate::server::validation::{
-    apply_file_edit_too_large_error, apply_read_file_window, build_read_file_remote_failure,
-    estimate_tokens_from_bytes, extract_text_from_call_tool_result,
-    has_apply_file_edit_conflict_marker, normalize_sha256_hex,
+    APPLY_FILE_EDIT_HARD_MAX_BYTES, SHA256_HEX_LEN, apply_file_edit_too_large_error,
+    apply_read_file_window, build_read_file_remote_failure, estimate_tokens_from_bytes,
+    extract_text_from_call_tool_result, has_apply_file_edit_conflict_marker, normalize_sha256_hex,
     parse_apply_file_edit_error_marker, parse_apply_file_edit_marker_value,
-    parse_read_file_error_marker, read_file_too_large_error,
-    resolve_read_file_line_limit, resolve_read_file_max_bytes,
-    sanitize_read_file_stderr_snippet, validate_background_log_path,
-    validate_read_file_path, APPLY_FILE_EDIT_HARD_MAX_BYTES, SHA256_HEX_LEN,
+    parse_read_file_error_marker, read_file_too_large_error, resolve_read_file_line_limit,
+    resolve_read_file_max_bytes, sanitize_read_file_stderr_snippet, validate_background_log_path,
+    validate_read_file_path,
 };
 #[cfg(test)]
 use crate::server::validation::{
     READ_FILE_BYTES_PER_TOKEN, READ_FILE_DEFAULT_PREVIEW_LINES, READ_FILE_HARD_MAX_BYTES,
     READ_FILE_MAX_LINE_WINDOW,
 };
+use crate::ssh::sanitize::wrap_in_posix_shell;
+use crate::ssh::{
+    CommandOutput, SshConfig, SshConnectionManager, escape_for_shell, sanitize_command,
+    wrap_sudo_command,
+};
+use crate::ticket::{DEFAULT_TICKET_TTL_SECS, TicketSigner};
 use crate::tools::{ApplyFileEditParams, CheckProcessParams, ReadFileMode, ReadFileParams};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 mod args;
 mod exec;
+mod testing;
 mod tools;
 mod validation;
 
@@ -124,8 +124,6 @@ fn build_background_wrapper_script(
         }
     }
 }
-
-
 
 /// SSH MCP Server
 ///
@@ -1705,295 +1703,6 @@ impl SshMcpServer {
     /// to save tokens in the MCP protocol.
     pub fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         tools::get_tool_documentation(tool_name)
-    }
-}
-
-impl SshMcpServer {
-    /// Internal method exposed for testing - executes a command directly
-    #[doc(hidden)]
-    pub async fn test_execute_command(
-        &self,
-        command: &str,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_command(command).await
-    }
-
-    /// Internal method exposed for testing - executes a command with a timeout override
-    #[doc(hidden)]
-    pub async fn test_execute_command_with_timeout_ms(
-        &self,
-        command: &str,
-        timeout_ms: u64,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_command_with_timeout(command, Duration::from_millis(timeout_ms))
-            .await
-    }
-
-    /// Internal method exposed for testing - executes a sudo command directly
-    #[doc(hidden)]
-    pub async fn test_execute_sudo_command(
-        &self,
-        command: &str,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_sudo_command(command).await
-    }
-
-    /// Internal method exposed for testing - checks a process status by PID
-    #[doc(hidden)]
-    pub async fn test_check_process(
-        &self,
-        job_id: &str,
-        tail_lines: usize,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        let params = CheckProcessParams {
-            job_id: job_id.to_string(),
-            tail_lines,
-        };
-        self.execute_check_process(params).await
-    }
-
-    /// Internal method exposed for testing - reads a remote UTF-8 file
-    #[doc(hidden)]
-    pub async fn test_read_file(
-        &self,
-        remote_path: &str,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.test_read_file_with_options(remote_path, ReadFileMode::Preview, None, timeout_ms)
-            .await
-    }
-
-    /// Internal method exposed for testing - reads a remote UTF-8 file with mode controls
-    #[doc(hidden)]
-    pub async fn test_read_file_with_options(
-        &self,
-        remote_path: &str,
-        mode: ReadFileMode,
-        lines: Option<usize>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_read_file(ReadFileParams {
-            remote_path: remote_path.to_string(),
-            mode,
-            lines,
-            timeout_ms,
-        })
-        .await
-    }
-
-    /// Internal method exposed for testing - applies an atomic edit to a remote UTF-8 file
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit(
-        &self,
-        remote_path: &str,
-        new_content: &str,
-        expected_sha256: Option<&str>,
-        read_ticket: Option<&str>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(
-            ApplyFileEditParams {
-                remote_path: remote_path.to_string(),
-                new_content: Some(new_content.to_string()),
-                old_text: None,
-                new_text: None,
-                replace_all: None,
-                expected_sha256: expected_sha256.map(str::to_string),
-                read_ticket: read_ticket.map(str::to_string),
-                timeout_ms,
-            },
-            ApplyFileEditFaultInjection::None,
-        )
-        .await
-    }
-
-    /// Internal method exposed for testing - applies a partial text replacement edit
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit_partial(
-        &self,
-        remote_path: &str,
-        old_text: &str,
-        new_text: &str,
-        replace_all: bool,
-        expected_sha256: Option<&str>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(
-            ApplyFileEditParams {
-                remote_path: remote_path.to_string(),
-                new_content: None,
-                old_text: Some(old_text.to_string()),
-                new_text: Some(new_text.to_string()),
-                replace_all: Some(replace_all),
-                expected_sha256: expected_sha256.map(str::to_string),
-                read_ticket: None,
-                timeout_ms,
-            },
-            ApplyFileEditFaultInjection::None,
-        )
-        .await
-    }
-
-    /// Internal method exposed for testing - runs apply-file-edit with raw params
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit_with_params(
-        &self,
-        params: ApplyFileEditParams,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(params, ApplyFileEditFaultInjection::None)
-            .await
-    }
-
-    /// Internal method exposed for testing - deletes destination after partial read and before write
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit_partial_delete_before_write(
-        &self,
-        remote_path: &str,
-        old_text: &str,
-        new_text: &str,
-        replace_all: bool,
-        expected_sha256: Option<&str>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(
-            ApplyFileEditParams {
-                remote_path: remote_path.to_string(),
-                new_content: None,
-                old_text: Some(old_text.to_string()),
-                new_text: Some(new_text.to_string()),
-                replace_all: Some(replace_all),
-                expected_sha256: expected_sha256.map(str::to_string),
-                read_ticket: None,
-                timeout_ms,
-            },
-            ApplyFileEditFaultInjection::PartialDeleteBeforeWrite,
-        )
-        .await
-    }
-
-    /// Internal method exposed for testing - mutates destination after partial read and before write
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit_partial_mutate_before_write(
-        &self,
-        remote_path: &str,
-        old_text: &str,
-        new_text: &str,
-        replace_all: bool,
-        expected_sha256: Option<&str>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(
-            ApplyFileEditParams {
-                remote_path: remote_path.to_string(),
-                new_content: None,
-                old_text: Some(old_text.to_string()),
-                new_text: Some(new_text.to_string()),
-                replace_all: Some(replace_all),
-                expected_sha256: expected_sha256.map(str::to_string),
-                read_ticket: None,
-                timeout_ms,
-            },
-            ApplyFileEditFaultInjection::PartialMutateBeforeWrite,
-        )
-        .await
-    }
-
-    /// Internal method exposed for testing - injects a failure after stage write and before rename
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit_fail_before_finalize(
-        &self,
-        remote_path: &str,
-        new_content: &str,
-        expected_sha256: Option<&str>,
-        read_ticket: Option<&str>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(
-            ApplyFileEditParams {
-                remote_path: remote_path.to_string(),
-                new_content: Some(new_content.to_string()),
-                old_text: None,
-                new_text: None,
-                replace_all: None,
-                expected_sha256: expected_sha256.map(str::to_string),
-                read_ticket: read_ticket.map(str::to_string),
-                timeout_ms,
-            },
-            ApplyFileEditFaultInjection::FailBeforeFinalize,
-        )
-        .await
-    }
-
-    /// Internal method exposed for testing - injects a SHA-256 preflight failure before mutation
-    #[doc(hidden)]
-    pub async fn test_apply_file_edit_sha256_unavailable(
-        &self,
-        remote_path: &str,
-        new_content: &str,
-        expected_sha256: Option<&str>,
-        read_ticket: Option<&str>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_apply_file_edit(
-            ApplyFileEditParams {
-                remote_path: remote_path.to_string(),
-                new_content: Some(new_content.to_string()),
-                old_text: None,
-                new_text: None,
-                replace_all: None,
-                expected_sha256: expected_sha256.map(str::to_string),
-                read_ticket: read_ticket.map(str::to_string),
-                timeout_ms,
-            },
-            ApplyFileEditFaultInjection::Sha256Unavailable,
-        )
-        .await
-    }
-
-    /// Internal method exposed for testing - starts an exec command in background=true mode
-    #[doc(hidden)]
-    pub async fn test_execute_background_command(
-        &self,
-        command: &str,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_background_command(command, None).await
-    }
-
-    #[doc(hidden)]
-    pub async fn test_transfer(
-        &self,
-        params: crate::transfer::TransferParams,
-    ) -> crate::transfer::TransferResponse {
-        let timeout = params
-            .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(self.timeout);
-
-        let key_path = self.config.key.clone();
-
-        if let Err(e) = self.connection.ensure_connected().await {
-            return crate::transfer::TransferResponse::error(
-                params,
-                self.transfer.local_root(),
-                &format!("SSH connection error: {e}"),
-            );
-        }
-
-        self.transfer
-            .run(
-                &self.connection,
-                params,
-                TransferRunContext {
-                    timeout,
-                    ssh: TransferSshOptions {
-                        host: self.config.host.clone(),
-                        port: self.config.port,
-                        user: self.config.user.clone(),
-                        key_path,
-                    },
-                },
-            )
-            .await
     }
 }
 

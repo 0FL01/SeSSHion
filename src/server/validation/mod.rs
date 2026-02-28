@@ -14,9 +14,3 @@ pub(crate) use read_file::*;
 
 // Re-export constants for test access
 pub(crate) use apply_file_edit::APPLY_FILE_EDIT_HARD_MAX_BYTES;
-pub(crate) use read_file::SHA256_HEX_LEN;
-#[cfg(test)]
-pub(crate) use read_file::{
-    READ_FILE_BYTES_PER_TOKEN, READ_FILE_DEFAULT_PREVIEW_LINES, READ_FILE_HARD_MAX_BYTES,
-    READ_FILE_MAX_LINE_WINDOW,
-};

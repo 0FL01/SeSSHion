@@ -320,25 +320,7 @@ pub(super) fn apply_file_edit_tool() -> Tool {
                 "description": "Optional timeout override in milliseconds"
             }
         },
-        "required": ["remote_path"],
-        "oneOf": [
-            {
-                "required": ["remote_path", "new_content"],
-                "not": {
-                    "anyOf": [
-                        {"required": ["old_text"]},
-                        {"required": ["new_text"]},
-                        {"required": ["replace_all"]}
-                    ]
-                }
-            },
-            {
-                "required": ["remote_path", "old_text", "new_text"],
-                "not": {
-                    "required": ["new_content"]
-                }
-            }
-        ]
+        "required": ["remote_path"]
     });
 
     let schema_obj = schema.as_object().cloned().unwrap_or_default();

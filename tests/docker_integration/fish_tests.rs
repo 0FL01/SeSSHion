@@ -57,6 +57,9 @@ fn docker_test_config(host: &str, port: u16) -> Config {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::background::OutputStreamer;
 use crate::background::detach::DetachMode;
@@ -21,6 +21,56 @@ pub(super) enum BackgroundPrivilege<'a> {
 }
 
 impl SshMcpServer {
+    async fn try_open_and_exec_background_wrapper(
+        &self,
+        wrapped_wrapper: &str,
+    ) -> std::result::Result<russh::Channel<russh::client::Msg>, String> {
+        let channel = self
+            .connection
+            .open_channel()
+            .await
+            .map_err(|e| format!("failed to open background channel: {e}"))?;
+
+        channel
+            .exec(true, wrapped_wrapper)
+            .await
+            .map_err(|e| format!("failed to send background exec request: {e}"))?;
+
+        Ok(channel)
+    }
+
+    pub(super) async fn open_background_wrapper_channel_with_retry(
+        &self,
+        wrapped_wrapper: &str,
+    ) -> std::result::Result<russh::Channel<russh::client::Msg>, String> {
+        match self
+            .try_open_and_exec_background_wrapper(wrapped_wrapper)
+            .await
+        {
+            Ok(channel) => Ok(channel),
+            Err(first_err) => {
+                warn!(
+                    error = ?first_err,
+                    "Background wrapper pre-exec failed, reconnecting once"
+                );
+
+                if let Err(reconnect_err) = self.connection.reconnect().await {
+                    return Err(format!(
+                        "background pre-exec failed ({first_err}); reconnect failed: {reconnect_err}"
+                    ));
+                }
+
+                self.try_open_and_exec_background_wrapper(wrapped_wrapper)
+                    .await
+                    .map_err(|retry_err| {
+                        format!(
+                            "background pre-exec failed ({first_err}); retry failed: {retry_err}"
+                        )
+                    })
+            }
+        }
+    }
+
     pub(super) async fn execute_background_impl(
         &self,
         command: &str,
@@ -141,29 +191,22 @@ impl SshMcpServer {
             }
         };
 
-        let mut channel = match self.connection.open_channel().await {
+        let wrapped_wrapper = wrap_in_posix_shell(&wrapper, false);
+        let mut channel = match self
+            .open_background_wrapper_channel_with_retry(wrapped_wrapper.as_str())
+            .await
+        {
             Ok(ch) => ch,
             Err(e) => {
                 return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
                     Some(&remote_log_path),
-                    &e.to_string(),
+                    &e,
                     "",
                 ));
             }
         };
-
-        let wrapped_wrapper = wrap_in_posix_shell(&wrapper, false);
-        if let Err(e) = channel.exec(true, wrapped_wrapper.as_str()).await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                Some(&remote_log_path),
-                &format!("Failed to exec background wrapper: {e}"),
-                "",
-            ));
-        }
 
         let (markers, initial_stdout) = match read_background_markers_from_channel(
             &mut channel,

@@ -64,6 +64,9 @@ async fn test_fallback_from_rsync_to_sftp() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -196,6 +199,9 @@ async fn test_fallback_from_rsync_to_scp() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -330,6 +336,9 @@ async fn test_fallback_from_sftp_to_scp() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -454,6 +463,9 @@ async fn test_fallback_all_the_way_to_execraw() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -638,6 +650,9 @@ async fn test_fallback_tries_all_on_generic_error() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)

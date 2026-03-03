@@ -14,6 +14,30 @@ pub const DEFAULT_MAX_CHARS: Option<usize> = Some(1000);
 /// Connection timeout in seconds
 pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
 
+/// Number of reconnect retries after the initial attempt
+pub const DEFAULT_RECONNECT_RETRIES: u64 = 3;
+
+/// Base reconnect backoff in milliseconds
+pub const DEFAULT_RECONNECT_BACKOFF_MS: u64 = 250;
+
+/// Health probe timeout in milliseconds
+pub const DEFAULT_HEALTH_PROBE_TIMEOUT_MS: u64 = 1500;
+
+/// Maximum reconnect retries allowed by configuration
+pub const MAX_RECONNECT_RETRIES: u64 = 10;
+
+/// Minimum reconnect backoff in milliseconds
+pub const MIN_RECONNECT_BACKOFF_MS: u64 = 10;
+
+/// Maximum reconnect backoff in milliseconds
+pub const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
+
+/// Minimum health probe timeout in milliseconds
+pub const MIN_HEALTH_PROBE_TIMEOUT_MS: u64 = 100;
+
+/// Maximum health probe timeout in milliseconds
+pub const MAX_HEALTH_PROBE_TIMEOUT_MS: u64 = 30_000;
+
 /// SSH MCP Server CLI Arguments
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ssh-mcp")]
@@ -95,6 +119,18 @@ pub struct Args {
     /// Total idle timeout = keepalive_interval * keepalive_max
     #[arg(long, default_value = "3", env = "SSH_MCP_KEEPALIVE_MAX")]
     pub keepalive_max: u64,
+
+    /// Number of reconnect retries after the initial attempt (default: 3)
+    #[arg(long, default_value = "3", env = "SSH_MCP_RECONNECT_RETRIES")]
+    pub reconnect_retries: u64,
+
+    /// Base reconnect backoff in milliseconds (default: 250)
+    #[arg(long, default_value = "250", env = "SSH_MCP_RECONNECT_BACKOFF_MS")]
+    pub reconnect_backoff_ms: u64,
+
+    /// Health probe timeout in milliseconds for active session checks (default: 1500)
+    #[arg(long, default_value = "1500", env = "SSH_MCP_HEALTH_PROBE_TIMEOUT_MS")]
+    pub health_probe_timeout_ms: u64,
 }
 
 /// Parsed and validated configuration
@@ -138,6 +174,15 @@ pub struct Config {
 
     /// Maximum keepalive failures before disconnecting
     pub keepalive_max: u64,
+
+    /// Number of reconnect retries after the initial attempt
+    pub reconnect_retries: u64,
+
+    /// Base reconnect backoff in milliseconds
+    pub reconnect_backoff_ms: u64,
+
+    /// Health probe timeout in milliseconds for active session checks
+    pub health_probe_timeout_ms: u64,
 }
 
 impl Config {
@@ -162,6 +207,9 @@ impl Config {
             disable_sudo: args.disable_sudo,
             keepalive_interval: args.keepalive_interval,
             keepalive_max: args.keepalive_max,
+            reconnect_retries: args.reconnect_retries,
+            reconnect_backoff_ms: args.reconnect_backoff_ms,
+            health_probe_timeout_ms: args.health_probe_timeout_ms,
         })
     }
 }
@@ -188,6 +236,26 @@ fn validate_args(args: &Args) -> Result<()> {
         && !key_path.exists()
     {
         errors.push(format!("SSH key file not found: {}", key_path.display()));
+    }
+
+    if args.reconnect_retries > MAX_RECONNECT_RETRIES {
+        errors.push(format!(
+            "--reconnect-retries must be <= {MAX_RECONNECT_RETRIES}"
+        ));
+    }
+
+    if !(MIN_RECONNECT_BACKOFF_MS..=MAX_RECONNECT_BACKOFF_MS).contains(&args.reconnect_backoff_ms) {
+        errors.push(format!(
+            "--reconnect-backoff-ms must be between {MIN_RECONNECT_BACKOFF_MS} and {MAX_RECONNECT_BACKOFF_MS}"
+        ));
+    }
+
+    if !(MIN_HEALTH_PROBE_TIMEOUT_MS..=MAX_HEALTH_PROBE_TIMEOUT_MS)
+        .contains(&args.health_probe_timeout_ms)
+    {
+        errors.push(format!(
+            "--health-probe-timeout-ms must be between {MIN_HEALTH_PROBE_TIMEOUT_MS} and {MAX_HEALTH_PROBE_TIMEOUT_MS}"
+        ));
     }
 
     if !errors.is_empty() {
@@ -269,6 +337,31 @@ fn sanitize_password(password: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base_args() -> Args {
+        Args {
+            host: "localhost".to_string(),
+            port: 22,
+            user: "test".to_string(),
+            password: Some("secret".to_string()),
+            key: None,
+            su_password: None,
+            sudo_password: None,
+            timeout: DEFAULT_TIMEOUT_MS,
+            max_chars: None,
+            disable_sudo: false,
+            max_output_tokens: None,
+            log_level: "info".to_string(),
+            log_file: None,
+            log_format: "text".to_string(),
+            log_rotation: "daily".to_string(),
+            keepalive_interval: 30,
+            keepalive_max: 3,
+            reconnect_retries: DEFAULT_RECONNECT_RETRIES,
+            reconnect_backoff_ms: DEFAULT_RECONNECT_BACKOFF_MS,
+            health_probe_timeout_ms: DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+        }
+    }
 
     #[test]
     fn test_parse_max_chars_none_string() {
@@ -352,5 +445,32 @@ mod tests {
     #[test]
     fn test_parse_max_output_tokens_not_provided() {
         assert_eq!(parse_max_output_tokens(None), DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn test_validate_args_rejects_reconnect_retries_out_of_range() {
+        let mut args = base_args();
+        args.reconnect_retries = MAX_RECONNECT_RETRIES.saturating_add(1);
+
+        let result = validate_args(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_args_rejects_reconnect_backoff_out_of_range() {
+        let mut args = base_args();
+        args.reconnect_backoff_ms = MIN_RECONNECT_BACKOFF_MS.saturating_sub(1);
+
+        let result = validate_args(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_args_rejects_health_probe_timeout_out_of_range() {
+        let mut args = base_args();
+        args.health_probe_timeout_ms = MAX_HEALTH_PROBE_TIMEOUT_MS.saturating_add(1);
+
+        let result = validate_args(&args);
+        assert!(result.is_err());
     }
 }

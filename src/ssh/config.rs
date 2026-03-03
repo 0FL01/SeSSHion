@@ -43,6 +43,15 @@ pub struct SshConfig {
     /// Maximum output tokens for command execution (default: 12_000)
     /// Prevents OOM and context overflow for large outputs
     pub max_output_tokens: Option<usize>,
+
+    /// Number of reconnect retries after the initial attempt (default: 3)
+    pub reconnect_retries: u64,
+
+    /// Base reconnect backoff in milliseconds (default: 250)
+    pub reconnect_backoff_ms: u64,
+
+    /// Health probe timeout in milliseconds for active session checks (default: 1500)
+    pub health_probe_timeout_ms: u64,
 }
 
 impl SshConfig {
@@ -59,6 +68,9 @@ impl SshConfig {
             keepalive_interval: 30,
             keepalive_max: 3,
             max_output_tokens: Some(12_000),
+            reconnect_retries: 3,
+            reconnect_backoff_ms: 250,
+            health_probe_timeout_ms: 1500,
         }
     }
 
@@ -114,6 +126,24 @@ impl SshConfig {
         self.max_output_tokens = tokens;
         self
     }
+
+    /// Set reconnect retries after the initial attempt (default: 3)
+    pub fn with_reconnect_retries(mut self, retries: u64) -> Self {
+        self.reconnect_retries = retries;
+        self
+    }
+
+    /// Set base reconnect backoff in milliseconds (default: 250)
+    pub fn with_reconnect_backoff_ms(mut self, backoff_ms: u64) -> Self {
+        self.reconnect_backoff_ms = backoff_ms;
+        self
+    }
+
+    /// Set health probe timeout in milliseconds (default: 1500)
+    pub fn with_health_probe_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.health_probe_timeout_ms = timeout_ms;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -125,12 +155,18 @@ mod tests {
         let config = SshConfig::new("192.168.1.1", "admin")
             .with_port(2222)
             .with_password("secret")
-            .with_max_output_tokens(Some(5_000));
+            .with_max_output_tokens(Some(5_000))
+            .with_reconnect_retries(4)
+            .with_reconnect_backoff_ms(500)
+            .with_health_probe_timeout_ms(1_200);
 
         assert_eq!(config.host, "192.168.1.1");
         assert_eq!(config.port, 2222);
         assert_eq!(config.username, "admin");
         assert_eq!(config.password, Some("secret".to_string()));
         assert!(config.private_key.is_none());
+        assert_eq!(config.reconnect_retries, 4);
+        assert_eq!(config.reconnect_backoff_ms, 500);
+        assert_eq!(config.health_probe_timeout_ms, 1_200);
     }
 }

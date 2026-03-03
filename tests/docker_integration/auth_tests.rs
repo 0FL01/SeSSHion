@@ -52,6 +52,9 @@ async fn test_key_auth_with_password_fallback() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -121,6 +124,9 @@ async fn test_password_auth_with_key_fallback() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -186,6 +192,9 @@ async fn test_both_key_and_password_configured() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -315,6 +324,9 @@ async fn test_key_auth_failure_then_password_success() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     // Should succeed via password fallback after key fails
@@ -383,6 +395,9 @@ async fn test_switch_auth_methods_between_transfers() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server1 = SshMcpServer::new(config_key_only)
@@ -450,6 +465,9 @@ async fn test_switch_auth_methods_between_transfers() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server2 = SshMcpServer::new(config_password_only)
@@ -510,6 +528,9 @@ async fn test_switch_auth_methods_between_transfers() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server3 = SshMcpServer::new(config_both)

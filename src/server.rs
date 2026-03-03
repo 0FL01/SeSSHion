@@ -171,6 +171,12 @@ impl SshMcpServer {
             .with_keepalive_interval(config.keepalive_interval)
             .with_keepalive_max(config.keepalive_max);
 
+        // Add reconnect and health probe settings
+        ssh_config = ssh_config
+            .with_reconnect_retries(config.reconnect_retries)
+            .with_reconnect_backoff_ms(config.reconnect_backoff_ms)
+            .with_health_probe_timeout_ms(config.health_probe_timeout_ms);
+
         // Add output token limit for OOM protection
         ssh_config = ssh_config.with_max_output_tokens(config.max_output_tokens);
 
@@ -348,26 +354,25 @@ impl SshMcpServer {
             Err(result) => return Ok(result),
         };
 
-        // Ensure connection is established
-        if let Err(e) = self.connection.ensure_connected().await {
-            error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "SSH connection error: {}",
-                e
-            ))]));
-        }
-
-        // If su elevation is configured and available, ensure we're elevated
-        if self.connection.get_su_password().is_some()
-            && let Err(e) = self.connection.ensure_elevated().await
-        {
-            debug!(error = ?e, "Elevation failed, will run as normal user");
-        }
-
         // Foreground execution is detachable-by-design:
         // - Start the command on a dedicated SSH channel
         // - Stream remote stdout/stderr into a local spool file
         // - If timeout elapses, return JSON with job_id/pid/log_path while the stream continues
+
+        let requires_elevation = self.connection.get_su_password().is_some();
+        if requires_elevation {
+            if let Err(e) = self.connection.ensure_connected().await {
+                error!(error = ?e, "Failed to ensure SSH connection");
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "SSH connection error: {}",
+                    e
+                ))]));
+            }
+
+            if let Err(e) = self.connection.ensure_elevated().await {
+                debug!(error = ?e, "Elevation failed, will run as normal user");
+            }
+        }
 
         let detach_mode = self.determine_detach_mode().await;
         if detach_mode == DetachMode::DirectOnly {
@@ -382,6 +387,15 @@ impl SshMcpServer {
                     return Ok(CallToolResult::error(vec![Content::text(msg)]));
                 }
             }
+        }
+
+        // Ensure connection is established for detached foreground execution path.
+        if !requires_elevation && let Err(e) = self.connection.ensure_connected().await {
+            error!(error = ?e, "Failed to ensure SSH connection");
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "SSH connection error: {}",
+                e
+            ))]));
         }
 
         let job_id = make_job_id();
@@ -413,7 +427,11 @@ impl SshMcpServer {
             }
         };
 
-        let mut channel = match self.connection.open_channel().await {
+        let wrapped_wrapper = wrap_in_posix_shell(&wrapper, false);
+        let mut channel = match self
+            .open_background_wrapper_channel_with_retry(wrapped_wrapper.as_str())
+            .await
+        {
             Ok(ch) => ch,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -421,13 +439,6 @@ impl SshMcpServer {
                 ))]));
             }
         };
-
-        let wrapped_wrapper = wrap_in_posix_shell(&wrapper, false);
-        if let Err(e) = channel.exec(true, wrapped_wrapper.as_str()).await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error: Failed to exec background wrapper: {e}"
-            ))]));
-        }
 
         let (markers, initial_stdout) = match read_background_markers_from_channel(
             &mut channel,
@@ -633,15 +644,6 @@ impl SshMcpServer {
             Ok(cmd) => cmd,
             Err(result) => return Ok(result),
         };
-
-        // Ensure connection is established
-        if let Err(e) = self.connection.ensure_connected().await {
-            error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "SSH connection error: {}",
-                e
-            ))]));
-        }
 
         // Wrap the command with sudo
         let sudo_password = self.connection.get_sudo_password();

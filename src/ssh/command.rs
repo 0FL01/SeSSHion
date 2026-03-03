@@ -550,6 +550,8 @@ impl SshConnectionManager {
                         timeout_duration.as_millis()
                     );
                     self.abort_command(command).await;
+                    self.invalidate_session("command timed out after exec")
+                        .await;
                     return Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
                 }
             }
@@ -582,21 +584,14 @@ impl SshConnectionManager {
 
                 // Execute the command again using fallback method (tokio timeout + pkill)
                 // Note: This is a feature fallback, not a connection retry
-                let (channel, _) = match self.try_open_and_exec(command).await {
-                    Ok(result) => result,
-                    Err(PreExecError::ChannelOpen(e)) => {
-                        return Err(SshMcpError::connection(format!(
-                            "Failed to open channel (fallback): {}",
-                            e
-                        )));
-                    }
-                    Err(PreExecError::ExecSend(e)) => {
-                        return Err(SshMcpError::connection(format!(
-                            "Failed to exec command (fallback): {}",
-                            e
-                        )));
-                    }
-                };
+                let (channel, _) = self
+                    .open_and_exec_with_reconnect_retry(command)
+                    .await
+                    .map_err(|e| {
+                        SshMcpError::connection(format!(
+                            "Failed to start fallback execution after reconnect retry: {e}"
+                        ))
+                    })?;
 
                 let result = timeout(timeout_duration, self.collect_channel_output(channel)).await;
 
@@ -608,6 +603,8 @@ impl SshConnectionManager {
                             timeout_duration.as_millis()
                         );
                         self.abort_command(command).await;
+                        self.invalidate_session("fallback command timed out after exec")
+                            .await;
                         Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64))
                     }
                 };

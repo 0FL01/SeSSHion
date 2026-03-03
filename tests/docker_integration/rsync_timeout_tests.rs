@@ -61,6 +61,9 @@ async fn test_rsync_put_file_timeout() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -220,6 +223,9 @@ async fn test_rsync_get_file_timeout() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -361,6 +367,9 @@ async fn test_rsync_put_directory_timeout() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)

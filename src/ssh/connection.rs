@@ -11,7 +11,7 @@ use russh::Channel;
 use russh::client::{self, Handle};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use super::config::SshConfig;
@@ -24,6 +24,9 @@ use russh::ChannelMsg;
 pub const CHANNEL_SEMAPHORE_CAPACITY: usize = 8;
 const AUTH_TIMEOUT_SECS: u64 = 20;
 const CONNECT_WAIT_TIMEOUT_SECS: u64 = CONNECTION_TIMEOUT_SECS + AUTH_TIMEOUT_SECS;
+const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
+const MIN_HEALTH_PROBE_TTL_MS: u64 = 250;
+const MAX_HEALTH_PROBE_TTL_MS: u64 = 5_000;
 
 /// SSH Connection Manager
 ///
@@ -60,6 +63,12 @@ pub struct SshConnectionManager {
     /// Semaphore to limit concurrent command execution
     /// Made pub(crate) to allow access from command.rs
     pub(crate) channel_semaphore: Arc<Semaphore>,
+
+    /// Last successful active health probe timestamp
+    last_health_probe_ok_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+
+    /// Lock to avoid concurrent active health probes
+    health_probe_lock: Arc<Mutex<()>>,
 }
 
 impl SshConnectionManager {
@@ -77,6 +86,8 @@ impl SshConnectionManager {
             is_elevated: AtomicBool::new(false),
             has_timeout_cmd: AtomicBool::new(false),
             channel_semaphore: Arc::new(Semaphore::new(CHANNEL_SEMAPHORE_CAPACITY)),
+            last_health_probe_ok_at: Arc::new(Mutex::new(None)),
+            health_probe_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -190,6 +201,10 @@ impl SshConnectionManager {
         {
             let mut session_guard = self.session.lock().await;
             *session_guard = Some(session);
+        }
+        {
+            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
+            *probe_guard = None;
         }
 
         info!(
@@ -305,9 +320,138 @@ impl SshConnectionManager {
     /// Ensure connection is established, reconnecting if necessary
     pub async fn ensure_connected(&self) -> Result<()> {
         if !self.is_connected().await {
-            self.connect().await?;
+            return self
+                .connect_with_retry("no active session found during ensure_connected")
+                .await;
         }
+
+        if self.is_health_probe_fresh().await {
+            return Ok(());
+        }
+
+        let _probe_guard = self.health_probe_lock.lock().await;
+        if self.is_health_probe_fresh().await {
+            return Ok(());
+        }
+
+        if let Err(probe_error) = self.run_health_probe().await {
+            warn!(
+                error = ?probe_error,
+                "SSH health probe failed, invalidating session before reconnect"
+            );
+            self.invalidate_session("health probe failed").await;
+            self.connect_with_retry("health probe failed during ensure_connected")
+                .await?;
+        } else {
+            self.mark_health_probe_ok().await;
+        }
+
         Ok(())
+    }
+
+    fn health_probe_ttl(&self) -> Duration {
+        let ttl_ms = self
+            .config
+            .health_probe_timeout_ms
+            .saturating_mul(2)
+            .clamp(MIN_HEALTH_PROBE_TTL_MS, MAX_HEALTH_PROBE_TTL_MS);
+        Duration::from_millis(ttl_ms)
+    }
+
+    async fn is_health_probe_fresh(&self) -> bool {
+        let guard = self.last_health_probe_ok_at.lock().await;
+        if let Some(last_ok_at) = guard.as_ref() {
+            return last_ok_at.elapsed() < self.health_probe_ttl();
+        }
+
+        false
+    }
+
+    async fn mark_health_probe_ok(&self) {
+        let mut guard = self.last_health_probe_ok_at.lock().await;
+        *guard = Some(tokio::time::Instant::now());
+    }
+
+    async fn run_health_probe(&self) -> Result<()> {
+        let ping_result = {
+            let session_guard = self.session.lock().await;
+            let session = session_guard
+                .as_ref()
+                .ok_or_else(|| SshMcpError::connection("SSH connection not established"))?;
+
+            timeout(
+                Duration::from_millis(self.config.health_probe_timeout_ms),
+                session.send_ping(),
+            )
+            .await
+        };
+
+        match ping_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(SshMcpError::connection(format!(
+                "SSH health probe ping failed: {e}"
+            ))),
+            Err(_) => Err(SshMcpError::connection(format!(
+                "SSH health probe timed out after {}ms",
+                self.config.health_probe_timeout_ms
+            ))),
+        }
+    }
+
+    async fn connect_with_retry(&self, reason: &str) -> Result<()> {
+        let max_attempts = self.config.reconnect_retries.saturating_add(1);
+        let mut attempt: u64 = 1;
+        let mut last_error: Option<SshMcpError> = None;
+
+        while attempt <= max_attempts {
+            match self.connect().await {
+                Ok(()) => {
+                    if attempt > 1 {
+                        info!(
+                            attempts = attempt,
+                            reason = reason,
+                            "SSH reconnect succeeded"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(err) => {
+                    let backoff_ms = self.backoff_for_attempt(attempt);
+                    warn!(
+                        attempt = attempt,
+                        max_attempts = max_attempts,
+                        backoff_ms = backoff_ms,
+                        reason = reason,
+                        error = ?err,
+                        "SSH reconnect attempt failed"
+                    );
+                    last_error = Some(err);
+
+                    if attempt < max_attempts && backoff_ms > 0 {
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+
+            attempt = attempt.saturating_add(1);
+        }
+
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+
+        Err(SshMcpError::connection(
+            "Reconnect retry loop ended without connection result",
+        ))
+    }
+
+    fn backoff_for_attempt(&self, attempt: u64) -> u64 {
+        let exponent = attempt.saturating_sub(1).min(63) as u32;
+        let factor = 1_u64 << exponent;
+        self.config
+            .reconnect_backoff_ms
+            .saturating_mul(factor)
+            .min(MAX_RECONNECT_BACKOFF_MS)
     }
 
     /// Get a reference to the session for operations
@@ -684,6 +828,11 @@ impl SshConnectionManager {
             }
         }
 
+        {
+            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
+            *probe_guard = None;
+        }
+
         info!("SSH connection closed");
     }
 
@@ -706,12 +855,23 @@ impl SshConnectionManager {
         }
         self.is_elevated.store(false, Ordering::SeqCst);
 
-        // Clear main session without graceful disconnect (it's already broken)
-        {
+        // Attempt best-effort graceful disconnect with short timeout.
+        let session = {
             let mut session_guard = self.session.lock().await;
-            if session_guard.is_some() {
-                session_guard.take();
-            }
+            session_guard.take()
+        };
+
+        if let Some(session) = session {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                session.disconnect(russh::Disconnect::ByApplication, "", ""),
+            )
+            .await;
+        }
+
+        {
+            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
+            *probe_guard = None;
         }
 
         debug!(reason = ?reason, "Session invalidated");
@@ -725,7 +885,8 @@ impl SshConnectionManager {
     pub async fn reconnect(&self) -> Result<()> {
         self.invalidate_session("explicit reconnect requested")
             .await;
-        self.connect().await
+        self.connect_with_retry("explicit reconnect requested")
+            .await
     }
 }
 

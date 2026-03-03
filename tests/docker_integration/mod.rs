@@ -8,6 +8,7 @@ pub mod fallback_tests;
 pub mod fish_tests;
 pub mod oom_tests;
 pub mod overwrite_tests;
+pub mod reconnect_tests;
 pub mod rsync_tests;
 pub mod rsync_timeout_tests;
 pub mod scp_tests;

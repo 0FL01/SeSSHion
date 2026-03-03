@@ -99,6 +99,9 @@ async fn test_check_process_running() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -198,6 +201,9 @@ async fn test_check_process_completed() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -295,6 +301,9 @@ async fn test_check_process_not_exists() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -364,6 +373,9 @@ async fn test_check_process_log_tail() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -465,6 +477,9 @@ async fn test_check_process_full_workflow_timeout() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)
@@ -625,6 +640,9 @@ async fn test_check_process_background_exec_workflow() {
         disable_sudo: true,
         keepalive_interval: 30,
         keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
     };
 
     let server = SshMcpServer::new(config)

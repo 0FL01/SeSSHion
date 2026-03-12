@@ -824,24 +824,22 @@ impl SshMcpServer {
 impl ServerHandler for SshMcpServer {
     /// Return server information
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(format!(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(format!(
                 "SSH MCP Server v{} - Execute commands on {}@{}:{}",
                 env!("CARGO_PKG_VERSION"),
                 self.config.user,
                 self.config.host,
                 self.config.port,
-            )),
-        }
+            ))
     }
 
     /// List available tools
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         debug!("list_tools called");
@@ -867,7 +865,7 @@ impl ServerHandler for SshMcpServer {
     /// Call a tool
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         let tool_name: &str = request.name.as_ref();

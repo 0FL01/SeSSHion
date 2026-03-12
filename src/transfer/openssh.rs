@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -170,6 +171,44 @@ async fn run_scp(
     wait_child_with_timeout(OpenSshTransport::Scp, child, timeout).await
 }
 
+fn scp_legacy_args(extra: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut args = vec!["-O".to_string()];
+    args.extend(extra);
+    args
+}
+
+fn scp_receive_args(extra: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut args = vec!["-T".to_string()];
+    args.extend(extra);
+    args
+}
+
+async fn remove_remote_dir(
+    conn: &SshConnectionManager,
+    timeout: Duration,
+    path: &str,
+) -> std::result::Result<(), super::TransportAttemptError> {
+    super::exec_raw::validate_remote_user_path(path, "remote_stage")
+        .map_err(super::TransportAttemptError::Other)?;
+
+    let escaped = escape_for_shell(path);
+    let cmd = format!(r#"sh -c 'set -eu; rm -rf -- "$1"' sh '{escaped}'"#);
+    let out = conn
+        .exec_command(&cmd, timeout)
+        .await
+        .map_err(super::TransportAttemptError::Other)?;
+    super::staging::ensure_remote_exec_success("reset scp remote directory", &out)
+        .map_err(super::TransportAttemptError::Other)
+}
+
+async fn remove_local_dir(path: &Path) -> std::result::Result<(), super::TransportAttemptError> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(super::TransportAttemptError::Other(SshMcpError::Io(err))),
+    }
+}
+
 #[derive(Debug)]
 struct ProcessOutput {
     status: std::process::ExitStatus,
@@ -301,7 +340,7 @@ async fn put_file(
                 }
                 OpenSshTransport::Scp => {
                     let remote = scp_remote_spec(&endpoint, &stage_path);
-                    let try_o = vec!["-O".to_string(), local_path_str.clone(), remote.clone()];
+                    let try_o = scp_legacy_args([local_path_str.clone(), remote.clone()]);
                     let out_o = run_scp(&endpoint, &try_o, timeout).await?;
                     if !out_o.status.success() {
                         let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
@@ -367,12 +406,12 @@ async fn get_file(
                 }
                 OpenSshTransport::Scp => {
                     let remote = scp_remote_spec(&endpoint, &remote_path_for_download);
-                    let try_o = vec!["-O".to_string(), remote.clone(), tmp_path.clone()];
+                    let try_o = scp_legacy_args(scp_receive_args([remote.clone(), tmp_path.clone()]));
                     let out_o = run_scp(&endpoint, &try_o, timeout).await?;
                     if !out_o.status.success() {
                         let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
                         if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = vec![remote, tmp_path];
+                            let no_o = scp_receive_args([remote, tmp_path]);
                             let out = run_scp(&endpoint, &no_o, timeout).await?;
                             if !out.status.success() {
                                 return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
@@ -410,6 +449,11 @@ async fn put_dir(
         ..
     } = args;
 
+    let local_path_for_scp = fs::canonicalize(&local_path)
+        .await
+        .map_err(super::io_to_transport_attempt)?;
+    let local_path_for_scp = local_path_for_scp.display().to_string();
+
     let counts = count_dir_no_symlinks(&local_path)
         .await
         .map_err(super::TransportAttemptError::Other)?;
@@ -439,19 +483,18 @@ async fn put_dir(
                     }
                 }
                 OpenSshTransport::Scp => {
-                    let local_dot = format!("{}/.", local_path.display());
+                    remove_remote_dir(conn, timeout, &stage_path).await?;
                     let remote = scp_remote_spec(&endpoint, &stage_path);
-                    let try_o = vec![
-                        "-O".to_string(),
+                    let try_o = scp_legacy_args([
                         "-r".to_string(),
-                        local_dot.clone(),
+                        local_path_for_scp.clone(),
                         remote.clone(),
-                    ];
+                    ]);
                     let out_o = run_scp(&endpoint, &try_o, timeout).await?;
                     if !out_o.status.success() {
                         let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
                         if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = vec!["-r".to_string(), local_dot, remote];
+                            let no_o = vec!["-r".to_string(), local_path_for_scp, remote];
                             let out = run_scp(&endpoint, &no_o, timeout).await?;
                             if !out.status.success() {
                                 return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
@@ -514,19 +557,22 @@ async fn get_dir(
                     }
                 }
                 OpenSshTransport::Scp => {
-                    let remote_dot = format!("{}/.", remote_path_for_download);
-                    let remote = scp_remote_spec(&endpoint, &remote_dot);
-                    let try_o = vec![
-                        "-O".to_string(),
+                    remove_local_dir(Path::new(&extract_target)).await?;
+                    let remote = scp_remote_spec(&endpoint, &remote_path_for_download);
+                    let try_o = scp_legacy_args(scp_receive_args([
                         "-r".to_string(),
                         remote.clone(),
                         extract_target.clone(),
-                    ];
+                    ]));
                     let out_o = run_scp(&endpoint, &try_o, timeout).await?;
                     if !out_o.status.success() {
                         let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
                         if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = vec!["-r".to_string(), remote, extract_target];
+                            let no_o = scp_receive_args([
+                                "-r".to_string(),
+                                remote,
+                                extract_target,
+                            ]);
                             let out = run_scp(&endpoint, &no_o, timeout).await?;
                             if !out.status.success() {
                                 return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));

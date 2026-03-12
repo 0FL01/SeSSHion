@@ -406,7 +406,8 @@ async fn get_file(
                 }
                 OpenSshTransport::Scp => {
                     let remote = scp_remote_spec(&endpoint, &remote_path_for_download);
-                    let try_o = scp_legacy_args(scp_receive_args([remote.clone(), tmp_path.clone()]));
+                    let try_o =
+                        scp_legacy_args(scp_receive_args([remote.clone(), tmp_path.clone()]));
                     let out_o = run_scp(&endpoint, &try_o, timeout).await?;
                     if !out_o.status.success() {
                         let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
@@ -568,11 +569,7 @@ async fn get_dir(
                     if !out_o.status.success() {
                         let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
                         if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = scp_receive_args([
-                                "-r".to_string(),
-                                remote,
-                                extract_target,
-                            ]);
+                            let no_o = scp_receive_args(["-r".to_string(), remote, extract_target]);
                             let out = run_scp(&endpoint, &no_o, timeout).await?;
                             if !out.status.success() {
                                 return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));

@@ -1070,7 +1070,49 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to clean lock-error fixture");
 
-    // 4a-13. Failure after stage write and before rename rolls back cleanly.
+    // 4a-13. Stale remote edit lock should be reclaimed automatically.
+    let stale_lock_dir = "/tmp/ssh-mcp-stale-lock";
+    let stale_lock_file = "/tmp/ssh-mcp-stale-lock/data.txt";
+    let stale_lock_guard = format!("{}.ssh-mcp-lock", stale_lock_file);
+    server
+        .test_execute_command(&format!(
+            "sh -c 'set -eu; rm -rf -- {dir} {lock_dir}; mkdir -p -- {dir} {lock_dir}; printf \"stale-base\\n\" > {file}; stale_started_at=$(( $(date +%s) - 3600 )); printf \"%s\\n\" \"$stale_started_at\" > {lock_dir}/started_at; printf \"write-file\\n\" > {lock_dir}/operation'",
+            dir = ssh_mcp::escape_for_shell(stale_lock_dir),
+            file = ssh_mcp::escape_for_shell(stale_lock_file),
+            lock_dir = ssh_mcp::escape_for_shell(&stale_lock_guard),
+        ))
+        .await
+        .expect("failed to create stale lock fixture");
+
+    let (stale_lock_hash, stale_lock_ticket) = read_file_ticket(&server, stale_lock_file).await;
+    let stale_lock_result = server
+        .test_write_file(
+            stale_lock_file,
+            "stale-lock-recovered\n",
+            Some(stale_lock_hash.as_str()),
+            Some(stale_lock_ticket.as_str()),
+            Some(30_000),
+        )
+        .await
+        .expect("write-file stale-lock recovery call failed");
+    assert!(
+        !stale_lock_result.is_error.unwrap_or(false),
+        "stale lock should be reclaimed automatically"
+    );
+
+    let stale_lock_read = server
+        .test_read_file(stale_lock_file, None)
+        .await
+        .expect("failed to read stale-lock file after recovery");
+    let stale_lock_text = extract_text_from_result(&stale_lock_read);
+    let stale_lock_json: serde_json::Value = serde_json::from_str(stale_lock_text.trim())
+        .expect("stale-lock read-file response should be valid JSON");
+    assert_eq!(
+        stale_lock_json.get("content").and_then(|v| v.as_str()),
+        Some("stale-lock-recovered\n")
+    );
+
+    // 4a-14. Failure after stage write and before rename rolls back cleanly.
     let rollback_dir = "/tmp/ssh-mcp-apply-edit-rollback";
     let rollback_file = "/tmp/ssh-mcp-apply-edit-rollback/data.txt";
     server

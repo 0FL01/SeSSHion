@@ -106,11 +106,13 @@ PARAMETERS:
 BEHAVIOR:
 - Validates remote_path like read-file
 - Acquires a per-file remote lock, computes SHA-256, and performs compare+replace in one transaction
+- Reclaims stale remote edit locks automatically when they are older than 120 seconds
 - Creates the target file atomically when it is missing and the parent directory already exists
 - If expected_sha256 is set and does not match, returns conflict and does not modify file
 - If expected_sha256 is set while file is missing, returns conflict and does not create file
 - Uses a same-directory sibling staging file and atomic rename
 - Requires a valid read_ticket when the target file exists and is non-empty; obtain it by calling read-file first
+- If the path is actively locked, returns retryable JSON with error="lock_busy"; retry the same tool call instead of falling back to exec/sudo-exec
 - Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
 
 EXAMPLE:
@@ -135,6 +137,8 @@ BEHAVIOR:
 - With replace_all=false, requires exactly one match; otherwise returns an error asking to use replace_all
 - Computes a baseline SHA-256 for race-safe compare+replace when expected_sha256 is not supplied
 - Uses the same atomic write transaction as write-file
+- Reclaims stale remote edit locks automatically when they are older than 120 seconds
+- If the path is actively locked, returns retryable JSON with error="lock_busy"; retry the same tool call instead of falling back to exec/sudo-exec
 - Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
 
 EXAMPLE:

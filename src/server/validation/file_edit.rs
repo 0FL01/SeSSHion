@@ -9,6 +9,9 @@ pub(crate) const FILE_EDIT_BASELINE_SHA_MARKER: &str = "__SSH_MCP_FILE_EDIT_BASE
 pub(crate) const FILE_EDIT_MISSING_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 pub(crate) const FILE_EDIT_HARD_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const FILE_EDIT_LOCK_MAX_SPINS: u32 = 20;
+pub(crate) const FILE_EDIT_LOCK_STALE_AFTER_SECS: u64 = 120;
+pub(crate) const FILE_EDIT_LOCK_RETRY_AFTER_MS: u64 = 2000;
 
 /// Parses a file-edit error marker from stderr.
 pub(crate) fn parse_file_edit_error_marker(stderr: &str) -> Option<&str> {

@@ -33,6 +33,22 @@ pub(in crate::server) struct FileWriteTransactionRequest<'a> {
     pub operation_name: &'a str,
 }
 
+fn file_edit_lock_busy_result(remote_path: &str, operation_name: &str) -> CallToolResult {
+    let result = serde_json::json!({
+        "error": "lock_busy",
+        "path": remote_path,
+        "operation": operation_name,
+        "retryable": true,
+        "retry_after_ms": FILE_EDIT_LOCK_RETRY_AFTER_MS,
+        "retry_same_tool": true,
+        "message": format!(
+            "Path is temporarily locked by another file-edit operation. Retry the same {operation_name} call after a short delay; do not fall back to exec/sudo-exec."
+        ),
+    });
+
+    CallToolResult::error(vec![Content::text(result.to_string())])
+}
+
 impl SshMcpServer {
     pub(in crate::server) async fn compute_partial_baseline_sha256(
         &self,
@@ -264,12 +280,15 @@ impl SshMcpServer {
         let remote_stage_path = format!("{}.ssh-mcp-stage-{}", remote_path, make_job_id());
         let expected_for_remote = expected_sha256.clone().unwrap_or_else(|| "-".to_string());
         let missing_sha_for_remote = FILE_EDIT_MISSING_SHA256;
+        let lock_stale_after_secs = FILE_EDIT_LOCK_STALE_AFTER_SECS.to_string();
 
         let dst_escaped = escape_for_shell(remote_path);
         let expected_escaped = escape_for_shell(&expected_for_remote);
         let missing_sha_escaped = escape_for_shell(missing_sha_for_remote);
         let lock_escaped = escape_for_shell(&remote_lock_dir);
         let stage_escaped = escape_for_shell(&remote_stage_path);
+        let lock_stale_after_secs_escaped = escape_for_shell(&lock_stale_after_secs);
+        let operation_name_escaped = escape_for_shell(operation_name);
         let force_fail_before_finalize =
             if fault_injection == FileEditFaultInjection::FailBeforeFinalize {
                 "1"
@@ -286,15 +305,17 @@ impl SshMcpServer {
         let force_sha256_unavailable_escaped = escape_for_shell(force_sha256_unavailable);
 
         let apply_cmd = format!(
-            r#"sh -c 'set -eu; dst=$1; expected=$2; lock_dir=$3; stage=$4; fail_before_finalize=$5; missing_sha=$6; force_sha_unavailable=$7; \
-             drain_stdin() {{ cat > /dev/null || true; }}; \
-             sha256_file() {{ file=$1; if command -v sha256sum >/dev/null 2>&1; then set -- $(sha256sum -- "$file"); printf "%s\n" "$1"; return 0; fi; if command -v shasum >/dev/null 2>&1; then set -- $(shasum -a 256 -- "$file"); printf "%s\n" "$1"; return 0; fi; return 1; }}; \
-             parent=${{dst%/*}}; if [ -z "$parent" ]; then parent=/; fi; if [ ! -d "$parent" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}parent_not_found" >&2; drain_stdin; exit 1; fi; \
-             lock_spins=0; while ! mkdir -- "$lock_dir" 2>/dev/null; do if [ -d "$lock_dir" ]; then lock_spins=$((lock_spins + 1)); if [ "$lock_spins" -ge 20 ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}lock_busy" >&2; drain_stdin; exit 1; fi; sleep 1; continue; fi; printf "%s\n" "{FILE_EDIT_ERROR_MARKER}lock_acquire_failed" >&2; drain_stdin; exit 1; done; \
-             cleanup() {{ rm -f -- "$stage" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null || true; }}; \
-             trap cleanup EXIT INT TERM; \
-             if [ "$force_sha_unavailable" = "1" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; \
-             if ! sha256_file /dev/null >/dev/null 2>&1; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; \
+            r#"sh -c 'set -eu; dst=$1; expected=$2; lock_dir=$3; stage=$4; fail_before_finalize=$5; missing_sha=$6; force_sha_unavailable=$7; stale_after_secs=$8; operation_name=$9; \
+              drain_stdin() {{ cat > /dev/null || true; }}; \
+              sha256_file() {{ file=$1; if command -v sha256sum >/dev/null 2>&1; then set -- $(sha256sum -- "$file"); printf "%s\n" "$1"; return 0; fi; if command -v shasum >/dev/null 2>&1; then set -- $(shasum -a 256 -- "$file"); printf "%s\n" "$1"; return 0; fi; return 1; }}; \
+              reclaim_stale_lock() {{ now_epoch=$1; lock_started_path=$lock_dir/started_at; lock_operation_path=$lock_dir/operation; if [ ! -f "$lock_started_path" ]; then return 1; fi; if ! IFS= read -r lock_started_at < "$lock_started_path"; then return 1; fi; case "$lock_started_at" in ""|*[!0-9]*) return 1 ;; esac; if [ "$lock_started_at" -gt "$now_epoch" ]; then return 1; fi; lock_age=$((now_epoch - lock_started_at)); if [ "$lock_age" -lt "$stale_after_secs" ]; then return 1; fi; rm -f -- "$lock_started_path" "$lock_operation_path" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null; }}; \
+              parent=${{dst%/*}}; if [ -z "$parent" ]; then parent=/; fi; if [ ! -d "$parent" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}parent_not_found" >&2; drain_stdin; exit 1; fi; \
+              lock_spins=0; while ! mkdir -- "$lock_dir" 2>/dev/null; do if [ -d "$lock_dir" ]; then if now_epoch=$(date +%s 2>/dev/null); then if reclaim_stale_lock "$now_epoch"; then continue; fi; fi; lock_spins=$((lock_spins + 1)); if [ "$lock_spins" -ge {FILE_EDIT_LOCK_MAX_SPINS} ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}lock_busy" >&2; drain_stdin; exit 1; fi; sleep 1; continue; fi; printf "%s\n" "{FILE_EDIT_ERROR_MARKER}lock_acquire_failed" >&2; drain_stdin; exit 1; done; \
+              lock_started_path=$lock_dir/started_at; lock_operation_path=$lock_dir/operation; if now_epoch=$(date +%s 2>/dev/null); then printf "%s\n" "$now_epoch" > "$lock_started_path" 2>/dev/null || true; fi; printf "%s\n" "$operation_name" > "$lock_operation_path" 2>/dev/null || true; \
+              cleanup() {{ rm -f -- "$stage" "$lock_started_path" "$lock_operation_path" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null || true; }}; \
+              trap cleanup EXIT INT TERM; \
+              if [ "$force_sha_unavailable" = "1" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; \
+              if ! sha256_file /dev/null >/dev/null 2>&1; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; \
              if [ -e "$dst" ]; then if [ ! -f "$dst" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}not_regular_file" >&2; drain_stdin; exit 1; fi; if ! current_hash=$(sha256_file "$dst"); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; drain_stdin; exit 1; fi; else if [ "$expected" != "-" ]; then printf "%s%s\n" "{FILE_EDIT_ACTUAL_SHA_MARKER}" "$missing_sha" >&2; printf "%s\n" "{FILE_EDIT_CONFLICT_MARKER}" >&2; drain_stdin; exit 3; fi; current_hash=$missing_sha; fi; \
              printf "%s%s\n" "{FILE_EDIT_PREVIOUS_SHA_MARKER}" "$current_hash" >&2; \
              if [ "$expected" != "-" ] && [ "$expected" != "$current_hash" ]; then printf "%s%s\n" "{FILE_EDIT_ACTUAL_SHA_MARKER}" "$current_hash" >&2; printf "%s\n" "{FILE_EDIT_CONFLICT_MARKER}" >&2; drain_stdin; exit 3; fi; \
@@ -303,8 +324,8 @@ impl SshMcpServer {
              if [ "$fail_before_finalize" = "1" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; \
              if ! mv -- "$stage" "$dst"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; \
              if ! new_hash=$(sha256_file "$dst"); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; \
-             printf "%s%s\n" "{FILE_EDIT_NEW_SHA_MARKER}" "$new_hash" >&2; \
-             trap - EXIT INT TERM; cleanup' sh '{dst_escaped}' '{expected_escaped}' '{lock_escaped}' '{stage_escaped}' '{force_fail_before_finalize_escaped}' '{missing_sha_escaped}' '{force_sha256_unavailable_escaped}'"#
+              printf "%s%s\n" "{FILE_EDIT_NEW_SHA_MARKER}" "$new_hash" >&2; \
+              trap - EXIT INT TERM; cleanup' sh '{dst_escaped}' '{expected_escaped}' '{lock_escaped}' '{stage_escaped}' '{force_fail_before_finalize_escaped}' '{missing_sha_escaped}' '{force_sha256_unavailable_escaped}' '{lock_stale_after_secs_escaped}' '{operation_name_escaped}'"#
         );
 
         let mut local_tmp_input = match tokio::fs::File::open(&local_tmp_path).await {
@@ -380,16 +401,16 @@ impl SshMcpServer {
         }
 
         if let Some(marker) = parse_file_edit_error_marker(&out.stderr) {
+            if marker == "lock_busy" {
+                return Ok(file_edit_lock_busy_result(remote_path, operation_name));
+            }
+
             let msg = match marker {
                 "not_found" => "Error: remote_path does not exist".to_string(),
                 "parent_not_found" => "Error: remote parent directory does not exist".to_string(),
                 "not_regular_file" => "Error: remote_path is not a regular file".to_string(),
                 "sha256_unavailable" => {
                     "Error: remote host does not provide SHA-256 utilities".to_string()
-                }
-                "lock_busy" => {
-                    "Error: remote_path is being edited by another operation; retry shortly"
-                        .to_string()
                 }
                 "lock_acquire_failed" => {
                     format!(
@@ -479,5 +500,48 @@ impl SshMcpServer {
         Ok(CallToolResult::success(vec![Content::text(
             result.to_string(),
         )]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_edit_lock_busy_result;
+
+    #[test]
+    fn test_file_edit_lock_busy_error_is_structured_retryable_json() {
+        let result = file_edit_lock_busy_result("/tmp/example.txt", "replace-in-file");
+        assert_eq!(result.is_error, Some(true));
+
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.raw.as_text().map(|text| text.text.as_str()))
+            .expect("lock busy error should include text content");
+
+        let json: serde_json::Value =
+            serde_json::from_str(text).expect("lock busy response should be valid JSON");
+        assert_eq!(
+            json.get("error").and_then(|value| value.as_str()),
+            Some("lock_busy")
+        );
+        assert_eq!(
+            json.get("path").and_then(|value| value.as_str()),
+            Some("/tmp/example.txt")
+        );
+        assert_eq!(
+            json.get("retryable").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            json.get("retry_same_tool")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(
+            json.get("message")
+                .and_then(|value| value.as_str())
+                .expect("lock busy response should include message")
+                .contains("do not fall back to exec/sudo-exec")
+        );
     }
 }

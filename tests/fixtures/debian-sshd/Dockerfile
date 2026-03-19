@@ -1,17 +1,21 @@
 FROM debian:trixie-slim
 
-# Install OpenSSH server and GNU tar
+# Install OpenSSH server, GNU tar, rsync, and sudo
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssh-server \
         openssh-client \
         tar \
-        rsync && \
+        rsync \
+        sudo && \
     rm -rf /var/lib/apt/lists/*
 
-# Create test user with password
+# Create test user with password and passwordless sudo
 RUN useradd -m -s /bin/bash test && \
-    echo "test:secret" | chpasswd
+    echo "test:secret" | chpasswd && \
+    usermod -aG sudo test && \
+    printf 'test ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/test && \
+    chmod 440 /etc/sudoers.d/test
 
 # Generate SSH host keys
 RUN ssh-keygen -A

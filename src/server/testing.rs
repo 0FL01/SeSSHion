@@ -41,6 +41,17 @@ impl SshMcpServer {
         self.execute_sudo_command(command).await
     }
 
+    /// Internal method exposed for testing - executes a sudo command with a timeout override
+    #[doc(hidden)]
+    pub async fn test_execute_sudo_command_with_timeout_ms(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_sudo_command_with_timeout(command, Duration::from_millis(timeout_ms))
+            .await
+    }
+
     /// Internal method exposed for testing - checks a process status by PID
     #[doc(hidden)]
     pub async fn test_check_process(
@@ -260,6 +271,15 @@ impl SshMcpServer {
         command: &str,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_background_command(command, None).await
+    }
+
+    /// Internal method exposed for testing - starts a sudo-exec command in background=true mode
+    #[doc(hidden)]
+    pub async fn test_execute_background_sudo_command(
+        &self,
+        command: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_background_sudo_command(command, None).await
     }
 
     #[doc(hidden)]

@@ -335,6 +335,121 @@ async fn test_timeout_actually_fires_with_precision() {
     tracing::info!("Timeout precision test passed - fired after ~800ms");
 }
 
+/// Foreground sudo-exec should auto-detach on timeout like exec.
+#[tokio::test]
+async fn test_sudo_timeout_auto_detaches_to_background() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    tracing::info!("Container ready at {}:{}", host, port);
+
+    let config = Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: Some("secret".to_string()),
+        key: None,
+        su_password: None,
+        sudo_password: None,
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        max_output_tokens: Some(12000),
+        disable_sudo: false,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
+    };
+
+    let server = SshMcpServer::new(config)
+        .await
+        .expect("Failed to create SshMcpServer");
+
+    let timeout_result = server
+        .test_execute_sudo_command_with_timeout_ms("sleep 2; echo done", 1100)
+        .await
+        .expect("sudo-exec timeout override failed");
+
+    let timeout_text = extract_text_from_result(&timeout_result);
+    let timeout_json: serde_json::Value =
+        serde_json::from_str(timeout_text.trim()).expect("timeout response should be valid JSON");
+
+    assert_eq!(
+        timeout_json.get("ok").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        timeout_json.get("timeout").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        timeout_json.get("background").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let job_id = timeout_json
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .expect("timeout response should include job_id");
+
+    let mut completed = false;
+    let deadline = Instant::now() + tokio::time::Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let check = server
+            .test_check_process(job_id, 50)
+            .await
+            .expect("check-process should succeed for detached sudo job");
+        let status: serde_json::Value = serde_json::from_str(&extract_text_from_result(&check))
+            .expect("check-process response should be valid JSON");
+
+        let running = status
+            .get("running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let log_tail = status
+            .get("log_tail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if !running && log_tail.contains("done") {
+            completed = true;
+            assert_eq!(status.get("exit_code").and_then(|v| v.as_u64()), Some(0));
+            break;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+
+    assert!(
+        completed,
+        "detached sudo job should finish and write 'done'"
+    );
+
+    server.shutdown().await;
+    tracing::info!("sudo timeout auto-detach test passed");
+}
+
 /// Regression: preserve $HOME expansion through pipe composition
 #[tokio::test]
 async fn test_posix_home_pipe_semantics_preserved() {

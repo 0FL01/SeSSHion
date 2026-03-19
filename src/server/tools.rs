@@ -38,12 +38,12 @@ PARAMETERS:
 - command (string, required): Command string executed by POSIX-compatible sh under sudo (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
-- timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo-exec returns a timeout error (no auto-detach). Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo-exec auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, log_path}. Ignored when background=true (not validated in that mode).
 - log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
 
 NOTE:
 - Commands are evaluated by POSIX-compatible sh on the remote host. Prefer portable shell syntax over shell-specific extensions.
-- Auto-detach on foreground timeout applies to exec only. For long-running sudo commands, set background=true.
+- Long-running sudo commands can be started explicitly with background=true, or they will auto-detach if a foreground timeout is reached on supported targets.
 
 EXAMPLE:
 {"command": "systemctl restart nginx", "background": false}"#;

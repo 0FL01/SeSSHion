@@ -205,9 +205,9 @@ Execute a command with root privileges using `sudo` via POSIX-compatible `sh`.
 - **Arguments**:
   - `command` (string, required): Command string evaluated by POSIX-compatible `sh` under sudo; use portable shell syntax.
   - `background` (boolean, default: false): Same behavior as `exec` - return immediately and stream output to a local log.
-  - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. On timeout, `sudo-exec` foreground returns a timeout error (no auto-detach). Auto-detach-on-timeout applies to `exec` foreground only. When `background=true`, `timeout_ms` is ignored and NOT validated.
+  - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. If the foreground command exceeds this timeout on a detach-capable target, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`. When `background=true`, `timeout_ms` is ignored and NOT validated.
   - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. When `background=false`, `log_path` is ignored and NOT validated.
-- **Note**: This tool uses the `--sudo-password` provided at startup. For long-running sudo tasks, use `background=true` and monitor via `check-process`.
+- **Note**: This tool uses the `--sudo-password` provided at startup. For long-running sudo tasks, prefer `background=true`; foreground timeouts also auto-detach on supported targets.
 
 ### `check-process`
 Check if a background job is still running and read the tail of its local log (stored on the MCP server).

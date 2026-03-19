@@ -1,4 +1,4 @@
-//! Common validation helpers used across read-file and apply-file-edit tools.
+//! Common validation helpers used across read-file, write-file, and replace-in-file tools.
 
 use std::path::{Component, Path};
 

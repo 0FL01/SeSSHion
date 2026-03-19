@@ -16,6 +16,9 @@
 //!
 //! - `exec` - Execute a shell command on the remote SSH server
 //! - `sudo-exec` - Execute a command with sudo privileges (can be disabled with `--disable-sudo`)
+//! - `read-file` - Read a remote UTF-8 file with preview/head/tail/full modes
+//! - `write-file` - Atomically overwrite or create a remote UTF-8 file
+//! - `replace-in-file` - Atomically replace text within a remote UTF-8 file
 //!
 //! # Example Usage (CLI)
 //!

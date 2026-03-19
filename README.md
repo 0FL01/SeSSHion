@@ -267,26 +267,14 @@ Read a remote file with smart preview to prevent context overflow.
 {"remote_path": "/etc/nginx/nginx.conf", "mode": "full"}
 ```
 
-### `apply-file-edit`
-Atomically edit a remote file with conflict detection and optional partial text replacement.
+### `write-file`
+Atomically overwrite or create a remote file with conflict detection.
 
-- **Modes**:
-  - **Full Replacement**: Replace entire file content atomically
-  - **Partial Replacement**: Replace specific text occurrences within the file
-
-- **Full Replacement Arguments**:
+- **Arguments**:
   - `remote_path` (string, required): Absolute path to the remote file.
   - `new_content` (string, required): Complete new file content (UTF-8, max 1MB).
   - `expected_sha256` (string, optional): 64-char hex SHA-256 hash for optimistic locking.
   - `read_ticket` (string, conditionally required): Opaque token from `read-file`. Required when editing an existing non-empty file. Not required for file creation or zero-byte files.
-
-- **Partial Replacement Arguments**:
-  - `remote_path` (string, required): Absolute path to the remote file (must exist).
-  - `old_text` (string, required): Text to search for and replace.
-  - `new_text` (string, required): Replacement text.
-  - `replace_all` (boolean, default: false): If false and multiple matches found, returns error (deterministic behavior).
-  - `expected_sha256` (string, optional): Expected SHA-256 hash for optimistic locking.
-  - `read_ticket` (string, optional/ignored): Partial mode reads the file internally and does not require a ticket.
 
 - **Response**:
   ```json
@@ -300,17 +288,10 @@ Atomically edit a remote file with conflict detection and optional partial text 
   ```
 
 - **Error Responses**:
-  - `conflict`: File changed since expected_sha256 (or multiple matches with replace_all=false)
-  - `not_found`: File or parent directory doesn't exist (partial mode only works on existing files)
-  - `sha256_unavailable`: Remote host lacks sha256sum/shasum utilities
-  - `invalid_params`: Missing/invalid/expired/wrong-path `read_ticket`, or full-mode edit attempted on existing non-empty file without calling `read-file` first
-
-- **Safety Features**:
-  - Atomic writes via staging + rename (never leaves partially written files)
-  - Lock directory prevents concurrent edits to same file
-  - Automatic rollback on failure
-  - Conflict detection prevents overwriting concurrent changes
-  - Partial mode always pinned to read baseline SHA (prevents race conditions)
+  - `conflict`: File changed since `expected_sha256`
+  - `not_found`: Parent directory doesn't exist
+  - `sha256_unavailable`: Remote host lacks `sha256sum`/`shasum` utilities
+  - `invalid_params`: Missing/invalid/expired/wrong-path `read_ticket`, or edit attempted on an existing non-empty file without calling `read-file` first
 
 **Example - Full replacement with optimistic lock (after calling `read-file`):**
 ```json
@@ -322,7 +303,41 @@ Atomically edit a remote file with conflict detection and optional partial text 
 }
 ```
 
-**Example - Partial text replacement (single match):**
+### `replace-in-file`
+Atomically replace text within an existing remote file with conflict detection.
+
+- **Arguments**:
+  - `remote_path` (string, required): Absolute path to the remote file (must exist).
+  - `old_text` (string, required): Text to search for and replace.
+  - `new_text` (string, required): Replacement text.
+  - `replace_all` (boolean, default: false): If false and multiple matches are found, returns an error.
+  - `expected_sha256` (string, optional): Expected SHA-256 hash for optimistic locking.
+
+- **Response**:
+  ```json
+  {
+    "path": "/etc/app.conf",
+    "previous_sha256": "d2d2d2...",
+    "new_sha256": "a3a3a3...",
+    "bytes_written": 1234,
+    "changed": true
+  }
+  ```
+
+- **Error Responses**:
+  - `conflict`: File changed since expected_sha256 (or baseline hash changed during replace)
+  - `not_found`: File doesn't exist
+  - `sha256_unavailable`: Remote host lacks sha256sum/shasum utilities
+  - `invalid_params`: Empty `old_text` or invalid hash/timeout input
+
+- **Safety Features**:
+  - Atomic writes via staging + rename (never leaves partially written files)
+  - Lock directory prevents concurrent edits to same file
+  - Automatic rollback on failure
+  - Conflict detection prevents overwriting concurrent changes
+  - `replace-in-file` always pins to a read baseline SHA when `expected_sha256` is omitted
+
+**Example - Text replacement (single match):**
 ```json
 {
   "remote_path": "/etc/nginx/nginx.conf",
@@ -332,7 +347,7 @@ Atomically edit a remote file with conflict detection and optional partial text 
 }
 ```
 
-**Example - Partial replacement (all occurrences):**
+**Example - Replace all occurrences:**
 ```json
 {
   "remote_path": "/etc/config.conf",
@@ -346,7 +361,7 @@ Atomically edit a remote file with conflict detection and optional partial text 
 1. Read file: `read-file` with mode `"preview"` or `"full"`
 2. Capture `read_ticket` from the read-file response (and optionally `sha256`)
 3. Make local edits to content
-4. Apply changes: `apply-file-edit` with `read_ticket` (required for existing non-empty files)
+4. Apply changes with `write-file` and `read_ticket` for full rewrites, or use `replace-in-file` for text substitutions
 5. Optional: also send `expected_sha256` for explicit optimistic locking
 6. If conflict error: re-read file (it changed), merge changes, retry
 

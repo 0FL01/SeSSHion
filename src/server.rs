@@ -44,8 +44,7 @@ use crate::ssh::{
 };
 use crate::ticket::TicketSigner;
 use crate::tools::{
-    ApplyFileEditFaultInjection, ApplyFileEditParams, CheckProcessParams, ReadFileMode,
-    ReadFileParams,
+    CheckProcessParams, ReadFileMode, ReadFileParams, ReplaceInFileParams, WriteFileParams,
 };
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
@@ -549,9 +548,14 @@ impl SshMcpServer {
         tools::read_file_tool()
     }
 
-    /// Build apply-file-edit tool definition
-    fn apply_file_edit_tool() -> Tool {
-        tools::apply_file_edit_tool()
+    /// Build write-file tool definition
+    fn write_file_tool() -> Tool {
+        tools::write_file_tool()
+    }
+
+    /// Build replace-in-file tool definition
+    fn replace_in_file_tool() -> Tool {
+        tools::replace_in_file_tool()
     }
 
     /// Get extended documentation for a tool by name
@@ -649,14 +653,15 @@ impl ServerHandler for SshMcpServer {
 
         let mut tools = vec![Self::exec_tool()];
 
-        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer, read-file, apply-file-edit.
+        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer, read-file, write-file, replace-in-file.
         if !self.config.disable_sudo {
             tools.push(Self::sudo_exec_tool());
         }
         tools.push(Self::check_process_tool());
         tools.push(Self::transfer_tool());
         tools.push(Self::read_file_tool());
-        tools.push(Self::apply_file_edit_tool());
+        tools.push(Self::write_file_tool());
+        tools.push(Self::replace_in_file_tool());
 
         Ok(ListToolsResult {
             tools,
@@ -722,11 +727,22 @@ impl ServerHandler for SshMcpServer {
                 let params: ReadFileParams = self.parse_tool_params(args, "read-file")?;
                 self.execute_read_file(params).await
             }
-            "apply-file-edit" | "apply_file_edit" => {
-                let params: ApplyFileEditParams =
-                    self.parse_tool_params(args, "apply-file-edit")?;
-                self.execute_apply_file_edit(params, ApplyFileEditFaultInjection::None)
-                    .await
+            "write-file" => {
+                let params: WriteFileParams = self.parse_tool_params(args, "write-file")?;
+                self.execute_write_file(
+                    params,
+                    crate::server::handlers::file_edit_common::FileEditFaultInjection::None,
+                )
+                .await
+            }
+            "replace-in-file" => {
+                let params: ReplaceInFileParams =
+                    self.parse_tool_params(args, "replace-in-file")?;
+                self.execute_replace_in_file(
+                    params,
+                    crate::server::handlers::file_edit_common::FileEditFaultInjection::None,
+                )
+                .await
             }
             _ => Err(McpError::invalid_params(
                 format!("Unknown tool: {}", tool_name),
@@ -787,9 +803,16 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_file_edit_tool_definition() {
-        let tool = SshMcpServer::apply_file_edit_tool();
-        assert_eq!(tool.name.as_ref(), "apply-file-edit");
+    fn test_write_file_tool_definition() {
+        let tool = SshMcpServer::write_file_tool();
+        assert_eq!(tool.name.as_ref(), "write-file");
+        assert!(tool.description.is_some());
+    }
+
+    #[test]
+    fn test_replace_in_file_tool_definition() {
+        let tool = SshMcpServer::replace_in_file_tool();
+        assert_eq!(tool.name.as_ref(), "replace-in-file");
         assert!(tool.description.is_some());
     }
 
@@ -1114,7 +1137,8 @@ mod tests {
         assert!(SshMcpServer::get_tool_documentation("sudo-exec").is_some());
         assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
         assert!(SshMcpServer::get_tool_documentation("read-file").is_some());
-        assert!(SshMcpServer::get_tool_documentation("apply-file-edit").is_some());
+        assert!(SshMcpServer::get_tool_documentation("write-file").is_some());
+        assert!(SshMcpServer::get_tool_documentation("replace-in-file").is_some());
         assert!(SshMcpServer::get_tool_documentation("unknown").is_none());
     }
 
@@ -1154,11 +1178,19 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_file_edit_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("apply-file-edit").unwrap();
-        assert!(docs.contains("APPLY-FILE-EDIT TOOL"));
+    fn test_write_file_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("write-file").unwrap();
+        assert!(docs.contains("WRITE-FILE TOOL"));
         assert!(docs.contains("expected_sha256"));
         assert!(docs.contains("atomic"));
+    }
+
+    #[test]
+    fn test_replace_in_file_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("replace-in-file").unwrap();
+        assert!(docs.contains("REPLACE-IN-FILE TOOL"));
+        assert!(docs.contains("old_text"));
+        assert!(docs.contains("replace_all"));
     }
 
     #[test]
@@ -1168,7 +1200,8 @@ mod tests {
         let sudo_exec = SshMcpServer::sudo_exec_tool();
         let transfer = SshMcpServer::transfer_tool();
         let read_file = SshMcpServer::read_file_tool();
-        let apply_file_edit = SshMcpServer::apply_file_edit_tool();
+        let write_file = SshMcpServer::write_file_tool();
+        let replace_in_file = SshMcpServer::replace_in_file_tool();
 
         // Descriptions should be present but concise (under 100 chars)
         if let Some(desc) = exec.description {
@@ -1199,10 +1232,17 @@ mod tests {
                 desc.len()
             );
         }
-        if let Some(desc) = apply_file_edit.description {
+        if let Some(desc) = write_file.description {
             assert!(
                 desc.len() < 100,
-                "apply-file-edit description too long: {} chars",
+                "write-file description too long: {} chars",
+                desc.len()
+            );
+        }
+        if let Some(desc) = replace_in_file.description {
+            assert!(
+                desc.len() < 100,
+                "replace-in-file description too long: {} chars",
                 desc.len()
             );
         }

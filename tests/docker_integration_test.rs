@@ -365,7 +365,7 @@ async fn test_mcp_tools_with_docker() {
     assert!(full_tokens > 0);
     assert_eq!(full_tokens, full_total_tokens);
 
-    // 4a-6. apply-file-edit creates a missing file when parent exists.
+    // 4a-6. write-file creates a missing file when parent exists.
     let create_dir = "/tmp/ssh-mcp-apply-create";
     let create_path = "/tmp/ssh-mcp-apply-create/new.txt";
     server
@@ -378,9 +378,9 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to prepare missing-file create fixture");
 
     let create_missing_result = server
-        .test_apply_file_edit(create_path, "created\n", None, None, Some(30_000))
+        .test_write_file(create_path, "created\n", None, None, Some(30_000))
         .await
-        .expect("apply-file-edit create-missing-file call failed");
+        .expect("write-file create-missing-file call failed");
     assert!(
         !create_missing_result.is_error.unwrap_or(false),
         "missing file with existing parent should be created"
@@ -431,9 +431,9 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to remove parent-missing fixture root");
 
     let parent_missing_result = server
-        .test_apply_file_edit(parent_missing_path, "will-fail\n", None, None, Some(30_000))
+        .test_write_file(parent_missing_path, "will-fail\n", None, None, Some(30_000))
         .await
-        .expect("apply-file-edit parent-missing call failed");
+        .expect("write-file parent-missing call failed");
     assert!(
         parent_missing_result.is_error.unwrap_or(false),
         "missing parent should return an error"
@@ -455,7 +455,7 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to reset missing-conflict fixture file");
 
     let missing_conflict_result = server
-        .test_apply_file_edit(
+        .test_write_file(
             missing_conflict_path,
             "must-not-create\n",
             Some("1111111111111111111111111111111111111111111111111111111111111111"),
@@ -463,7 +463,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit missing+expected conflict call failed");
+        .expect("write-file missing+expected conflict call failed");
     assert!(
         missing_conflict_result.is_error.unwrap_or(false),
         "missing file with expected_sha256 should conflict"
@@ -508,20 +508,20 @@ async fn test_mcp_tools_with_docker() {
         "missing+expected conflict should not create destination: {missing_conflict_read_text}"
     );
 
-    // 4a-9. apply-file-edit partial mode: single replacement success.
-    let partial_path = "/tmp/ssh-mcp-apply-file-edit-partial.txt";
+    // 4a-9. replace-in-file single replacement success.
+    let partial_path = "/tmp/ssh-mcp-replace-in-file-partial.txt";
     server
         .test_execute_command(&format!(
             "printf 'alpha beta\\n' > {}",
             ssh_mcp::escape_for_shell(partial_path)
         ))
         .await
-        .expect("failed to create partial apply-file-edit fixture file");
+        .expect("failed to create replace-in-file fixture file");
 
     let partial_single_result = server
-        .test_apply_file_edit_partial(partial_path, "beta", "gamma", false, None, Some(30_000))
+        .test_replace_in_file(partial_path, "beta", "gamma", false, None, Some(30_000))
         .await
-        .expect("apply-file-edit partial single replacement call failed");
+        .expect("replace-in-file single replacement call failed");
     assert!(
         !partial_single_result.is_error.unwrap_or(false),
         "partial single replacement should return success"
@@ -542,7 +542,7 @@ async fn test_mcp_tools_with_docker() {
         Some("alpha gamma\n")
     );
 
-    // 4a-10. apply-file-edit partial mode: replace_all=true updates repeated text.
+    // 4a-10. replace-in-file with replace_all=true updates repeated text.
     server
         .test_execute_command(&format!(
             "printf 'x x x\\n' > {}",
@@ -552,9 +552,9 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to reset partial fixture for replace_all");
 
     let partial_replace_all_result = server
-        .test_apply_file_edit_partial(partial_path, "x", "y", true, None, Some(30_000))
+        .test_replace_in_file(partial_path, "x", "y", true, None, Some(30_000))
         .await
-        .expect("apply-file-edit partial replace_all call failed");
+        .expect("replace-in-file replace_all call failed");
     assert!(
         !partial_replace_all_result.is_error.unwrap_or(false),
         "partial replace_all should return success"
@@ -575,9 +575,9 @@ async fn test_mcp_tools_with_docker() {
         Some("y y y\n")
     );
 
-    // 4a-11. apply-file-edit partial mode: old_text not found returns an error.
+    // 4a-11. replace-in-file: old_text not found returns an error.
     let partial_not_found_result = server
-        .test_apply_file_edit_partial(
+        .test_replace_in_file(
             partial_path,
             "missing-token",
             "z",
@@ -586,7 +586,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit partial not-found call failed");
+        .expect("replace-in-file not-found call failed");
     assert!(
         partial_not_found_result.is_error.unwrap_or(false),
         "partial replacement with missing old_text should return an error"
@@ -597,7 +597,7 @@ async fn test_mcp_tools_with_docker() {
         "unexpected partial not-found error: {partial_not_found_text}"
     );
 
-    // 4a-12. apply-file-edit partial mode: ambiguous match requires replace_all=true.
+    // 4a-12. replace-in-file: ambiguous match requires replace_all=true.
     server
         .test_execute_command(&format!(
             "printf 'dup dup\\n' > {}",
@@ -607,9 +607,9 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to reset partial fixture for ambiguity test");
 
     let partial_ambiguous_result = server
-        .test_apply_file_edit_partial(partial_path, "dup", "solo", false, None, Some(30_000))
+        .test_replace_in_file(partial_path, "dup", "solo", false, None, Some(30_000))
         .await
-        .expect("apply-file-edit partial ambiguous call failed");
+        .expect("replace-in-file ambiguous call failed");
     assert!(
         partial_ambiguous_result.is_error.unwrap_or(false),
         "partial replacement with multiple matches and replace_all=false should error"
@@ -620,8 +620,8 @@ async fn test_mcp_tools_with_docker() {
         "unexpected partial ambiguity error: {partial_ambiguous_text}"
     );
 
-    // 4a-13. apply-file-edit partial mode: missing file must fail and must not create.
-    let partial_missing_path = "/tmp/ssh-mcp-apply-file-edit-partial-missing.txt";
+    // 4a-13. replace-in-file: missing file must fail and must not create.
+    let partial_missing_path = "/tmp/ssh-mcp-replace-in-file-partial-missing.txt";
     server
         .test_execute_command(&format!(
             "sh -c 'set -eu; rm -f -- {}'",
@@ -631,9 +631,9 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to reset missing partial fixture file");
 
     let partial_missing_result = server
-        .test_apply_file_edit_partial(partial_missing_path, "a", "b", false, None, Some(30_000))
+        .test_replace_in_file(partial_missing_path, "a", "b", false, None, Some(30_000))
         .await
-        .expect("apply-file-edit partial missing-file call failed");
+        .expect("replace-in-file missing-file call failed");
     assert!(
         partial_missing_result.is_error.unwrap_or(false),
         "partial replacement on missing file should return an error"
@@ -653,118 +653,14 @@ async fn test_mcp_tools_with_docker() {
         "partial mode should not create missing destination"
     );
 
-    // 4a-14. apply-file-edit invalid parameter combinations return invalid_params.
-    let invalid_mode_error = "apply-file-edit requires exactly one mode: provide new_content for full mode, or provide old_text and new_text for partial mode (replace_all is only valid in partial mode)";
-
-    let invalid_new_content_plus_partial = server
-        .test_apply_file_edit_with_params(ssh_mcp::tools::ApplyFileEditParams {
-            remote_path: partial_path.to_string(),
-            new_content: Some("full".to_string()),
-            old_text: Some("old".to_string()),
-            new_text: Some("new".to_string()),
-            replace_all: None,
-            expected_sha256: None,
-            read_ticket: None,
-            timeout_ms: Some(30_000),
-        })
-        .await
-        .expect_err("new_content + old_text/new_text should fail with invalid_params");
-    assert!(
-        invalid_new_content_plus_partial
-            .to_string()
-            .contains(invalid_mode_error),
-        "unexpected invalid_params error for new_content + old_text/new_text: {invalid_new_content_plus_partial}"
-    );
-
-    let invalid_new_content_plus_replace_all = server
-        .test_apply_file_edit_with_params(ssh_mcp::tools::ApplyFileEditParams {
-            remote_path: partial_path.to_string(),
-            new_content: Some("full".to_string()),
-            old_text: None,
-            new_text: None,
-            replace_all: Some(true),
-            expected_sha256: None,
-            read_ticket: None,
-            timeout_ms: Some(30_000),
-        })
-        .await
-        .expect_err("new_content + replace_all should fail with invalid_params");
-    assert!(
-        invalid_new_content_plus_replace_all
-            .to_string()
-            .contains(invalid_mode_error),
-        "unexpected invalid_params error for new_content + replace_all: {invalid_new_content_plus_replace_all}"
-    );
-
-    let invalid_only_old_text = server
-        .test_apply_file_edit_with_params(ssh_mcp::tools::ApplyFileEditParams {
-            remote_path: partial_path.to_string(),
-            new_content: None,
-            old_text: Some("old".to_string()),
-            new_text: None,
-            replace_all: None,
-            expected_sha256: None,
-            read_ticket: None,
-            timeout_ms: Some(30_000),
-        })
-        .await
-        .expect_err("only old_text should fail with invalid_params");
-    assert!(
-        invalid_only_old_text
-            .to_string()
-            .contains(invalid_mode_error),
-        "unexpected invalid_params error for only old_text: {invalid_only_old_text}"
-    );
-
-    let invalid_only_new_text = server
-        .test_apply_file_edit_with_params(ssh_mcp::tools::ApplyFileEditParams {
-            remote_path: partial_path.to_string(),
-            new_content: None,
-            old_text: None,
-            new_text: Some("new".to_string()),
-            replace_all: None,
-            expected_sha256: None,
-            read_ticket: None,
-            timeout_ms: Some(30_000),
-        })
-        .await
-        .expect_err("only new_text should fail with invalid_params");
-    assert!(
-        invalid_only_new_text
-            .to_string()
-            .contains(invalid_mode_error),
-        "unexpected invalid_params error for only new_text: {invalid_only_new_text}"
-    );
-
-    let invalid_only_replace_all = server
-        .test_apply_file_edit_with_params(ssh_mcp::tools::ApplyFileEditParams {
-            remote_path: partial_path.to_string(),
-            new_content: None,
-            old_text: None,
-            new_text: None,
-            replace_all: Some(true),
-            expected_sha256: None,
-            read_ticket: None,
-            timeout_ms: Some(30_000),
-        })
-        .await
-        .expect_err("only replace_all should fail with invalid_params");
-    assert!(
-        invalid_only_replace_all
-            .to_string()
-            .contains(invalid_mode_error),
-        "unexpected invalid_params error for only replace_all: {invalid_only_replace_all}"
-    );
-
+    // 4a-14. replace-in-file validates old_text before reading remote content.
     let invalid_empty_old_text = server
-        .test_apply_file_edit_with_params(ssh_mcp::tools::ApplyFileEditParams {
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
             remote_path: partial_path.to_string(),
-            new_content: None,
-            old_text: Some(String::new()),
-            new_text: Some("replacement".to_string()),
+            old_text: String::new(),
+            new_text: "replacement".to_string(),
             replace_all: Some(false),
             expected_sha256: None,
-            read_ticket: None,
             timeout_ms: Some(30_000),
         })
         .await
@@ -772,12 +668,12 @@ async fn test_mcp_tools_with_docker() {
     assert!(
         invalid_empty_old_text
             .to_string()
-            .contains("old_text must not be empty in partial mode"),
+            .contains("old_text must not be empty in replace-in-file"),
         "unexpected invalid_params error for empty old_text: {invalid_empty_old_text}"
     );
 
     // 4a-15. Partial mode must not recreate file deleted between read and write.
-    let partial_delete_race_path = "/tmp/ssh-mcp-apply-file-edit-partial-race-delete.txt";
+    let partial_delete_race_path = "/tmp/ssh-mcp-replace-in-file-partial-race-delete.txt";
     server
         .test_execute_command(&format!(
             "printf 'race delete token\\n' > {}",
@@ -787,7 +683,7 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to create partial delete-race fixture file");
 
     let partial_delete_race_result = server
-        .test_apply_file_edit_partial_delete_before_write(
+        .test_replace_in_file_delete_before_write(
             partial_delete_race_path,
             "token",
             "updated",
@@ -796,7 +692,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit partial delete-race call failed");
+        .expect("replace-in-file delete-race call failed");
     assert!(
         partial_delete_race_result.is_error.unwrap_or(false),
         "partial delete race should return conflict-like error"
@@ -833,7 +729,7 @@ async fn test_mcp_tools_with_docker() {
     );
 
     // 4a-16. Partial mode must conflict when file changes between read and write.
-    let partial_mutate_race_path = "/tmp/ssh-mcp-apply-file-edit-partial-race-mutate.txt";
+    let partial_mutate_race_path = "/tmp/ssh-mcp-replace-in-file-partial-race-mutate.txt";
     server
         .test_execute_command(&format!(
             "printf 'race mutate token\\n' > {}",
@@ -843,7 +739,7 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to create partial mutate-race fixture file");
 
     let partial_mutate_race_result = server
-        .test_apply_file_edit_partial_mutate_before_write(
+        .test_replace_in_file_mutate_before_write(
             partial_mutate_race_path,
             "token",
             "updated",
@@ -852,7 +748,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit partial mutate-race call failed");
+        .expect("replace-in-file mutate-race call failed");
     assert!(
         partial_mutate_race_result.is_error.unwrap_or(false),
         "partial mutate race should return conflict-like error"
@@ -895,19 +791,19 @@ async fn test_mcp_tools_with_docker() {
         Some("__ssh_mcp_race_injected__\n")
     );
 
-    // 4a-17. apply-file-edit full mode happy path with optimistic lock.
-    let apply_path = "/tmp/ssh-mcp-apply-file-edit.txt";
+    // 4a-17. write-file happy path with optimistic lock.
+    let apply_path = "/tmp/ssh-mcp-write-file.txt";
     server
         .test_execute_command(&format!(
             "printf 'alpha\\n' > {}",
             ssh_mcp::escape_for_shell(apply_path)
         ))
         .await
-        .expect("failed to create apply-file-edit fixture file");
+        .expect("failed to create write-file fixture file");
 
     let (previous_hash, ticket) = read_file_ticket(&server, apply_path).await;
     let apply_ok_result = server
-        .test_apply_file_edit(
+        .test_write_file(
             apply_path,
             "beta\n",
             Some(previous_hash.as_str()),
@@ -915,7 +811,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit happy-path call failed");
+        .expect("write-file happy-path call failed");
     assert!(
         !apply_ok_result.is_error.unwrap_or(false),
         "happy path should return success"
@@ -923,7 +819,7 @@ async fn test_mcp_tools_with_docker() {
 
     let apply_ok_text = extract_text_from_result(&apply_ok_result);
     let apply_ok_json: serde_json::Value = serde_json::from_str(apply_ok_text.trim())
-        .expect("apply-file-edit happy-path response should be valid JSON");
+        .expect("write-file happy-path response should be valid JSON");
     assert_eq!(
         apply_ok_json.get("path").and_then(|v| v.as_str()),
         Some(apply_path)
@@ -946,7 +842,7 @@ async fn test_mcp_tools_with_docker() {
     let post_apply_read = server
         .test_read_file(apply_path, None)
         .await
-        .expect("failed to read apply-file-edit result");
+        .expect("failed to read write-file result");
     let post_apply_text = extract_text_from_result(&post_apply_read);
     let post_apply_json: serde_json::Value = serde_json::from_str(post_apply_text.trim())
         .expect("post-apply read-file response should be valid JSON");
@@ -958,7 +854,7 @@ async fn test_mcp_tools_with_docker() {
     // 4a-9. Conflict hash mismatch must not modify file.
     let (_conflict_hash, conflict_ticket) = read_file_ticket(&server, apply_path).await;
     let conflict_result = server
-        .test_apply_file_edit(
+        .test_write_file(
             apply_path,
             "gamma\n",
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
@@ -966,7 +862,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit conflict call failed");
+        .expect("write-file conflict call failed");
     assert!(
         conflict_result.is_error.unwrap_or(false),
         "mismatch hash should return an error"
@@ -1003,7 +899,7 @@ async fn test_mcp_tools_with_docker() {
             ssh_mcp::escape_for_shell(apply_path)
         ))
         .await
-        .expect("failed to reset apply-file-edit race fixture file");
+        .expect("failed to reset write-file race fixture file");
 
     let (race_expected, race_ticket) = read_file_ticket(&server, apply_path).await;
     let server_a = server.clone();
@@ -1016,7 +912,7 @@ async fn test_mcp_tools_with_docker() {
     let (race_a_result, race_b_result) = tokio::join!(
         async move {
             server_a
-                .test_apply_file_edit(
+                .test_write_file(
                     apply_path,
                     "race-a\n",
                     Some(race_expected_a.as_str()),
@@ -1027,7 +923,7 @@ async fn test_mcp_tools_with_docker() {
         },
         async move {
             server_b
-                .test_apply_file_edit(
+                .test_write_file(
                     apply_path,
                     "race-b\n",
                     Some(race_expected_b.as_str()),
@@ -1038,8 +934,8 @@ async fn test_mcp_tools_with_docker() {
         }
     );
 
-    let race_a_result = race_a_result.expect("first concurrent apply-file-edit call failed");
-    let race_b_result = race_b_result.expect("second concurrent apply-file-edit call failed");
+    let race_a_result = race_a_result.expect("first concurrent write-file call failed");
+    let race_b_result = race_b_result.expect("second concurrent write-file call failed");
 
     let mut race_successes = 0usize;
     let mut race_conflicts = 0usize;
@@ -1077,7 +973,7 @@ async fn test_mcp_tools_with_docker() {
     let race_read = server
         .test_read_file(apply_path, None)
         .await
-        .expect("failed to read file after concurrent apply-file-edit race");
+        .expect("failed to read file after concurrent write-file race");
     let race_text = extract_text_from_result(&race_read);
     let race_json: serde_json::Value = serde_json::from_str(race_text.trim())
         .expect("post-race read-file response should be valid JSON");
@@ -1094,7 +990,7 @@ async fn test_mcp_tools_with_docker() {
     let oversized_new_content = "x".repeat(1_048_577);
     let (_oversized_hash, oversized_ticket) = read_file_ticket(&server, apply_path).await;
     let oversized_apply_result = server
-        .test_apply_file_edit(
+        .test_write_file(
             apply_path,
             oversized_new_content.as_str(),
             None,
@@ -1102,7 +998,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit oversized call failed");
+        .expect("write-file oversized call failed");
     assert!(
         oversized_apply_result.is_error.unwrap_or(false),
         "oversized new_content should return an error"
@@ -1110,15 +1006,15 @@ async fn test_mcp_tools_with_docker() {
     let oversized_apply_text = extract_text_from_result(&oversized_apply_result);
     assert!(
         oversized_apply_text.contains(
-            "Error: new_content exceeds apply-file-edit size limit (1048576 bytes). Use transfer for large files"
+            "Error: new_content exceeds write-file size limit (1048576 bytes). Use transfer for large files"
         ),
-        "unexpected oversized apply-file-edit error: {oversized_apply_text}"
+        "unexpected oversized write-file error: {oversized_apply_text}"
     );
 
     let post_oversized_read = server
         .test_read_file(apply_path, None)
         .await
-        .expect("failed to read file after oversized apply-file-edit rejection");
+        .expect("failed to read file after oversized write-file rejection");
     let post_oversized_text = extract_text_from_result(&post_oversized_read);
     let post_oversized_json: serde_json::Value = serde_json::from_str(post_oversized_text.trim())
         .expect("post-oversized read-file response should be valid JSON");
@@ -1128,7 +1024,7 @@ async fn test_mcp_tools_with_docker() {
         .expect("post-oversized read-file response should include content");
     assert!(
         post_oversized_content == "race-a\n" || post_oversized_content == "race-b\n",
-        "oversized apply-file-edit should not modify destination"
+        "oversized write-file should not modify destination"
     );
 
     // 4a-12. Hard lock acquisition failure should return a filesystem error (not contention).
@@ -1145,7 +1041,7 @@ async fn test_mcp_tools_with_docker() {
 
     let (lock_error_hash, lock_error_ticket) = read_file_ticket(&server, lock_error_file).await;
     let lock_error_result = server
-        .test_apply_file_edit(
+        .test_write_file(
             lock_error_file,
             "should-not-commit\n",
             Some(lock_error_hash.as_str()),
@@ -1153,7 +1049,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit lock-error call failed");
+        .expect("write-file lock-error call failed");
     assert!(
         lock_error_result.is_error.unwrap_or(false),
         "lock acquisition failure should return an error"
@@ -1161,7 +1057,7 @@ async fn test_mcp_tools_with_docker() {
     let lock_error_text = extract_text_from_result(&lock_error_result);
     assert!(
         lock_error_text
-            .contains("failed to acquire remote apply-file-edit lock due to filesystem error"),
+            .contains("failed to acquire remote write-file lock due to filesystem error"),
         "lock acquisition error should be classified as hard failure: {lock_error_text}"
     );
 
@@ -1188,7 +1084,7 @@ async fn test_mcp_tools_with_docker() {
 
     let (rollback_hash, rollback_ticket) = read_file_ticket(&server, rollback_file).await;
     let rollback_failure_result = server
-        .test_apply_file_edit_fail_before_finalize(
+        .test_write_file_fail_before_finalize(
             rollback_file,
             "should-not-commit\n",
             Some(rollback_hash.as_str()),
@@ -1196,7 +1092,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit rollback-injection call failed");
+        .expect("write-file rollback-injection call failed");
     assert!(
         rollback_failure_result.is_error.unwrap_or(false),
         "rollback injection should return an error"
@@ -1217,7 +1113,7 @@ async fn test_mcp_tools_with_docker() {
     let rollback_hash_after = remote_sha256(&server, rollback_file).await;
     assert_eq!(
         rollback_hash_after, rollback_hash,
-        "failed apply-file-edit must not change destination hash"
+        "failed write-file must not change destination hash"
     );
 
     let rollback_listing = server
@@ -1262,7 +1158,7 @@ async fn test_mcp_tools_with_docker() {
     let (sha_unavailable_hash_before, sha_unavailable_ticket) =
         read_file_ticket(&server, sha_unavailable_file).await;
     let sha_unavailable_result = server
-        .test_apply_file_edit_sha256_unavailable(
+        .test_write_file_sha256_unavailable(
             sha_unavailable_file,
             "should-not-commit\n",
             Some(sha_unavailable_hash_before.as_str()),
@@ -1270,7 +1166,7 @@ async fn test_mcp_tools_with_docker() {
             Some(30_000),
         )
         .await
-        .expect("apply-file-edit sha-unavailable injection call failed");
+        .expect("write-file sha-unavailable injection call failed");
     assert!(
         sha_unavailable_result.is_error.unwrap_or(false),
         "sha-unavailable injection should return an error"
@@ -1299,7 +1195,7 @@ async fn test_mcp_tools_with_docker() {
     let sha_unavailable_hash_after = remote_sha256(&server, sha_unavailable_file).await;
     assert_eq!(
         sha_unavailable_hash_after, sha_unavailable_hash_before,
-        "sha-unavailable apply-file-edit failure must not change destination hash"
+        "sha-unavailable write-file failure must not change destination hash"
     );
 
     let sha_unavailable_listing = server
@@ -1375,7 +1271,7 @@ async fn test_mcp_tools_with_docker() {
             .expect("failed to create enforcement fixture");
 
         let enforce_result = server
-            .test_apply_file_edit(rt_enforce_path, "new-content\n", None, None, Some(30_000))
+            .test_write_file(rt_enforce_path, "new-content\n", None, None, Some(30_000))
             .await;
 
         assert!(
@@ -1403,7 +1299,7 @@ async fn test_mcp_tools_with_docker() {
             .expect("failed to prepare read-ticket create fixture");
 
         let create_result = server
-            .test_apply_file_edit(rt_create_path, "brand-new\n", None, None, Some(30_000))
+            .test_write_file(rt_create_path, "brand-new\n", None, None, Some(30_000))
             .await
             .expect("full-mode create without ticket should succeed");
 
@@ -1426,7 +1322,7 @@ async fn test_mcp_tools_with_docker() {
             .expect("failed to create zero-byte fixture");
 
         let empty_result = server
-            .test_apply_file_edit(rt_empty_path, "now-has-content\n", None, None, Some(30_000))
+            .test_write_file(rt_empty_path, "now-has-content\n", None, None, Some(30_000))
             .await
             .expect("full-mode edit on empty file without ticket should succeed");
 
@@ -1450,7 +1346,7 @@ async fn test_mcp_tools_with_docker() {
 
         let (valid_sha, valid_ticket) = read_file_ticket(&server, rt_valid_path).await;
         let valid_result = server
-            .test_apply_file_edit(
+            .test_write_file(
                 rt_valid_path,
                 "updated\n",
                 Some(valid_sha.as_str()),
@@ -1489,7 +1385,7 @@ async fn test_mcp_tools_with_docker() {
 
         let (_sha_a, ticket_a) = read_file_ticket(&server, rt_wrong_path_a).await;
         let wrong_result = server
-            .test_apply_file_edit(
+            .test_write_file(
                 rt_wrong_path_b,
                 "should-fail\n",
                 None,

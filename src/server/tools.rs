@@ -86,46 +86,59 @@ BEHAVIOR:
 - Default preview mode returns the first 800 lines to avoid context bombs
 - Returns JSON with path/content/returned_lines/truncated/token estimates, sha256, read_ticket, and optional hint
 - sha256: SHA-256 hex digest of the full file content (always present)
-- read_ticket: opaque token required by apply-file-edit when editing non-empty existing files (valid for 10 minutes)
+- read_ticket: opaque token required by write-file when editing non-empty existing files (valid for 10 minutes)
 - Enforces deterministic size limits (aligned with max_output_tokens, hard-capped)
 - Returns an error for missing path, non-file paths, oversized files, or invalid UTF-8 content
 
 EXAMPLE:
 {"remote_path": "/etc/nginx/nginx.conf", "mode": "preview"}"#;
 
-    pub const APPLY_FILE_EDIT: &str = r#"APPLY-FILE-EDIT TOOL
-Atomically overwrite/create or patch-replace a remote UTF-8 file with optional optimistic locking.
+    pub const WRITE_FILE: &str = r#"WRITE-FILE TOOL
+Atomically overwrite or create a remote UTF-8 file with optional optimistic locking.
 
 PARAMETERS:
 - remote_path (string, required): Absolute remote file path to overwrite/create
-- new_content (string): Full replacement content (max 1048576 bytes, full mode)
-- old_text (string): Source text to replace (partial mode)
-- new_text (string): Replacement text (partial mode)
-- replace_all (boolean): Partial mode flag; default false. If false, exactly one match is required.
+- new_content (string, required): Full replacement content (max 1048576 bytes)
 - expected_sha256 (string): Optional 64-char hex SHA-256 precondition of current file
-- read_ticket (string): Opaque token from read-file response. Required in full mode when editing a non-empty existing file. Not needed for file creation or empty files. Partial mode does not require it.
+- read_ticket (string): Opaque token from read-file response. Required when editing a non-empty existing file. Not needed for file creation or empty files.
 - timeout_ms (integer): Optional timeout override in milliseconds
 
 BEHAVIOR:
 - Validates remote_path like read-file
-- Runtime mode is selected by fields:
-  - Full mode: set new_content only
-  - Partial mode: set old_text and new_text only
-  - Mixed/invalid combinations return invalid_params
 - Acquires a per-file remote lock, computes SHA-256, and performs compare+replace in one transaction
 - Creates the target file atomically when it is missing and the parent directory already exists
-- Partial mode requires an existing regular file and never creates a new file
-- Partial mode returns an error when old_text is not found
-- Partial mode with replace_all=false requires exactly one match; otherwise returns an error asking to use replace_all
 - If expected_sha256 is set and does not match, returns conflict and does not modify file
 - If expected_sha256 is set while file is missing, returns conflict and does not create file
 - Uses a same-directory sibling staging file and atomic rename
-- Full mode requires a valid read_ticket when the target file exists and is non-empty; obtain it by calling read-file first
-- Partial mode does not require read_ticket (file is read internally)
+- Requires a valid read_ticket when the target file exists and is non-empty; obtain it by calling read-file first
 - Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
 
 EXAMPLE:
 {"remote_path":"/etc/app.conf","new_content":"key=value\n","expected_sha256":"d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"}"#;
+
+    pub const REPLACE_IN_FILE: &str = r#"REPLACE-IN-FILE TOOL
+Atomically replace text within an existing remote UTF-8 file with optional optimistic locking.
+
+PARAMETERS:
+- remote_path (string, required): Absolute remote file path to edit
+- old_text (string, required): Source text to replace
+- new_text (string, required): Replacement text
+- replace_all (boolean): Replace all matches when true; default false requires exactly one match
+- expected_sha256 (string): Optional 64-char hex SHA-256 precondition of current file
+- timeout_ms (integer): Optional timeout override in milliseconds
+
+BEHAVIOR:
+- Validates remote_path like read-file
+- Reads the file internally using read-file full mode
+- Requires an existing regular file and never creates a new file
+- Returns an error when old_text is not found
+- With replace_all=false, requires exactly one match; otherwise returns an error asking to use replace_all
+- Computes a baseline SHA-256 for race-safe compare+replace when expected_sha256 is not supplied
+- Uses the same atomic write transaction as write-file
+- Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
+
+EXAMPLE:
+{"remote_path":"/etc/nginx/nginx.conf","old_text":"listen 80;","new_text":"listen 8080;"}"#;
 }
 
 fn command_tool(
@@ -281,7 +294,7 @@ pub(super) fn read_file_tool() -> Tool {
     )
 }
 
-pub(super) fn apply_file_edit_tool() -> Tool {
+pub(super) fn write_file_tool() -> Tool {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -294,39 +307,69 @@ pub(super) fn apply_file_edit_tool() -> Tool {
                 "description": "Full replacement UTF-8 content (max 1048576 bytes)",
                 "maxLength": 1048576
             },
-            "old_text": {
-                "type": "string",
-                "description": "Partial mode: source text to replace"
-            },
-            "new_text": {
-                "type": "string",
-                "description": "Partial mode: replacement text"
-            },
-            "replace_all": {
-                "type": "boolean",
-                "default": false,
-                "description": "Partial mode: replace all matches (default false requires exactly one match)"
-            },
             "expected_sha256": {
                 "type": "string",
                 "description": "Optional 64-char hex SHA-256 precondition of current file"
             },
             "read_ticket": {
                 "type": "string",
-                "description": "Opaque read-ticket from read-file (required when editing a non-empty existing file in full mode)"
+                "description": "Opaque read-ticket from read-file (required when editing a non-empty existing file)"
             },
             "timeout_ms": {
                 "type": "integer",
                 "description": "Optional timeout override in milliseconds"
             }
         },
-        "required": ["remote_path"]
+        "required": ["remote_path", "new_content"],
+        "additionalProperties": false
     });
 
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
     Tool::new(
-        "apply-file-edit",
-        "Atomically overwrite/create or patch-replace a remote file with optional SHA-256 precondition.",
+        "write-file",
+        "Atomically overwrite or create a remote file.",
+        Arc::new(schema_obj),
+    )
+}
+
+pub(super) fn replace_in_file_tool() -> Tool {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "remote_path": {
+                "type": "string",
+                "description": "Absolute remote file path to edit"
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Source text to replace"
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Replacement text"
+            },
+            "replace_all": {
+                "type": "boolean",
+                "default": false,
+                "description": "Replace all matches (default false requires exactly one match)"
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional 64-char hex SHA-256 precondition of current file"
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Optional timeout override in milliseconds"
+            }
+        },
+        "required": ["remote_path", "old_text", "new_text"],
+        "additionalProperties": false
+    });
+
+    let schema_obj = schema.as_object().cloned().unwrap_or_default();
+    Tool::new(
+        "replace-in-file",
+        "Atomically replace text in a remote file.",
         Arc::new(schema_obj),
     )
 }
@@ -337,7 +380,8 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         "sudo-exec" => Some(tool_docs::SUDO_EXEC),
         "transfer" => Some(tool_docs::TRANSFER),
         "read-file" => Some(tool_docs::READ_FILE),
-        "apply-file-edit" => Some(tool_docs::APPLY_FILE_EDIT),
+        "replace-in-file" => Some(tool_docs::REPLACE_IN_FILE),
+        "write-file" => Some(tool_docs::WRITE_FILE),
         _ => None,
     }
 }

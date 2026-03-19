@@ -23,6 +23,16 @@ pub(in crate::server) enum FileEditFaultInjection {
     PartialMutateBeforeWrite,
 }
 
+pub(in crate::server) struct FileWriteTransactionRequest<'a> {
+    pub remote_path: &'a str,
+    pub new_content: &'a str,
+    pub expected_sha256: Option<String>,
+    pub timeout: Duration,
+    pub fault_injection: FileEditFaultInjection,
+    pub too_large_error: String,
+    pub operation_name: &'a str,
+}
+
 impl SshMcpServer {
     pub(in crate::server) async fn compute_partial_baseline_sha256(
         &self,
@@ -177,14 +187,18 @@ impl SshMcpServer {
 
     pub(in crate::server) async fn execute_file_write_transaction(
         &self,
-        remote_path: &str,
-        new_content: &str,
-        expected_sha256: Option<String>,
-        timeout: Duration,
-        fault_injection: FileEditFaultInjection,
-        too_large_error: String,
-        operation_name: &str,
+        request: FileWriteTransactionRequest<'_>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let FileWriteTransactionRequest {
+            remote_path,
+            new_content,
+            expected_sha256,
+            timeout,
+            fault_injection,
+            too_large_error,
+            operation_name,
+        } = request;
+
         let bytes_written = new_content.len();
         if bytes_written > FILE_EDIT_HARD_MAX_BYTES {
             return Ok(CallToolResult::error(vec![Content::text(too_large_error)]));

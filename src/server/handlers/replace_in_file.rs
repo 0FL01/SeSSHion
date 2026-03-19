@@ -4,7 +4,9 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::server::SshMcpServer;
-use crate::server::handlers::file_edit_common::FileEditFaultInjection;
+use crate::server::handlers::file_edit_common::{
+    FileEditFaultInjection, FileWriteTransactionRequest,
+};
 use crate::server::validation::common::extract_text_from_call_tool_result;
 use crate::server::validation::common::validate_read_file_path;
 use crate::server::validation::file_edit::replace_in_file_too_large_error;
@@ -131,17 +133,17 @@ impl SshMcpServer {
             current_content.replacen(old_text.as_str(), new_text.as_str(), 1)
         };
 
-        self.execute_file_write_transaction(
-            remote_path.as_str(),
-            updated_content.as_str(),
-            user_expected_sha256.or(partial_baseline_sha256),
+        self.execute_file_write_transaction(FileWriteTransactionRequest {
+            remote_path: remote_path.as_str(),
+            new_content: updated_content.as_str(),
+            expected_sha256: user_expected_sha256.or(partial_baseline_sha256),
             timeout,
             fault_injection,
-            replace_in_file_too_large_error(
+            too_large_error: replace_in_file_too_large_error(
                 crate::server::validation::file_edit::FILE_EDIT_HARD_MAX_BYTES,
             ),
-            "replace-in-file",
-        )
+            operation_name: "replace-in-file",
+        })
         .await
     }
 }

@@ -4,7 +4,9 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::server::SshMcpServer;
-use crate::server::handlers::file_edit_common::FileEditFaultInjection;
+use crate::server::handlers::file_edit_common::{
+    FileEditFaultInjection, FileWriteTransactionRequest,
+};
 use crate::server::validation::common::validate_read_file_path;
 use crate::server::validation::file_edit::write_file_too_large_error;
 use crate::server::validation::read_file::normalize_sha256_hex;
@@ -71,17 +73,17 @@ impl SshMcpServer {
             }
         }
 
-        self.execute_file_write_transaction(
-            remote_path.as_str(),
-            new_content.as_str(),
-            user_expected_sha256,
+        self.execute_file_write_transaction(FileWriteTransactionRequest {
+            remote_path: remote_path.as_str(),
+            new_content: new_content.as_str(),
+            expected_sha256: user_expected_sha256,
             timeout,
             fault_injection,
-            write_file_too_large_error(
+            too_large_error: write_file_too_large_error(
                 crate::server::validation::file_edit::FILE_EDIT_HARD_MAX_BYTES,
             ),
-            "write-file",
-        )
+            operation_name: "write-file",
+        })
         .await
     }
 }

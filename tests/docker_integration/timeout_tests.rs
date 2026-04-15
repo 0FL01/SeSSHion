@@ -407,6 +407,29 @@ async fn test_sudo_timeout_auto_detaches_to_background() {
         timeout_json.get("background").and_then(|v| v.as_bool()),
         Some(true)
     );
+    assert_eq!(
+        timeout_json.get("still_running").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(timeout_json.get("exit_code").and_then(|v| v.as_u64()), None);
+    assert_eq!(
+        timeout_json.get("tail_lines_used").and_then(|v| v.as_u64()),
+        Some(50)
+    );
+    assert!(
+        timeout_json
+            .get("elapsed_time")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty()),
+        "timeout response should include elapsed_time"
+    );
+    assert!(
+        timeout_json
+            .get("log_tail")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "timeout response should include log_tail"
+    );
 
     let job_id = timeout_json
         .get("job_id")

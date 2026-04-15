@@ -11,7 +11,7 @@ PARAMETERS:
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
   (+ remote_log_path deprecated)
-- timeout_ms (integer): Foreground-only. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Foreground-only. If timeout is reached on a target that supports detach handoff, exec auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, still_running, log_tail}. Ignored when background=true (not validated in that mode).
 - log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
 
 BACKGROUND MODE:
@@ -19,7 +19,7 @@ For commands longer than RPC timeout, use background=true:
 1. Command runs detached on the remote host
 2. Returns immediately with job_id, pid, LOCAL log_path on the MCP server
 3. Monitor: use check-process with job_id (preferred) or ps -p <pid> -o pid,etime,cmd
-4. View output: use check-process with job_id; or tail -n 50 '<log_path>' (local spool file)
+4. View output: use check-process with job_id; or inspect timeout response fields `log_tail` / `still_running`; or tail -n 50 '<log_path>' (local spool file)
 
 NOTE:
 - remote_log_path is kept for backward compatibility only (deprecated) and will be removed in a future version.
@@ -38,7 +38,7 @@ PARAMETERS:
 - command (string, required): Command string executed by POSIX-compatible sh under sudo (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
-- timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo-exec auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, log_path}. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo-exec auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, still_running, log_tail, log_path}. Ignored when background=true (not validated in that mode).
 - log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
 
 NOTE:

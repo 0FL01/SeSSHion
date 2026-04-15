@@ -2,6 +2,14 @@ use rmcp::model::{CallToolResult, Content};
 
 pub(crate) const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
 
+pub(crate) struct BackgroundTimeoutSnapshot<'a> {
+    pub still_running: bool,
+    pub exit_code: Option<u32>,
+    pub elapsed_time: &'a str,
+    pub log_tail: &'a str,
+    pub tail_lines_used: usize,
+}
+
 fn truncate_with_flag(input: &str, limit_chars: usize) -> (String, bool) {
     let mut iter = input.chars();
     let snippet: String = iter.by_ref().take(limit_chars).collect();
@@ -33,16 +41,28 @@ pub(crate) fn background_json_timeout(
     pid: u32,
     local_log_path: &str,
     remote_log_path: &str,
+    snapshot: &BackgroundTimeoutSnapshot<'_>,
 ) -> CallToolResult {
-    let hint = format!(
-        "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with job_id={job_id} to retrieve output."
-    );
+    let hint = if snapshot.still_running {
+        format!(
+            "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with job_id={job_id} to retrieve output."
+        )
+    } else {
+        format!(
+            "TIMEOUT_RECOVERY: Foreground timeout elapsed after handoff, but the background job is no longer running. Inspect exit_code/log_tail or use check-process tool with job_id={job_id} before retrying."
+        )
+    };
     let body = serde_json::json!({
         "ok": false,
         "timeout": true,
         "background": true,
         "job_id": job_id,
         "pid": pid,
+        "still_running": snapshot.still_running,
+        "exit_code": snapshot.exit_code,
+        "elapsed_time": snapshot.elapsed_time,
+        "log_tail": snapshot.log_tail,
+        "tail_lines_used": snapshot.tail_lines_used,
         "log_path": local_log_path,
         "remote_log_path": remote_log_path,
         "hint": hint,

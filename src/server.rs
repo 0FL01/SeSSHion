@@ -1081,6 +1081,13 @@ mod tests {
             4242,
             "/tmp/ssh-mcp/local.log",
             "/tmp/.ssh-mcp-job-job-42.log",
+            &crate::background::response::BackgroundTimeoutSnapshot {
+                still_running: true,
+                exit_code: None,
+                elapsed_time: "00:01",
+                log_tail: "tail line",
+                tail_lines_used: 50,
+            },
         );
         let text = extract_text_from_result(&result);
 
@@ -1092,6 +1099,22 @@ mod tests {
         assert_eq!(
             value.get("background").and_then(|v| v.as_bool()),
             Some(true)
+        );
+        assert_eq!(
+            value.get("still_running").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            value.get("tail_lines_used").and_then(|v| v.as_u64()),
+            Some(50)
+        );
+        assert_eq!(
+            value.get("elapsed_time").and_then(|v| v.as_str()),
+            Some("00:01")
+        );
+        assert_eq!(
+            value.get("log_tail").and_then(|v| v.as_str()),
+            Some("tail line")
         );
 
         let hint = value
@@ -1150,6 +1173,7 @@ mod tests {
         assert!(docs.contains("BACKGROUND MODE:"));
         assert!(docs.contains("command"));
         assert!(docs.contains("background"));
+        assert!(docs.contains("still_running"));
     }
 
     #[test]

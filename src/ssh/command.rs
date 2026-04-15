@@ -1136,6 +1136,7 @@ impl SshConnectionManager {
         let log_path = job_guard.log_path.clone();
         let status = job_guard.status;
         let exit_code_i32 = job_guard.exit_code;
+        let elapsed_time = job_guard.elapsed_time();
         drop(job_guard);
 
         let running = match status {
@@ -1154,7 +1155,7 @@ impl SshConnectionManager {
         Ok(ProcessStatus {
             running,
             exit_code,
-            elapsed_time: String::new(),
+            elapsed_time,
             command,
             log_tail,
         })
@@ -1168,7 +1169,7 @@ impl SshConnectionManager {
     }
 }
 
-async fn read_local_log_tail(path: &Path, lines: usize) -> Result<String> {
+pub(crate) async fn read_local_log_tail(path: &Path, lines: usize) -> Result<String> {
     if lines == 0 {
         return Ok(String::new());
     }

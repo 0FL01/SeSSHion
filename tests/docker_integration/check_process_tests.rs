@@ -40,6 +40,11 @@ struct TimeoutBackgroundResponse {
     background: bool,
     job_id: String,
     pid: u32,
+    still_running: bool,
+    exit_code: Option<u32>,
+    elapsed_time: String,
+    log_tail: String,
+    tail_lines_used: usize,
     log_path: String,
     hint: String,
 }
@@ -150,8 +155,8 @@ async fn test_check_process_running() {
         "Command name should be captured"
     );
     assert!(
-        status.elapsed_time.is_empty() || status.elapsed_time.chars().any(|c| c.is_ascii_digit()),
-        "elapsed_time should be empty or include digits; got: '{}'",
+        !status.elapsed_time.is_empty() && status.elapsed_time.chars().any(|c| c.is_ascii_digit()),
+        "elapsed_time should be populated and include digits; got: '{}'",
         status.elapsed_time
     );
 
@@ -514,10 +519,31 @@ async fn test_check_process_full_workflow_timeout() {
 
     assert!(!timeout_resp.job_id.is_empty(), "job_id should be present");
     assert!(
+        timeout_resp.still_running,
+        "timeout handoff should report running=true"
+    );
+    assert_eq!(
+        timeout_resp.exit_code, None,
+        "running timeout handoff should not have exit code"
+    );
+    assert!(
+        !timeout_resp.elapsed_time.is_empty(),
+        "timeout handoff should include elapsed_time"
+    );
+    assert_eq!(
+        timeout_resp.tail_lines_used, 50,
+        "timeout handoff should report the tail_lines_used snapshot"
+    );
+    assert!(
         !timeout_resp.log_path.is_empty(),
         "local log_path should be present"
     );
     assert_local_log_file_present(&timeout_resp.log_path);
+    assert!(
+        timeout_resp.log_tail.is_empty(),
+        "sleep-only timeout handoff should not have unexpected log output: {:?}",
+        timeout_resp.log_tail
+    );
     assert!(
         timeout_resp.hint.contains("TIMEOUT_RECOVERY"),
         "hint should contain TIMEOUT_RECOVERY"
@@ -667,6 +693,12 @@ async fn test_check_process_background_exec_workflow() {
             serde_json::from_str(&text).expect("Failed to parse timeout response");
 
         assert!(!timeout_resp.job_id.is_empty(), "job_id should be present");
+        assert!(
+            timeout_resp.still_running,
+            "timeout handoff should initially report the job as still running"
+        );
+        assert_eq!(timeout_resp.exit_code, None);
+        assert_eq!(timeout_resp.tail_lines_used, 50);
         assert!(
             !timeout_resp.log_path.is_empty(),
             "local log_path should be present"

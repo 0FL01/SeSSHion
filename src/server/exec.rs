@@ -10,16 +10,28 @@ use tracing::{debug, error, warn};
 use crate::background::OutputStreamer;
 use crate::background::detach::DetachMode;
 use crate::background::marker::read_background_markers_from_channel;
-use crate::background::response::{background_json_err, background_json_ok};
+use crate::background::response::{
+    BackgroundTimeoutSnapshot, background_json_err, background_json_ok, background_json_timeout,
+};
 use crate::background::wrapper::remote_job_log_path;
+use crate::ssh::command::read_local_log_tail;
 use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{CommandOutput, sanitize_command, wrap_sudo_command};
+use crate::tools::DEFAULT_CHECK_PROCESS_TAIL_LINES;
 
 use super::SshMcpServer;
 
 pub(super) enum BackgroundPrivilege<'a> {
     Normal,
     Sudo { password: Option<&'a str> },
+}
+
+struct TimeoutRecoverySnapshot {
+    still_running: bool,
+    exit_code: Option<u32>,
+    elapsed_time: String,
+    log_tail: String,
+    tail_lines_used: usize,
 }
 
 impl SshMcpServer {
@@ -129,11 +141,21 @@ impl SshMcpServer {
                 }
             },
             Err(_) => {
-                return Ok(crate::background::response::background_json_timeout(
+                let snapshot = self
+                    .build_timeout_recovery_snapshot(&job_id, markers.pid, &final_log_path_buf)
+                    .await;
+                return Ok(background_json_timeout(
                     &job_id,
                     markers.pid,
                     &final_log_path,
                     &markers.remote_log_path,
+                    &BackgroundTimeoutSnapshot {
+                        still_running: snapshot.still_running,
+                        exit_code: snapshot.exit_code,
+                        elapsed_time: &snapshot.elapsed_time,
+                        log_tail: &snapshot.log_tail,
+                        tail_lines_used: snapshot.tail_lines_used,
+                    },
                 ));
             }
         };
@@ -248,6 +270,77 @@ impl SshMcpServer {
             ..Default::default()
         };
         Ok(Self::calltool_from_command_output(output))
+    }
+
+    async fn build_timeout_recovery_snapshot(
+        &self,
+        job_id: &str,
+        pid: u32,
+        final_log_path_buf: &PathBuf,
+    ) -> TimeoutRecoverySnapshot {
+        let tail_lines_used = DEFAULT_CHECK_PROCESS_TAIL_LINES;
+
+        match self
+            .connection
+            .check_process(job_id, tail_lines_used, self.job_registry.as_ref())
+            .await
+        {
+            Ok(status) => TimeoutRecoverySnapshot {
+                still_running: status.running,
+                exit_code: status.exit_code,
+                elapsed_time: status.elapsed_time,
+                log_tail: status.log_tail,
+                tail_lines_used,
+            },
+            Err(e) => {
+                warn!(
+                    job_id = ?job_id,
+                    pid,
+                    error = ?e,
+                    "Failed to gather timeout recovery snapshot via check-process path"
+                );
+
+                let mut still_running = true;
+                let mut exit_code = None;
+                let mut elapsed_time = String::new();
+
+                if let Some(job) = self.job_registry.get(job_id).await {
+                    let job_guard = job.lock().await;
+                    still_running =
+                        matches!(job_guard.status, crate::background::JobStatus::Running);
+                    exit_code = job_guard
+                        .exit_code
+                        .and_then(|code| u32::try_from(code).ok());
+                    elapsed_time = job_guard.elapsed_time();
+                }
+
+                let log_tail = match read_local_log_tail(
+                    final_log_path_buf.as_path(),
+                    tail_lines_used,
+                )
+                .await
+                {
+                    Ok(log_tail) => log_tail,
+                    Err(log_err) => {
+                        warn!(
+                            job_id = ?job_id,
+                            pid,
+                            error = ?log_err,
+                            "Failed to read local log tail for timeout recovery snapshot"
+                        );
+                        String::new()
+                    }
+                };
+
+                TimeoutRecoverySnapshot {
+                    still_running,
+                    exit_code: if still_running { None } else { exit_code },
+                    elapsed_time,
+                    log_tail,
+                    tail_lines_used,
+                }
+            }
+        }
     }
 
     async fn try_open_and_exec_background_wrapper(

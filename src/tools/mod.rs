@@ -20,6 +20,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub(crate) const DEFAULT_CHECK_PROCESS_TAIL_LINES: usize = 50;
+
 fn default_read_file_mode() -> ReadFileMode {
     ReadFileMode::Preview
 }
@@ -172,7 +174,7 @@ pub struct ReplaceInFileParams {
 }
 
 fn default_tail_lines() -> usize {
-    50
+    DEFAULT_CHECK_PROCESS_TAIL_LINES
 }
 
 #[cfg(test)]

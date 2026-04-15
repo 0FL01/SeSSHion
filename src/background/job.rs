@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::Mutex;
 
@@ -55,6 +55,22 @@ pub struct NewRunningJob {
     pub connection_id: String,
 }
 
+fn format_ps_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}-{hours:02}:{minutes:02}:{seconds:02}")
+    } else if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 impl JobState {
     pub fn new_running(opts: NewRunningJob) -> Self {
         Self {
@@ -72,6 +88,12 @@ impl JobState {
 
     pub fn is_terminal(&self) -> bool {
         matches!(self.status, JobStatus::Completed | JobStatus::Failed)
+    }
+
+    pub fn elapsed_time(&self) -> String {
+        let end_time = self.completed_at.unwrap_or_else(SystemTime::now);
+        let elapsed = end_time.duration_since(self.start_time).unwrap_or_default();
+        format_ps_elapsed(elapsed)
     }
 
     pub fn mark_exit(&mut self, exit_code: i32) {

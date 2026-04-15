@@ -8,8 +8,8 @@ use crate::error::{Result, SshMcpError};
 /// Default timeout for command execution in milliseconds
 pub const DEFAULT_TIMEOUT_MS: u64 = 60_000; // 60 seconds
 
-/// Default max characters for command output (None = unlimited)
-pub const DEFAULT_MAX_CHARS: Option<usize> = Some(1000);
+/// Default max characters for command length (None = unlimited)
+pub const DEFAULT_MAX_CHARS: Option<usize> = Some(2048);
 
 /// Connection timeout in seconds
 pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
@@ -79,7 +79,7 @@ pub struct Args {
 
     /// Maximum characters for command length.
     /// Use "none", "0", or negative value to disable limit.
-    /// Default: 1000
+    /// Default: 2048
     #[arg(long = "maxChars", env = "SSH_MCP_MAX_CHARS")]
     pub max_chars: Option<String>,
 
@@ -393,6 +393,13 @@ mod tests {
     #[test]
     fn test_parse_max_chars_not_provided() {
         assert_eq!(parse_max_chars(None), DEFAULT_MAX_CHARS);
+    }
+
+    #[test]
+    fn test_config_from_args_uses_default_max_chars() {
+        let config = Config::from_args(base_args()).unwrap();
+
+        assert_eq!(config.max_chars, Some(2048));
     }
 
     #[test]

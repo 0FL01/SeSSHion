@@ -82,7 +82,7 @@ The server is configured via CLI arguments or environment variables.
 | `--su-password` | `SSH_MCP_SU_PASSWORD` | Password for `su` elevation |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` pipes |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 60000) |
-| `--maxChars` | `SSH_MCP_MAX_CHARS` | Output limit (default: 1000, "none" to disable) |
+| `--maxChars` | `SSH_MCP_MAX_CHARS` | Command length limit (default: 2048, "none" to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo-exec` tool |
 | `--log-level` | `SSH_MCP_LOG_LEVEL` | Log level: trace, debug, info, warn, error (default: info) |
 | `--log-file` | `SSH_MCP_LOG_FILE` | Log file path (base name; daily/hourly adds date suffix) |
@@ -112,7 +112,7 @@ Add this to your `opencode.jsonc`:
         "--user=agent-nc",
         "--key=/path/to/private/key",
         "--timeout=30000",
-        "--maxChars=1000"
+        "--maxChars=2048"
       ],
       "enabled": true
     }
@@ -134,7 +134,7 @@ Add this to your `opencode.jsonc`:
         "--user=agent-nc",
         "--password=your-password",
         "--timeout=30000",
-        "--maxChars=1000"
+        "--maxChars=2048"
       ],
       "enabled": true
     }
@@ -158,7 +158,7 @@ Add this to your `claude_desktop_config.json`:
         "--user=agent-nc",
         "--key=/path/to/private/key",
         "--timeout=30000",
-        "--maxChars=1000"
+        "--maxChars=2048"
       ]
     }
   }
@@ -177,7 +177,7 @@ Add this to your `claude_desktop_config.json`:
         "--user=agent-nc",
         "--password=your-password",
         "--timeout=30000",
-        "--maxChars=1000"
+        "--maxChars=2048"
       ]
     }
   }

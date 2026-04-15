@@ -16,7 +16,7 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::background::detach::{DetachMode, DetachProbeOutput, DetachProbeRequest};
 use crate::background::job::NewRunningJob;
@@ -289,6 +289,15 @@ impl SshMcpServer {
         self.job_registry
             .insert(job_id.to_string(), Arc::clone(&job))
             .await;
+
+        let persisted = {
+            let guard = job.lock().await;
+            guard.clone()
+        };
+        if let Err(e) = self.spooler.persist_job_state(&persisted).await {
+            warn!(job_id = ?job_id, error = ?e, "failed to persist running job state");
+        }
+
         job
     }
 
@@ -1022,13 +1031,8 @@ mod tests {
         let long_error = "e".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
         let long_stderr = "s".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
 
-        let result = background_json_err(
-            "job-1",
-            "/tmp/ssh-mcp/job-1.log",
-            Some("/tmp/.ssh-mcp-job-job-1.log"),
-            &long_error,
-            &long_stderr,
-        );
+        let result =
+            background_json_err("job-1", "/tmp/ssh-mcp/job-1.log", &long_error, &long_stderr);
         let text = extract_text_from_result(&result);
 
         let value: serde_json::Value =
@@ -1080,11 +1084,13 @@ mod tests {
             "job-42",
             4242,
             "/tmp/ssh-mcp/local.log",
-            "/tmp/.ssh-mcp-job-job-42.log",
             &crate::background::response::BackgroundTimeoutSnapshot {
+                state: "running",
                 still_running: true,
                 exit_code: None,
+                state_reason: None,
                 elapsed_time: "00:01",
+                log_exists: true,
                 log_tail: "tail line",
                 tail_lines_used: 50,
             },
@@ -1104,6 +1110,7 @@ mod tests {
             value.get("still_running").and_then(|v| v.as_bool()),
             Some(true)
         );
+        assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("running"));
         assert_eq!(
             value.get("tail_lines_used").and_then(|v| v.as_u64()),
             Some(50)

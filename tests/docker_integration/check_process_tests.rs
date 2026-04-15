@@ -15,10 +15,14 @@ use std::time::Duration;
 /// Response from check_process tool
 #[derive(Debug, Deserialize)]
 struct CheckProcessResponse {
+    state: String,
     running: bool,
     exit_code: Option<u32>,
+    state_reason: Option<String>,
     elapsed_time: String,
     command: String,
+    log_path: String,
+    log_exists: bool,
     log_tail: String,
 }
 
@@ -30,6 +34,7 @@ struct BackgroundExecResponse {
     job_id: String,
     pid: u32,
     log_path: String,
+    log_exists: bool,
 }
 
 /// Response from timeout foreground command that gets backgrounded
@@ -40,9 +45,12 @@ struct TimeoutBackgroundResponse {
     background: bool,
     job_id: String,
     pid: u32,
+    state: String,
     still_running: bool,
     exit_code: Option<u32>,
+    state_reason: Option<String>,
     elapsed_time: String,
+    log_exists: bool,
     log_tail: String,
     tail_lines_used: usize,
     log_path: String,
@@ -125,6 +133,10 @@ async fn test_check_process_running() {
     assert!(bg_resp.background);
     assert!(!bg_resp.job_id.is_empty());
     assert!(!bg_resp.log_path.is_empty());
+    assert!(
+        bg_resp.log_exists,
+        "background exec should report log_exists=true"
+    );
     assert_local_log_file_present(&bg_resp.log_path);
 
     tracing::info!(
@@ -146,14 +158,18 @@ async fn test_check_process_running() {
         "Process {} should be running but got: {:?}",
         bg_resp.pid, status
     );
+    assert_eq!(status.state, "running");
     assert!(
         status.exit_code.is_none(),
         "Running process should not have exit code"
     );
+    assert_eq!(status.state_reason, None);
     assert!(
         !status.command.is_empty(),
         "Command name should be captured"
     );
+    assert_eq!(status.log_path, bg_resp.log_path);
+    assert!(status.log_exists, "running job should keep local log path");
     assert!(
         !status.elapsed_time.is_empty() && status.elapsed_time.chars().any(|c| c.is_ascii_digit()),
         "elapsed_time should be populated and include digits; got: '{}'",
@@ -255,7 +271,11 @@ async fn test_check_process_completed() {
         bg_resp.pid, status
     );
 
+    assert_eq!(status.state, "failed");
     assert_eq!(status.exit_code, Some(7));
+    assert_eq!(status.state_reason, None);
+    assert_eq!(status.log_path, bg_resp.log_path);
+    assert!(status.log_exists, "completed job should preserve log path");
 
     // Command name might be empty for completed processes
     tracing::info!("Completed process status: {:?}", status);
@@ -400,6 +420,7 @@ async fn test_check_process_log_tail() {
     assert!(bg_resp.ok);
     assert!(bg_resp.background);
     assert!(!bg_resp.log_path.is_empty());
+    assert!(bg_resp.log_exists);
     assert_local_log_file_present(&bg_resp.log_path);
 
     let mut tail5 = String::new();
@@ -426,6 +447,8 @@ async fn test_check_process_log_tail() {
         .await
         .expect("Failed to check process");
     let status_10 = parse_check_process_response(&check_result_10);
+    assert_eq!(status_10.log_path, bg_resp.log_path);
+    assert!(status_10.log_exists);
     assert!(
         status_10.log_tail.contains("Line 11") || status_10.log_tail.contains("Line 12"),
         "Log tail with 10 lines should contain Line 11-12. Got: {}",
@@ -518,6 +541,7 @@ async fn test_check_process_full_workflow_timeout() {
     );
 
     assert!(!timeout_resp.job_id.is_empty(), "job_id should be present");
+    assert_eq!(timeout_resp.state, "running");
     assert!(
         timeout_resp.still_running,
         "timeout handoff should report running=true"
@@ -526,6 +550,7 @@ async fn test_check_process_full_workflow_timeout() {
         timeout_resp.exit_code, None,
         "running timeout handoff should not have exit code"
     );
+    assert_eq!(timeout_resp.state_reason, None);
     assert!(
         !timeout_resp.elapsed_time.is_empty(),
         "timeout handoff should include elapsed_time"
@@ -537,6 +562,10 @@ async fn test_check_process_full_workflow_timeout() {
     assert!(
         !timeout_resp.log_path.is_empty(),
         "local log_path should be present"
+    );
+    assert!(
+        timeout_resp.log_exists,
+        "timeout handoff should confirm log exists"
     );
     assert_local_log_file_present(&timeout_resp.log_path);
     assert!(
@@ -568,15 +597,19 @@ async fn test_check_process_full_workflow_timeout() {
         "Process {} should still be running after timeout. Got: {:?}",
         pid, status
     );
+    assert_eq!(status.state, "running");
     assert!(
         status.exit_code.is_none(),
         "Running process should not have exit code"
     );
+    assert_eq!(status.state_reason, None);
     assert!(
         !status.command.is_empty(),
         "Command should be captured: {}",
         status.command
     );
+    assert_eq!(status.log_path, timeout_resp.log_path);
+    assert!(status.log_exists);
 
     // Wait a bit more and check log tail is being populated
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -592,6 +625,7 @@ async fn test_check_process_full_workflow_timeout() {
         "Process {} should still be running after 1.5s",
         pid
     );
+    assert_eq!(status2.state, "running");
 
     tracing::info!("Process status after 1.5s: {:?}", status2);
 
@@ -618,6 +652,11 @@ async fn test_check_process_full_workflow_timeout() {
         !status3.running,
         "Killed process {} should not be running. Got: {:?}",
         pid, status3
+    );
+    assert!(
+        matches!(status3.state.as_str(), "failed" | "state_lost"),
+        "killed job should end as failed or state_lost, got: {:?}",
+        status3
     );
 
     server.shutdown().await;
@@ -693,16 +732,19 @@ async fn test_check_process_background_exec_workflow() {
             serde_json::from_str(&text).expect("Failed to parse timeout response");
 
         assert!(!timeout_resp.job_id.is_empty(), "job_id should be present");
+        assert_eq!(timeout_resp.state, "running");
         assert!(
             timeout_resp.still_running,
             "timeout handoff should initially report the job as still running"
         );
         assert_eq!(timeout_resp.exit_code, None);
+        assert_eq!(timeout_resp.state_reason, None);
         assert_eq!(timeout_resp.tail_lines_used, 50);
         assert!(
             !timeout_resp.log_path.is_empty(),
             "local log_path should be present"
         );
+        assert!(timeout_resp.log_exists);
         assert_local_log_file_present(&timeout_resp.log_path);
         assert!(
             timeout_resp.hint.contains("TIMEOUT_RECOVERY"),
@@ -727,6 +769,7 @@ async fn test_check_process_background_exec_workflow() {
             "Background process {} should be running",
             pid
         );
+        assert_eq!(status.state, "running");
 
         // Kill it
         let _ = server
@@ -739,4 +782,166 @@ async fn test_check_process_background_exec_workflow() {
 
     server.shutdown().await;
     tracing::info!("test_check_process_background_exec_workflow passed");
+}
+
+#[tokio::test]
+async fn test_check_process_reports_missing_local_log() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let config = Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: Some("secret".to_string()),
+        key: None,
+        su_password: None,
+        sudo_password: None,
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        max_output_tokens: Some(12000),
+        disable_sudo: true,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
+    };
+
+    let server = SshMcpServer::new(config)
+        .await
+        .expect("Failed to create SshMcpServer");
+
+    let bg_result = server
+        .test_execute_background_command("sleep 10")
+        .await
+        .expect("Failed to start background command");
+    let bg_resp: BackgroundExecResponse =
+        serde_json::from_str(&extract_text_from_result(&bg_result)).expect("background JSON");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::fs::remove_file(&bg_resp.log_path).expect("remove local log path");
+
+    let check_result = server
+        .test_check_process(&bg_resp.job_id, 50)
+        .await
+        .expect("Failed to check process");
+    let status = parse_check_process_response(&check_result);
+
+    assert_eq!(status.state, "running");
+    assert!(status.running);
+    assert_eq!(status.log_path, bg_resp.log_path);
+    assert!(
+        !status.log_exists,
+        "missing local log should be reported explicitly"
+    );
+    assert!(
+        status.log_tail.is_empty(),
+        "missing log path should yield empty tail"
+    );
+
+    let _ = server
+        .test_execute_command(&format!("kill {} 2>/dev/null || true", bg_resp.pid))
+        .await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_check_process_recovers_persisted_state_in_new_server() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let config = Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: Some("secret".to_string()),
+        key: None,
+        su_password: None,
+        sudo_password: None,
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        max_output_tokens: Some(12000),
+        disable_sudo: true,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
+    };
+
+    let server = SshMcpServer::new(config.clone())
+        .await
+        .expect("Failed to create SshMcpServer");
+
+    let bg_result = server
+        .test_execute_background_command("sh -c 'sleep 1; echo RECOVERED_OK'")
+        .await
+        .expect("Failed to start background command");
+    let bg_resp: BackgroundExecResponse =
+        serde_json::from_str(&extract_text_from_result(&bg_result)).expect("background JSON");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let recovered_server = SshMcpServer::new(config)
+        .await
+        .expect("Failed to create second SshMcpServer");
+    let check_result = recovered_server
+        .test_check_process(&bg_resp.job_id, 50)
+        .await
+        .expect("Recovered server should load persisted job state");
+    let status = parse_check_process_response(&check_result);
+
+    assert_eq!(status.state, "completed");
+    assert!(!status.running);
+    assert_eq!(status.exit_code, Some(0));
+    assert_eq!(status.state_reason, None);
+    assert_eq!(status.log_path, bg_resp.log_path);
+    assert!(status.log_exists);
+    assert!(status.log_tail.contains("RECOVERED_OK"));
+
+    recovered_server.shutdown().await;
+    server.shutdown().await;
 }

@@ -8,17 +8,19 @@
 //! process monitoring uses portable mechanisms that work across distributions.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
 use super::config::TIMEOUT_KILL_AFTER_SECS;
 use super::connection::SshConnectionManager;
 use super::sanitize::{escape_command_for_shell, escape_for_timeout_wrapper, wrap_in_posix_shell};
-use crate::background::{JobRegistry, JobStatus};
+use crate::background::{JobRegistry, JobStatus, LocalLogSpooler, SharedJobState};
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
@@ -72,14 +74,22 @@ pub struct TransferRawOutput {
 /// Process status check result
 #[derive(Debug, Clone)]
 pub struct ProcessStatus {
+    /// Strict job state label: running, completed, failed, or state_lost.
+    pub state: String,
     /// Whether the process is currently running
     pub running: bool,
     /// Exit code if process has completed
     pub exit_code: Option<u32>,
+    /// Why the job entered state_lost, if known.
+    pub state_reason: Option<String>,
     /// Elapsed time in ps format (e.g., "12:34" or "2-12:34:56")
     pub elapsed_time: String,
-    /// Command line of the process (from /proc/PID/cmdline)
+    /// Original command string tracked for this job.
     pub command: String,
+    /// Absolute local log path on the MCP server.
+    pub log_path: String,
+    /// Whether the local log file currently exists.
+    pub log_exists: bool,
     /// Tail of the log file (if log_path provided)
     pub log_tail: String,
 }
@@ -1122,13 +1132,32 @@ impl SshConnectionManager {
         job_id: &str,
         tail_lines: usize,
         registry: &JobRegistry,
+        spooler: &LocalLogSpooler,
     ) -> Result<ProcessStatus> {
         debug!(job_id = ?job_id, "Checking process status");
 
-        let job = registry
-            .get(job_id)
-            .await
-            .ok_or_else(|| SshMcpError::invalid_params(format!("job not found: {job_id}")))?;
+        let job = match registry.get(job_id).await {
+            Some(job) => job,
+            None => match spooler.load_job_state(job_id).await {
+                Ok(Some(recovered)) => {
+                    let shared = Arc::new(Mutex::new(recovered));
+                    registry
+                        .insert(job_id.to_string(), Arc::clone(&shared))
+                        .await;
+                    shared
+                }
+                Ok(None) => {
+                    return Err(SshMcpError::invalid_params(format!(
+                        "job not found: {job_id}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(SshMcpError::invalid_params(format!(
+                        "failed to recover job state for {job_id}: {e}"
+                    )));
+                }
+            },
+        };
 
         let job_guard = job.lock().await;
         let pid = job_guard.pid;
@@ -1136,27 +1165,133 @@ impl SshConnectionManager {
         let log_path = job_guard.log_path.clone();
         let status = job_guard.status;
         let exit_code_i32 = job_guard.exit_code;
+        let stored_state_reason = job_guard.state_reason.clone();
         let elapsed_time = job_guard.elapsed_time();
         drop(job_guard);
 
-        let running = match status {
-            JobStatus::Running => self.is_pid_running(pid).await?,
-            JobStatus::Completed | JobStatus::Failed => false,
+        let (running, effective_status, effective_exit_code_i32, effective_reason) = match status {
+            JobStatus::Running => {
+                self.ensure_connected().await?;
+                if self.is_pid_running(pid).await? {
+                    (true, JobStatus::Running, None, None)
+                } else if let Some(code) = exit_code_i32 {
+                    (false, job_status_from_exit_code(code), Some(code), None)
+                } else {
+                    let (settled_status, settled_exit_code, settled_reason) =
+                        await_running_job_settle(&job).await;
+                    match settled_status {
+                        JobStatus::Running => match settled_exit_code {
+                            Some(code) => {
+                                (false, job_status_from_exit_code(code), Some(code), None)
+                            }
+                            None => (
+                                false,
+                                JobStatus::StateLost,
+                                None,
+                                Some(settled_reason.unwrap_or_else(|| {
+                                    "pid_not_running_and_no_exit_status".to_string()
+                                })),
+                            ),
+                        },
+                        JobStatus::Completed | JobStatus::Failed => match settled_exit_code {
+                            Some(code) => {
+                                (false, job_status_from_exit_code(code), Some(code), None)
+                            }
+                            None => (
+                                false,
+                                JobStatus::StateLost,
+                                None,
+                                Some(settled_reason.unwrap_or_else(|| {
+                                    "missing_exit_code_for_terminal_state".to_string()
+                                })),
+                            ),
+                        },
+                        JobStatus::StateLost => (
+                            false,
+                            JobStatus::StateLost,
+                            None,
+                            Some(settled_reason.unwrap_or_else(|| "state_lost".to_string())),
+                        ),
+                    }
+                }
+            }
+            JobStatus::Completed | JobStatus::Failed => match exit_code_i32 {
+                Some(code) => (false, job_status_from_exit_code(code), Some(code), None),
+                None => (
+                    false,
+                    JobStatus::StateLost,
+                    None,
+                    Some(
+                        stored_state_reason
+                            .clone()
+                            .unwrap_or_else(|| "missing_exit_code_for_terminal_state".to_string()),
+                    ),
+                ),
+            },
+            JobStatus::StateLost => (
+                false,
+                JobStatus::StateLost,
+                None,
+                Some(
+                    stored_state_reason
+                        .clone()
+                        .unwrap_or_else(|| "state_lost".to_string()),
+                ),
+            ),
         };
 
-        let exit_code = if running {
+        if status != effective_status
+            || exit_code_i32 != effective_exit_code_i32
+            || stored_state_reason != effective_reason
+        {
+            let mut guard = job.lock().await;
+            match effective_status {
+                JobStatus::Running => {
+                    guard.status = JobStatus::Running;
+                    guard.exit_code = None;
+                    guard.state_reason = None;
+                }
+                JobStatus::Completed | JobStatus::Failed => {
+                    if let Some(code) = effective_exit_code_i32 {
+                        guard.mark_exit(code);
+                    }
+                }
+                JobStatus::StateLost => {
+                    guard.mark_state_lost(
+                        effective_reason
+                            .clone()
+                            .unwrap_or_else(|| "state_lost".to_string()),
+                    );
+                }
+            }
+
+            let persisted = guard.clone();
+            drop(guard);
+
+            if let Err(e) = spooler.persist_job_state(&persisted).await {
+                warn!(job_id = ?job_id, error = ?e, "failed to persist reconciled job state");
+            }
+        }
+
+        let exit_code = if running || effective_status == JobStatus::StateLost {
             None
         } else {
-            exit_code_i32.and_then(|code| u32::try_from(code).ok())
+            effective_exit_code_i32.and_then(|code| u32::try_from(code).ok())
         };
+
+        let log_exists = log_file_exists(&log_path).await?;
 
         let log_tail = read_local_log_tail(&log_path, tail_lines).await?;
 
         Ok(ProcessStatus {
+            state: effective_status.as_str().to_string(),
             running,
             exit_code,
+            state_reason: effective_reason,
             elapsed_time,
             command,
+            log_path: log_path.to_string_lossy().to_string(),
+            log_exists,
             log_tail,
         })
     }
@@ -1167,6 +1302,22 @@ impl SshConnectionManager {
         let output = self.exec_command(&cmd, Duration::from_secs(5)).await?;
         Ok(output.exit_code == Some(0))
     }
+}
+
+fn job_status_from_exit_code(exit_code: i32) -> JobStatus {
+    if exit_code == 0 {
+        JobStatus::Completed
+    } else {
+        JobStatus::Failed
+    }
+}
+
+async fn await_running_job_settle(
+    job: &SharedJobState,
+) -> (JobStatus, Option<i32>, Option<String>) {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let guard = job.lock().await;
+    (guard.status, guard.exit_code, guard.state_reason.clone())
 }
 
 pub(crate) async fn read_local_log_tail(path: &Path, lines: usize) -> Result<String> {
@@ -1227,6 +1378,23 @@ pub(crate) async fn read_local_log_tail(path: &Path, lines: usize) -> Result<Str
 
     let start = all_lines.len().saturating_sub(lines);
     Ok(all_lines[start..].join("\n"))
+}
+
+async fn log_file_exists(path: &Path) -> Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log path is a symlink (refusing to follow it)",
+                )
+                .into());
+            }
+            Ok(meta.is_file())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn open_log_read_no_symlink(path: &Path) -> Result<Option<tokio::fs::File>> {

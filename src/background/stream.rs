@@ -4,10 +4,22 @@ use std::sync::Arc;
 use russh::ChannelMsg;
 use russh::client;
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
-use crate::background::{JobRegistry, Result};
+use crate::background::{JobRegistry, LocalLogSpooler, Result};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
+
+const STATE_REASON_LIMIT_CHARS: usize = 160;
+
+enum JobTerminalUpdate {
+    Exit(i32),
+    StateLost(String),
+}
+
+fn truncate_state_reason(input: &str) -> String {
+    input.chars().take(STATE_REASON_LIMIT_CHARS).collect()
+}
 
 fn clamp_exit_status(exit_status: u32) -> i32 {
     if exit_status > 255 {
@@ -60,14 +72,21 @@ pub struct OutputStreamer {
     job_id: String,
     local_log_path: PathBuf,
     registry: Arc<JobRegistry>,
+    spooler: Arc<LocalLogSpooler>,
 }
 
 impl OutputStreamer {
-    pub fn new(job_id: String, local_log_path: PathBuf, registry: Arc<JobRegistry>) -> Self {
+    pub fn new(
+        job_id: String,
+        local_log_path: PathBuf,
+        registry: Arc<JobRegistry>,
+        spooler: Arc<LocalLogSpooler>,
+    ) -> Self {
         Self {
             job_id,
             local_log_path,
             registry,
+            spooler,
         }
     }
 
@@ -81,12 +100,24 @@ impl OutputStreamer {
             .await;
 
         match res {
-            Ok(exit_code) => {
-                self.update_job_terminal(exit_code).await;
-                Ok(exit_code)
+            Ok(Some(exit_code)) => {
+                self.update_job_terminal(JobTerminalUpdate::Exit(exit_code))
+                    .await;
+                Ok(Some(exit_code))
+            }
+            Ok(None) => {
+                self.update_job_terminal(JobTerminalUpdate::StateLost(
+                    "background_channel_closed_without_exit_status".to_string(),
+                ))
+                .await;
+                Ok(None)
             }
             Err(e) => {
-                self.update_job_terminal(None).await;
+                self.update_job_terminal(JobTerminalUpdate::StateLost(format!(
+                    "background_stream_error: {}",
+                    truncate_state_reason(&e.to_string())
+                )))
+                .await;
                 Err(e)
             }
         }
@@ -173,15 +204,21 @@ impl OutputStreamer {
         Ok(exit_code)
     }
 
-    async fn update_job_terminal(&self, exit_code: Option<i32>) {
+    async fn update_job_terminal(&self, update: JobTerminalUpdate) {
         let Some(job) = self.registry.get(&self.job_id).await else {
             return;
         };
 
         let mut guard = job.lock().await;
-        match exit_code {
-            Some(code) => guard.mark_exit(code),
-            None => guard.mark_failed(),
+        match update {
+            JobTerminalUpdate::Exit(code) => guard.mark_exit(code),
+            JobTerminalUpdate::StateLost(reason) => guard.mark_state_lost(reason),
+        }
+        let persisted = guard.clone();
+        drop(guard);
+
+        if let Err(e) = self.spooler.persist_job_state(&persisted).await {
+            warn!(job_id = ?self.job_id, error = ?e, "failed to persist terminal job state");
         }
     }
 }

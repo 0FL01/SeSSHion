@@ -27,9 +27,12 @@ pub(super) enum BackgroundPrivilege<'a> {
 }
 
 struct TimeoutRecoverySnapshot {
+    state: String,
     still_running: bool,
     exit_code: Option<u32>,
+    state_reason: Option<String>,
     elapsed_time: String,
+    log_exists: bool,
     log_tail: String,
     tail_lines_used: usize,
 }
@@ -116,6 +119,7 @@ impl SshMcpServer {
             job_id.clone(),
             final_log_path_buf.clone(),
             Arc::clone(&self.job_registry),
+            self.spooler.clone(),
         );
 
         let join = tokio::spawn(async move {
@@ -148,11 +152,13 @@ impl SshMcpServer {
                     &job_id,
                     markers.pid,
                     &final_log_path,
-                    &markers.remote_log_path,
                     &BackgroundTimeoutSnapshot {
+                        state: &snapshot.state,
                         still_running: snapshot.still_running,
                         exit_code: snapshot.exit_code,
+                        state_reason: snapshot.state_reason.as_deref(),
                         elapsed_time: &snapshot.elapsed_time,
+                        log_exists: snapshot.log_exists,
                         log_tail: &snapshot.log_tail,
                         tail_lines_used: snapshot.tail_lines_used,
                     },
@@ -282,13 +288,21 @@ impl SshMcpServer {
 
         match self
             .connection
-            .check_process(job_id, tail_lines_used, self.job_registry.as_ref())
+            .check_process(
+                job_id,
+                tail_lines_used,
+                self.job_registry.as_ref(),
+                &self.spooler,
+            )
             .await
         {
             Ok(status) => TimeoutRecoverySnapshot {
+                state: status.state,
                 still_running: status.running,
                 exit_code: status.exit_code,
+                state_reason: status.state_reason,
                 elapsed_time: status.elapsed_time,
+                log_exists: status.log_exists,
                 log_tail: status.log_tail,
                 tail_lines_used,
             },
@@ -301,18 +315,51 @@ impl SshMcpServer {
                 );
 
                 let mut still_running = true;
+                let mut state = crate::background::JobStatus::Running.as_str().to_string();
                 let mut exit_code = None;
+                let mut state_reason = None;
                 let mut elapsed_time = String::new();
 
                 if let Some(job) = self.job_registry.get(job_id).await {
                     let job_guard = job.lock().await;
                     still_running =
                         matches!(job_guard.status, crate::background::JobStatus::Running);
-                    exit_code = job_guard
-                        .exit_code
-                        .and_then(|code| u32::try_from(code).ok());
+                    state = job_guard.status.as_str().to_string();
+                    exit_code = if matches!(
+                        job_guard.status,
+                        crate::background::JobStatus::Completed
+                            | crate::background::JobStatus::Failed
+                    ) {
+                        job_guard
+                            .exit_code
+                            .and_then(|code| u32::try_from(code).ok())
+                    } else {
+                        None
+                    };
+                    state_reason = job_guard.state_reason.clone();
                     elapsed_time = job_guard.elapsed_time();
                 }
+
+                if !still_running && exit_code.is_none() {
+                    state = crate::background::JobStatus::StateLost.as_str().to_string();
+                    state_reason.get_or_insert_with(|| {
+                        "timeout_recovery_missing_terminal_exit_code".to_string()
+                    });
+                }
+
+                let log_exists = match tokio::fs::symlink_metadata(final_log_path_buf).await {
+                    Ok(meta) => !meta.file_type().is_symlink() && meta.is_file(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(log_err) => {
+                        warn!(
+                            job_id = ?job_id,
+                            pid,
+                            error = ?log_err,
+                            "Failed to stat local log for timeout recovery snapshot"
+                        );
+                        false
+                    }
+                };
 
                 let log_tail = match read_local_log_tail(
                     final_log_path_buf.as_path(),
@@ -333,9 +380,12 @@ impl SshMcpServer {
                 };
 
                 TimeoutRecoverySnapshot {
+                    state,
                     still_running,
                     exit_code: if still_running { None } else { exit_code },
+                    state_reason,
                     elapsed_time,
+                    log_exists,
                     log_tail,
                     tail_lines_used,
                 }
@@ -407,13 +457,7 @@ impl SshMcpServer {
             None => match self.default_local_log_path(&job_id) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Ok(background_json_err(
-                        &job_id,
-                        "",
-                        Some(&remote_log_path),
-                        &e,
-                        "",
-                    ));
+                    return Ok(background_json_err(&job_id, "", &e, ""));
                 }
             },
         };
@@ -422,7 +466,6 @@ impl SshMcpServer {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,
-                Some(&remote_log_path),
                 &e.to_string(),
                 "",
             ));
@@ -434,7 +477,6 @@ impl SshMcpServer {
                 return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
-                    Some(&remote_log_path),
                     &e.to_string(),
                     "",
                 ));
@@ -446,7 +488,6 @@ impl SshMcpServer {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,
-                Some(&remote_log_path),
                 &format!("SSH connection error: {}", e),
                 "",
             ));
@@ -487,7 +528,6 @@ impl SshMcpServer {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,
-                Some(&remote_log_path),
                 "Background detach is not supported on this target; run with background=false.",
                 "",
             ));
@@ -506,7 +546,6 @@ impl SshMcpServer {
                 return Ok(background_json_err(
                     &job_id,
                     &final_log_path,
-                    Some(&remote_log_path),
                     &format!("Failed to acquire command slot: {e}"),
                     "",
                 ));
@@ -520,13 +559,7 @@ impl SshMcpServer {
         {
             Ok(ch) => ch,
             Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e,
-                    "",
-                ));
+                return Ok(background_json_err(&job_id, &final_log_path, &e, ""));
             }
         };
 
@@ -540,13 +573,7 @@ impl SshMcpServer {
         {
             Ok(v) => v,
             Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    Some(&remote_log_path),
-                    &e,
-                    "",
-                ));
+                return Ok(background_json_err(&job_id, &final_log_path, &e, ""));
             }
         };
 
@@ -562,6 +589,7 @@ impl SshMcpServer {
             job_id.clone(),
             final_log_path_buf.clone(),
             Arc::clone(&self.job_registry),
+            self.spooler.clone(),
         );
 
         let job_id_for_log = job_id.clone();
@@ -573,11 +601,6 @@ impl SshMcpServer {
             }
         });
 
-        Ok(background_json_ok(
-            &job_id,
-            markers.pid,
-            &final_log_path,
-            &markers.remote_log_path,
-        ))
+        Ok(background_json_ok(&job_id, markers.pid, &final_log_path))
     }
 }

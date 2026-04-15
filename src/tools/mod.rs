@@ -37,7 +37,7 @@ pub struct ExecParams {
     /// If true, run the command in background and return immediately.
     /// The server continues streaming output into a local log file on the MCP server and
     /// tracks the job via an in-memory registry keyed by job_id.
-    /// The tool returns JSON metadata (job_id/pid/log_path; remote_log_path is deprecated).
+    /// The tool returns JSON metadata (job_id/pid/log_path/log_exists).
     #[serde(default)]
     pub background: bool,
 
@@ -61,7 +61,7 @@ pub struct SudoExecParams {
     /// If true, run the command in background and return immediately.
     /// The server continues streaming output into a local log file on the MCP server and
     /// tracks the job via an in-memory registry keyed by job_id.
-    /// The tool returns JSON metadata (job_id/pid/log_path; remote_log_path is deprecated).
+    /// The tool returns JSON metadata (job_id/pid/log_path/log_exists).
     #[serde(default)]
     pub background: bool,
 

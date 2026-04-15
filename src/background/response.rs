@@ -4,8 +4,11 @@ pub(crate) const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
 
 pub(crate) struct BackgroundTimeoutSnapshot<'a> {
     pub still_running: bool,
+    pub state: &'a str,
     pub exit_code: Option<u32>,
+    pub state_reason: Option<&'a str>,
     pub elapsed_time: &'a str,
+    pub log_exists: bool,
     pub log_tail: &'a str,
     pub tail_lines_used: usize,
 }
@@ -17,19 +20,14 @@ fn truncate_with_flag(input: &str, limit_chars: usize) -> (String, bool) {
     (snippet, truncated)
 }
 
-pub(crate) fn background_json_ok(
-    job_id: &str,
-    pid: u32,
-    local_log_path: &str,
-    remote_log_path: &str,
-) -> CallToolResult {
+pub(crate) fn background_json_ok(job_id: &str, pid: u32, local_log_path: &str) -> CallToolResult {
     let body = serde_json::json!({
         "ok": true,
         "background": true,
         "job_id": job_id,
         "pid": pid,
         "log_path": local_log_path,
-        "remote_log_path": remote_log_path,
+        "log_exists": true,
     })
     .to_string();
 
@@ -40,12 +38,15 @@ pub(crate) fn background_json_timeout(
     job_id: &str,
     pid: u32,
     local_log_path: &str,
-    remote_log_path: &str,
     snapshot: &BackgroundTimeoutSnapshot<'_>,
 ) -> CallToolResult {
     let hint = if snapshot.still_running {
         format!(
             "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with job_id={job_id} to retrieve output."
+        )
+    } else if snapshot.state == "state_lost" {
+        format!(
+            "TIMEOUT_RECOVERY: Background job state is lost after handoff. Inspect log_path/log_tail and use check-process with job_id={job_id} before deciding whether to retry."
         )
     } else {
         format!(
@@ -58,13 +59,15 @@ pub(crate) fn background_json_timeout(
         "background": true,
         "job_id": job_id,
         "pid": pid,
+        "state": snapshot.state,
         "still_running": snapshot.still_running,
         "exit_code": snapshot.exit_code,
+        "state_reason": snapshot.state_reason,
         "elapsed_time": snapshot.elapsed_time,
+        "log_exists": snapshot.log_exists,
         "log_tail": snapshot.log_tail,
         "tail_lines_used": snapshot.tail_lines_used,
         "log_path": local_log_path,
-        "remote_log_path": remote_log_path,
         "hint": hint,
     })
     .to_string();
@@ -75,7 +78,6 @@ pub(crate) fn background_json_timeout(
 pub(crate) fn background_json_err(
     job_id: &str,
     local_log_path: &str,
-    remote_log_path: Option<&str>,
     error: &str,
     stderr: &str,
 ) -> CallToolResult {
@@ -98,12 +100,6 @@ pub(crate) fn background_json_err(
         "log_path".to_string(),
         serde_json::Value::String(local_log_path.to_string()),
     );
-    if let Some(remote) = remote_log_path {
-        obj.insert(
-            "remote_log_path".to_string(),
-            serde_json::Value::String(remote.to_string()),
-        );
-    }
     obj.insert(
         "error".to_string(),
         serde_json::Value::String(error_snippet),

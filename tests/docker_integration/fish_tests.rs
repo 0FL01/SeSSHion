@@ -15,15 +15,19 @@ struct BackgroundExecResponse {
     job_id: String,
     pid: u32,
     log_path: String,
-    remote_log_path: String,
+    log_exists: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct CheckProcessResponse {
+    state: String,
     running: bool,
     exit_code: Option<u32>,
+    state_reason: Option<String>,
     elapsed_time: String,
     command: String,
+    log_path: String,
+    log_exists: bool,
     log_tail: String,
 }
 
@@ -238,10 +242,7 @@ async fn test_fish_shell_background_exec_and_check_process_workflow() {
         !bg_response.log_path.is_empty(),
         "log_path should be present"
     );
-    assert!(
-        !bg_response.remote_log_path.is_empty(),
-        "remote_log_path should be present"
-    );
+    assert!(bg_response.log_exists, "log_exists should be true");
     assert_local_log_file_present(&bg_response.log_path);
 
     let mut last_status = None;
@@ -273,6 +274,10 @@ async fn test_fish_shell_background_exec_and_check_process_workflow() {
         "Background job should exit successfully: {:?}",
         status
     );
+    assert_eq!(status.state, "completed");
+    assert_eq!(status.state_reason, None);
+    assert_eq!(status.log_path, bg_response.log_path);
+    assert!(status.log_exists);
     assert!(
         status.log_tail.contains("FISH_BG_OK"),
         "Expected marker in background log tail: {}",

@@ -73,6 +73,14 @@ pub(crate) fn extract_text_from_call_tool_result(result: &CallToolResult) -> Str
     combined
 }
 
+/// Trims optional text input and treats empty strings as absent.
+pub(crate) fn normalize_optional_text_input(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Parses a read-file error marker from stderr.
 pub(crate) fn parse_read_file_error_marker(stderr: &str) -> Option<&str> {
     stderr.lines().find_map(|line| {

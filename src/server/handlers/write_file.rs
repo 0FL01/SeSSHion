@@ -8,10 +8,10 @@ use crate::server::handlers::file_edit_common::{
     FileEditFaultInjection, FileWriteTransactionRequest, RemoteTextFileState,
     build_file_edit_conflict_result, build_unified_diff, local_text_sha256_hex,
 };
-use crate::server::validation::common::validate_read_file_path;
+use crate::server::validation::common::{normalize_optional_text_input, validate_read_file_path};
 use crate::server::validation::file_edit::FILE_EDIT_MISSING_SHA256;
 use crate::server::validation::file_edit::write_file_too_large_error;
-use crate::server::validation::read_file::normalize_sha256_hex;
+use crate::server::validation::read_file::normalize_optional_sha256_hex;
 use crate::tools::WriteFileParams;
 
 impl SshMcpServer {
@@ -33,13 +33,9 @@ impl SshMcpServer {
 
         validate_read_file_path(&remote_path).map_err(|msg| McpError::invalid_params(msg, None))?;
 
-        let user_expected_sha256 = match expected_sha256.as_deref() {
-            Some(value) => Some(
-                normalize_sha256_hex(value, "expected_sha256")
-                    .map_err(|msg| McpError::invalid_params(msg, None))?,
-            ),
-            None => None,
-        };
+        let user_expected_sha256 =
+            normalize_optional_sha256_hex(expected_sha256.as_deref(), "expected_sha256")
+                .map_err(|msg| McpError::invalid_params(msg, None))?;
 
         let timeout = match timeout_ms {
             Some(0) => {
@@ -53,9 +49,10 @@ impl SshMcpServer {
         };
 
         let dry_run = dry_run.unwrap_or(false);
+        let read_ticket = normalize_optional_text_input(read_ticket.as_deref());
 
-        let ticket_bound_sha256 = match read_ticket {
-            Some(ref ticket) => {
+        let ticket_bound_sha256 = match read_ticket.as_deref() {
+            Some(ticket) => {
                 let claims = self
                     .ticket_signer
                     .verify(ticket, &remote_path)

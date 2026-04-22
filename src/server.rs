@@ -769,8 +769,10 @@ mod tests {
     };
     use crate::background::wrapper::remote_job_log_path;
     use crate::server::validation::common::validate_read_file_path;
-    use crate::server::validation::read_file::normalize_sha256_hex;
     use crate::server::validation::read_file::sanitize_read_file_stderr_snippet;
+    use crate::server::validation::read_file::{
+        normalize_optional_sha256_hex, normalize_sha256_hex,
+    };
 
     fn extract_text_from_result(result: &CallToolResult) -> String {
         result
@@ -920,6 +922,12 @@ mod tests {
     fn test_normalize_sha256_hex_rejects_invalid_length() {
         let err = normalize_sha256_hex("abcd", "expected_sha256").unwrap_err();
         assert!(err.contains("64-character"));
+    }
+
+    #[test]
+    fn test_normalize_optional_sha256_hex_treats_blank_as_absent() {
+        let normalized = normalize_optional_sha256_hex(Some("   "), "expected_sha256").unwrap();
+        assert!(normalized.is_none());
     }
 
     #[test]

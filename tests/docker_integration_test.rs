@@ -419,6 +419,46 @@ async fn test_mcp_tools_with_docker() {
         Some("created\n")
     );
 
+    // 4a-6b. Blank wrapper placeholders for expected_sha256/read_ticket are treated as absent.
+    let create_blank_placeholder_path = "/tmp/ssh-mcp-apply-create/blank-placeholder.txt";
+    server
+        .test_execute_command(&format!(
+            "sh -c 'set -eu; rm -f -- {}'",
+            ssh_mcp::escape_for_shell(create_blank_placeholder_path)
+        ))
+        .await
+        .expect("failed to reset blank-placeholder fixture");
+
+    let create_blank_placeholder_result = server
+        .test_write_file(
+            create_blank_placeholder_path,
+            "created-via-blank-placeholders\n",
+            Some(""),
+            Some(""),
+            Some(30_000),
+        )
+        .await
+        .expect("write-file blank-placeholder create call failed");
+    assert!(
+        !create_blank_placeholder_result.is_error.unwrap_or(false),
+        "blank placeholder strings should be treated as absent on missing-file create"
+    );
+
+    let create_blank_placeholder_read = server
+        .test_read_file(create_blank_placeholder_path, None)
+        .await
+        .expect("failed to read blank-placeholder create result");
+    let create_blank_placeholder_text = extract_text_from_result(&create_blank_placeholder_read);
+    let create_blank_placeholder_json: serde_json::Value =
+        serde_json::from_str(create_blank_placeholder_text.trim())
+            .expect("blank-placeholder create read-file response should be valid JSON");
+    assert_eq!(
+        create_blank_placeholder_json
+            .get("content")
+            .and_then(|v| v.as_str()),
+        Some("created-via-blank-placeholders\n")
+    );
+
     // 4a-7. Missing parent directory returns a dedicated error.
     let parent_missing_root = "/tmp/ssh-mcp-apply-parent-missing";
     let parent_missing_path = "/tmp/ssh-mcp-apply-parent-missing/nested/new.txt";
@@ -1763,6 +1803,38 @@ async fn test_mcp_tools_with_docker() {
             "creating a missing file without read_ticket should succeed"
         );
         tracing::info!("read_ticket exemption for missing file verified");
+    }
+
+    // 4a-RT3b. Blank read_ticket placeholder must not bypass read-before-edit on non-empty files.
+    {
+        let rt_blank_path = "/tmp/ssh-mcp-read-ticket-blank.txt";
+        server
+            .test_execute_command(&format!(
+                "printf 'blank-enforce\n' > {}",
+                ssh_mcp::escape_for_shell(rt_blank_path),
+            ))
+            .await
+            .expect("failed to create blank-ticket enforcement fixture");
+
+        let blank_result = server
+            .test_write_file(
+                rt_blank_path,
+                "should-fail\n",
+                Some(""),
+                Some(""),
+                Some(30_000),
+            )
+            .await;
+
+        assert!(
+            blank_result.is_err(),
+            "blank placeholder ticket must still be rejected for existing non-empty files"
+        );
+        let blank_err = format!("{:?}", blank_result.unwrap_err());
+        assert!(
+            blank_err.contains("must be read before editing"),
+            "blank placeholder error should still mention read-before-edit: {blank_err}"
+        );
     }
 
     // 4a-RT4. Full mode edit on empty (zero-byte) file without read_ticket should succeed.

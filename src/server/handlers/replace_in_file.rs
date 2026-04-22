@@ -11,7 +11,7 @@ use crate::server::handlers::file_edit_common::{
 use crate::server::validation::common::extract_text_from_call_tool_result;
 use crate::server::validation::common::validate_read_file_path;
 use crate::server::validation::file_edit::replace_in_file_too_large_error;
-use crate::server::validation::read_file::normalize_sha256_hex;
+use crate::server::validation::read_file::normalize_optional_sha256_hex;
 use crate::tools::{ReadFileMode, ReadFileParams, ReplaceInFileParams};
 
 struct PlannedReplacement {
@@ -140,13 +140,9 @@ impl SshMcpServer {
 
         validate_read_file_path(&remote_path).map_err(|msg| McpError::invalid_params(msg, None))?;
 
-        let user_expected_sha256 = match expected_sha256.as_deref() {
-            Some(value) => Some(
-                normalize_sha256_hex(value, "expected_sha256")
-                    .map_err(|msg| McpError::invalid_params(msg, None))?,
-            ),
-            None => None,
-        };
+        let user_expected_sha256 =
+            normalize_optional_sha256_hex(expected_sha256.as_deref(), "expected_sha256")
+                .map_err(|msg| McpError::invalid_params(msg, None))?;
 
         let timeout = match timeout_ms {
             Some(0) => {

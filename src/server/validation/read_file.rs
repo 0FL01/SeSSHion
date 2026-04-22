@@ -37,6 +37,17 @@ pub(crate) fn normalize_sha256_hex(
     Ok(normalized)
 }
 
+/// Trims optional SHA-256 input and treats empty strings as absent.
+pub(crate) fn normalize_optional_sha256_hex(
+    value: Option<&str>,
+    field: &str,
+) -> std::result::Result<Option<String>, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => normalize_sha256_hex(value, field).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Resolves the max bytes limit from max_output_tokens.
 pub(crate) fn resolve_read_file_max_bytes(max_output_tokens: Option<usize>) -> usize {
     max_output_tokens

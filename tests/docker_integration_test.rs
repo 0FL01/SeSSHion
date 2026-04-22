@@ -616,8 +616,118 @@ async fn test_mcp_tools_with_docker() {
     );
     let partial_ambiguous_text = extract_text_from_result(&partial_ambiguous_result);
     assert!(
-        partial_ambiguous_text.contains("set replace_all=true"),
+        partial_ambiguous_text.contains("pass match_index"),
         "unexpected partial ambiguity error: {partial_ambiguous_text}"
+    );
+
+    // 4a-12b. replace-in-file: match_index selects one match deterministically.
+    server
+        .test_execute_command(&format!(
+            "printf 'dup dup dup\\n' > {}",
+            ssh_mcp::escape_for_shell(partial_path)
+        ))
+        .await
+        .expect("failed to reset partial fixture for match_index test");
+
+    let partial_match_index_result = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "dup".to_string(),
+            new_text: "solo".to_string(),
+            replace_all: Some(false),
+            match_index: Some(2),
+            dry_run: None,
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("replace-in-file match_index call failed");
+    assert!(
+        !partial_match_index_result.is_error.unwrap_or(false),
+        "match_index replacement should return success"
+    );
+
+    let partial_match_index_read = server
+        .test_read_file(partial_path, None)
+        .await
+        .expect("failed to read file after match_index replacement");
+    let partial_match_index_text = extract_text_from_result(&partial_match_index_read);
+    let partial_match_index_json: serde_json::Value =
+        serde_json::from_str(partial_match_index_text.trim())
+            .expect("match_index read-file response should be valid JSON");
+    assert_eq!(
+        partial_match_index_json
+            .get("content")
+            .and_then(|v| v.as_str()),
+        Some("dup solo dup\n")
+    );
+
+    // 4a-12c. replace-in-file: dry_run previews diff and leaves file unchanged.
+    server
+        .test_execute_command(&format!(
+            "printf 'dup dup\\n' > {}",
+            ssh_mcp::escape_for_shell(partial_path)
+        ))
+        .await
+        .expect("failed to reset partial fixture for dry_run test");
+
+    let partial_dry_run_result = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "dup".to_string(),
+            new_text: "solo".to_string(),
+            replace_all: Some(false),
+            match_index: Some(2),
+            dry_run: Some(true),
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("replace-in-file dry_run call failed");
+    assert!(
+        !partial_dry_run_result.is_error.unwrap_or(false),
+        "replace-in-file dry_run should return success"
+    );
+    let partial_dry_run_text = extract_text_from_result(&partial_dry_run_result);
+    let partial_dry_run_json: serde_json::Value = serde_json::from_str(partial_dry_run_text.trim())
+        .expect("replace-in-file dry_run response should be valid JSON");
+    assert_eq!(
+        partial_dry_run_json
+            .get("dry_run")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        partial_dry_run_json
+            .get("match_count")
+            .and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        partial_dry_run_json.get("selected_match_indices"),
+        Some(&serde_json::json!([2]))
+    );
+    assert!(
+        partial_dry_run_json
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .is_some_and(|diff| diff.contains("solo")),
+        "replace-in-file dry_run should include diff preview: {partial_dry_run_text}"
+    );
+
+    let partial_dry_run_read = server
+        .test_read_file(partial_path, None)
+        .await
+        .expect("failed to read file after replace-in-file dry_run");
+    let partial_dry_run_read_text = extract_text_from_result(&partial_dry_run_read);
+    let partial_dry_run_read_json: serde_json::Value =
+        serde_json::from_str(partial_dry_run_read_text.trim())
+            .expect("replace-in-file dry_run follow-up read should be valid JSON");
+    assert_eq!(
+        partial_dry_run_read_json
+            .get("content")
+            .and_then(|v| v.as_str()),
+        Some("dup dup\n")
     );
 
     // 4a-13. replace-in-file: missing file must fail and must not create.
@@ -660,6 +770,8 @@ async fn test_mcp_tools_with_docker() {
             old_text: String::new(),
             new_text: "replacement".to_string(),
             replace_all: Some(false),
+            match_index: None,
+            dry_run: None,
             expected_sha256: None,
             timeout_ms: Some(30_000),
         })
@@ -849,6 +961,120 @@ async fn test_mcp_tools_with_docker() {
     assert_eq!(
         post_apply_json.get("content").and_then(|v| v.as_str()),
         Some("beta\n")
+    );
+
+    // 4a-17a. write-file dry_run previews diff and leaves file unchanged.
+    let (preview_hash, preview_ticket) = read_file_ticket(&server, apply_path).await;
+    let preview_result = server
+        .test_write_file_with_params(ssh_mcp::tools::WriteFileParams {
+            remote_path: apply_path.to_string(),
+            new_content: "delta\n".to_string(),
+            expected_sha256: None,
+            read_ticket: Some(preview_ticket),
+            dry_run: Some(true),
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("write-file dry_run call failed");
+    assert!(
+        !preview_result.is_error.unwrap_or(false),
+        "write-file dry_run should return success"
+    );
+    let preview_text = extract_text_from_result(&preview_result);
+    let preview_json: serde_json::Value = serde_json::from_str(preview_text.trim())
+        .expect("write-file dry_run response should be valid JSON");
+    assert_eq!(
+        preview_json.get("dry_run").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        preview_json.get("previous_sha256").and_then(|v| v.as_str()),
+        Some(preview_hash.as_str())
+    );
+    assert!(
+        preview_json
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .is_some_and(|diff| diff.contains("delta")),
+        "write-file dry_run should include diff preview: {preview_text}"
+    );
+
+    let post_preview_read = server
+        .test_read_file(apply_path, None)
+        .await
+        .expect("failed to read file after write-file dry_run");
+    let post_preview_text = extract_text_from_result(&post_preview_read);
+    let post_preview_json: serde_json::Value = serde_json::from_str(post_preview_text.trim())
+        .expect("post-preview read-file response should be valid JSON");
+    assert_eq!(
+        post_preview_json.get("content").and_then(|v| v.as_str()),
+        Some("beta\n")
+    );
+
+    // 4a-17b. Hash-bound read_ticket acts as implicit optimistic-lock baseline.
+    let implicit_lock_path = "/tmp/ssh-mcp-write-file-implicit-ticket.txt";
+    server
+        .test_execute_command(&format!(
+            "printf 'ticket-base\\n' > {}",
+            ssh_mcp::escape_for_shell(implicit_lock_path)
+        ))
+        .await
+        .expect("failed to create implicit ticket fixture file");
+
+    let (_implicit_hash, implicit_ticket) = read_file_ticket(&server, implicit_lock_path).await;
+    server
+        .test_execute_command(&format!(
+            "printf 'mutated-after-read\\n' > {}",
+            ssh_mcp::escape_for_shell(implicit_lock_path)
+        ))
+        .await
+        .expect("failed to mutate implicit ticket fixture file");
+
+    let implicit_conflict_result = server
+        .test_write_file(
+            implicit_lock_path,
+            "should-not-apply\n",
+            None,
+            Some(implicit_ticket.as_str()),
+            Some(30_000),
+        )
+        .await
+        .expect("write-file implicit optimistic-lock call failed");
+    assert!(
+        implicit_conflict_result.is_error.unwrap_or(false),
+        "hash-bound read_ticket should conflict after intervening modification"
+    );
+    let implicit_conflict_text = extract_text_from_result(&implicit_conflict_result);
+    let implicit_conflict_json: serde_json::Value =
+        serde_json::from_str(implicit_conflict_text.trim())
+            .expect("implicit read_ticket conflict response should be valid JSON");
+    assert_eq!(
+        implicit_conflict_json.get("error").and_then(|v| v.as_str()),
+        Some("conflict")
+    );
+    assert_ne!(
+        implicit_conflict_json
+            .get("expected_sha256")
+            .and_then(|v| v.as_str()),
+        implicit_conflict_json
+            .get("actual_sha256")
+            .and_then(|v| v.as_str()),
+        "hash-bound read_ticket conflict should report different expected/actual hashes"
+    );
+
+    let implicit_conflict_read = server
+        .test_read_file(implicit_lock_path, None)
+        .await
+        .expect("failed to read implicit ticket fixture after conflict");
+    let implicit_conflict_read_text = extract_text_from_result(&implicit_conflict_read);
+    let implicit_conflict_read_json: serde_json::Value =
+        serde_json::from_str(implicit_conflict_read_text.trim())
+            .expect("implicit ticket follow-up read should be valid JSON");
+    assert_eq!(
+        implicit_conflict_read_json
+            .get("content")
+            .and_then(|v| v.as_str()),
+        Some("mutated-after-read\n")
     );
 
     // 4a-9. Conflict hash mismatch must not modify file.
@@ -1295,8 +1521,13 @@ async fn test_mcp_tools_with_docker() {
             .and_then(|v| v.as_str())
             .expect("read-file response must include read_ticket field");
         assert!(
-            rt_ticket.starts_with("rt1."),
+            rt_ticket.starts_with("rt2."),
             "read_ticket must start with version prefix: {rt_ticket}"
+        );
+        assert_eq!(
+            rt_ticket.split('.').count(),
+            4,
+            "read_ticket must include version, expiry, content hash, and signature"
         );
         tracing::info!("read-file sha256 and read_ticket fields verified");
     }

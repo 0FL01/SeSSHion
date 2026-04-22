@@ -1,5 +1,7 @@
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
+use sha2::{Digest, Sha256};
+use similar::TextDiff;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
@@ -8,11 +10,13 @@ use tracing::error;
 use crate::platform::O_NOFOLLOW_FLAG;
 use crate::server::SshMcpServer;
 use crate::server::make_job_id;
+use crate::server::validation::common::extract_text_from_call_tool_result;
 use crate::server::validation::file_edit::*;
 use crate::server::validation::read_file::{
-    normalize_sha256_hex, sanitize_read_file_stderr_snippet,
+    SHA256_HEX_LEN, normalize_sha256_hex, sanitize_read_file_stderr_snippet,
 };
 use crate::shell_escape::escape_for_shell;
+use crate::tools::{ReadFileMode, ReadFileParams};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(in crate::server) enum FileEditFaultInjection {
@@ -33,6 +37,17 @@ pub(in crate::server) struct FileWriteTransactionRequest<'a> {
     pub operation_name: &'a str,
 }
 
+pub(in crate::server) enum RemoteTextFileState {
+    Missing,
+    Existing { content: String, sha256: String },
+}
+
+enum RemotePathKind {
+    Missing,
+    RegularFile,
+    NonRegularFile,
+}
+
 fn file_edit_lock_busy_result(remote_path: &str, operation_name: &str) -> CallToolResult {
     let result = serde_json::json!({
         "error": "lock_busy",
@@ -49,7 +64,168 @@ fn file_edit_lock_busy_result(remote_path: &str, operation_name: &str) -> CallTo
     CallToolResult::error(vec![Content::text(result.to_string())])
 }
 
+pub(in crate::server) fn local_text_sha256_hex(content: &str) -> String {
+    let hash = Sha256::digest(content.as_bytes());
+    hash.iter()
+        .fold(String::with_capacity(SHA256_HEX_LEN), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+}
+
+pub(in crate::server) fn build_unified_diff(
+    remote_path: &str,
+    original: &str,
+    modified: &str,
+) -> String {
+    if original == modified {
+        return String::new();
+    }
+
+    format!(
+        "{}",
+        TextDiff::from_lines(original, modified)
+            .unified_diff()
+            .context_radius(3)
+            .header(remote_path, remote_path)
+    )
+}
+
+pub(in crate::server) fn build_file_edit_conflict_result(
+    remote_path: &str,
+    expected_sha256: &str,
+    actual_sha256: &str,
+) -> CallToolResult {
+    let conflict = serde_json::json!({
+        "error": "conflict",
+        "path": remote_path,
+        "expected_sha256": expected_sha256,
+        "actual_sha256": actual_sha256,
+    });
+
+    CallToolResult::error(vec![Content::text(conflict.to_string())])
+}
+
 impl SshMcpServer {
+    async fn probe_remote_path_kind(
+        &self,
+        remote_path: &str,
+        timeout: Duration,
+    ) -> std::result::Result<RemotePathKind, CallToolResult> {
+        let escaped = escape_for_shell(remote_path);
+        let cmd = format!(
+            r#"sh -c 'p=$1; if [ ! -e "$p" ]; then printf "missing"; elif [ -f "$p" ]; then printf "regular"; else printf "other"; fi' sh '{escaped}'"#
+        );
+
+        let out = match self.connection.exec_command(&cmd, timeout).await {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(CallToolResult::error(vec![Content::text(format!(
+                    "Error: failed to inspect remote file while preparing edit: {e}"
+                ))]));
+            }
+        };
+
+        match out.exit_code {
+            Some(0) => {}
+            Some(code) => {
+                let mut msg = format!(
+                    "Error: failed to inspect remote file while preparing edit: remote command failed with exit_code={code}"
+                );
+                if let Some(snippet) = sanitize_read_file_stderr_snippet(&out.stderr) {
+                    msg.push_str(&format!("; stderr={snippet}"));
+                }
+                return Err(CallToolResult::error(vec![Content::text(msg)]));
+            }
+            None => {
+                if !out.stderr.trim().is_empty() {
+                    let mut msg = "Error: failed to inspect remote file while preparing edit: remote command did not provide an exit status".to_string();
+                    if let Some(snippet) = sanitize_read_file_stderr_snippet(&out.stderr) {
+                        msg.push_str(&format!("; stderr={snippet}"));
+                    }
+                    return Err(CallToolResult::error(vec![Content::text(msg)]));
+                }
+            }
+        }
+
+        match out.stdout.trim() {
+            "missing" => Ok(RemotePathKind::Missing),
+            "regular" => Ok(RemotePathKind::RegularFile),
+            "other" => Ok(RemotePathKind::NonRegularFile),
+            other => Err(CallToolResult::error(vec![Content::text(format!(
+                "Error: unexpected remote file probe result: {other}"
+            ))])),
+        }
+    }
+
+    pub(in crate::server) async fn load_remote_text_file_state(
+        &self,
+        remote_path: &str,
+        timeout: Duration,
+    ) -> std::result::Result<RemoteTextFileState, CallToolResult> {
+        match self.probe_remote_path_kind(remote_path, timeout).await? {
+            RemotePathKind::Missing => Ok(RemoteTextFileState::Missing),
+            RemotePathKind::NonRegularFile => Err(CallToolResult::error(vec![Content::text(
+                "Error: remote_path is not a regular file".to_string(),
+            )])),
+            RemotePathKind::RegularFile => {
+                let timeout_ms = (timeout.as_millis().min(u128::from(u64::MAX))) as u64;
+                let read_result = match self
+                    .execute_read_file(ReadFileParams {
+                        remote_path: remote_path.to_string(),
+                        mode: ReadFileMode::Full,
+                        lines: None,
+                        timeout_ms: Some(timeout_ms),
+                    })
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        return Err(CallToolResult::error(vec![Content::text(format!(
+                            "Error: failed to read remote file while preparing edit: {e}"
+                        ))]));
+                    }
+                };
+
+                if read_result.is_error.unwrap_or(false) {
+                    return Err(read_result);
+                }
+
+                let read_text = extract_text_from_call_tool_result(&read_result);
+                let read_value: serde_json::Value = match serde_json::from_str(read_text.trim()) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return Err(CallToolResult::error(vec![Content::text(format!(
+                            "Error: failed to parse read-file response while preparing edit: {e}"
+                        ))]));
+                    }
+                };
+
+                let content = match read_value.get("content").and_then(|value| value.as_str()) {
+                    Some(value) => value.to_string(),
+                    None => {
+                        return Err(CallToolResult::error(vec![Content::text(
+                            "Error: read-file response missing content while preparing edit"
+                                .to_string(),
+                        )]));
+                    }
+                };
+                let sha256 = match read_value.get("sha256").and_then(|value| value.as_str()) {
+                    Some(value) => value.to_string(),
+                    None => {
+                        return Err(CallToolResult::error(vec![Content::text(
+                            "Error: read-file response missing sha256 while preparing edit"
+                                .to_string(),
+                        )]));
+                    }
+                };
+
+                Ok(RemoteTextFileState::Existing { content, sha256 })
+            }
+        }
+    }
+
     pub(in crate::server) async fn compute_partial_baseline_sha256(
         &self,
         content: &str,
@@ -389,15 +565,11 @@ impl SshMcpServer {
                 }
             };
 
-            let conflict = serde_json::json!({
-                "error": "conflict",
-                "path": remote_path,
-                "expected_sha256": expected,
-                "actual_sha256": actual_sha256,
-            });
-            return Ok(CallToolResult::error(vec![Content::text(
-                conflict.to_string(),
-            )]));
+            return Ok(build_file_edit_conflict_result(
+                remote_path,
+                &expected,
+                &actual_sha256,
+            ));
         }
 
         if let Some(marker) = parse_file_edit_error_marker(&out.stderr) {

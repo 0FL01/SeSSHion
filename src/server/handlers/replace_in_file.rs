@@ -5,13 +5,81 @@ use tracing::debug;
 
 use crate::server::SshMcpServer;
 use crate::server::handlers::file_edit_common::{
-    FileEditFaultInjection, FileWriteTransactionRequest,
+    FileEditFaultInjection, FileWriteTransactionRequest, build_file_edit_conflict_result,
+    build_unified_diff, local_text_sha256_hex,
 };
 use crate::server::validation::common::extract_text_from_call_tool_result;
 use crate::server::validation::common::validate_read_file_path;
 use crate::server::validation::file_edit::replace_in_file_too_large_error;
 use crate::server::validation::read_file::normalize_sha256_hex;
 use crate::tools::{ReadFileMode, ReadFileParams, ReplaceInFileParams};
+
+struct PlannedReplacement {
+    updated_content: String,
+    match_count: usize,
+    selected_match_indices: Vec<usize>,
+}
+
+fn plan_exact_text_replacement(
+    current_content: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+    match_index: Option<usize>,
+) -> std::result::Result<PlannedReplacement, String> {
+    let match_positions: Vec<usize> = current_content
+        .match_indices(old_text)
+        .map(|(offset, _)| offset)
+        .collect();
+    let match_count = match_positions.len();
+
+    if match_count == 0 {
+        return Err("Error: old_text was not found in remote file".to_string());
+    }
+
+    if replace_all {
+        return Ok(PlannedReplacement {
+            updated_content: current_content.replace(old_text, new_text),
+            match_count,
+            selected_match_indices: (1..=match_count).collect(),
+        });
+    }
+
+    if let Some(index) = match_index {
+        if index > match_count {
+            return Err(format!(
+                "Error: match_index {index} is out of range; old_text matched {match_count} times"
+            ));
+        }
+
+        let selected_offset = match_positions[index - 1];
+        let selected_end = selected_offset + old_text.len();
+        let mut updated_content = String::with_capacity(
+            current_content.len().saturating_sub(old_text.len()) + new_text.len(),
+        );
+        updated_content.push_str(&current_content[..selected_offset]);
+        updated_content.push_str(new_text);
+        updated_content.push_str(&current_content[selected_end..]);
+
+        return Ok(PlannedReplacement {
+            updated_content,
+            match_count,
+            selected_match_indices: vec![index],
+        });
+    }
+
+    if match_count != 1 {
+        return Err(format!(
+            "Error: old_text matched {match_count} times; pass match_index to select one match or set replace_all=true to replace all matches"
+        ));
+    }
+
+    Ok(PlannedReplacement {
+        updated_content: current_content.replacen(old_text, new_text, 1),
+        match_count,
+        selected_match_indices: vec![1],
+    })
+}
 
 impl SshMcpServer {
     pub(in crate::server) async fn execute_replace_in_file(
@@ -26,6 +94,8 @@ impl SshMcpServer {
             old_text,
             new_text,
             replace_all,
+            match_index,
+            dry_run,
             expected_sha256,
             timeout_ms,
         } = params;
@@ -52,9 +122,22 @@ impl SshMcpServer {
         };
 
         let replace_all = replace_all.unwrap_or(false);
+        let dry_run = dry_run.unwrap_or(false);
         if old_text.is_empty() {
             return Err(McpError::invalid_params(
                 "old_text must not be empty in replace-in-file",
+                None,
+            ));
+        }
+        if replace_all && match_index.is_some() {
+            return Err(McpError::invalid_params(
+                "match_index cannot be combined with replace_all=true in replace-in-file",
+                None,
+            ));
+        }
+        if match_index == Some(0) {
+            return Err(McpError::invalid_params(
+                "match_index must be a positive 1-based integer in replace-in-file",
                 None,
             ));
         }
@@ -94,17 +177,52 @@ impl SshMcpServer {
                 )
             })?;
 
-        let match_count = current_content.matches(old_text.as_str()).count();
-        if match_count == 0 {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Error: old_text was not found in remote file".to_string(),
-            )]));
+        let current_sha256 = read_value
+            .get("sha256")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "read-file response missing sha256 while preparing replace-in-file".to_string(),
+                    None,
+                )
+            })?;
+
+        let planned = match plan_exact_text_replacement(
+            current_content,
+            old_text.as_str(),
+            new_text.as_str(),
+            replace_all,
+            match_index,
+        ) {
+            Ok(plan) => plan,
+            Err(message) => return Ok(CallToolResult::error(vec![Content::text(message)])),
+        };
+
+        if let Some(expected) = user_expected_sha256.as_deref()
+            && expected != current_sha256
+        {
+            return Ok(build_file_edit_conflict_result(
+                &remote_path,
+                expected,
+                current_sha256,
+            ));
         }
 
-        if !replace_all && match_count != 1 {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error: old_text matched {match_count} times; set replace_all=true to replace all matches"
-            ))]));
+        if dry_run {
+            let preview = serde_json::json!({
+                "path": remote_path,
+                "dry_run": true,
+                "changed": current_content != planned.updated_content,
+                "previous_sha256": current_sha256,
+                "predicted_new_sha256": local_text_sha256_hex(&planned.updated_content),
+                "bytes_written": planned.updated_content.len(),
+                "match_count": planned.match_count,
+                "selected_match_indices": planned.selected_match_indices,
+                "diff": build_unified_diff(&remote_path, current_content, &planned.updated_content),
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                preview.to_string(),
+            )]));
         }
 
         let partial_baseline_sha256 = if user_expected_sha256.is_none() {
@@ -127,15 +245,9 @@ impl SshMcpServer {
             return Ok(result);
         }
 
-        let updated_content = if replace_all {
-            current_content.replace(old_text.as_str(), new_text.as_str())
-        } else {
-            current_content.replacen(old_text.as_str(), new_text.as_str(), 1)
-        };
-
         self.execute_file_write_transaction(FileWriteTransactionRequest {
             remote_path: remote_path.as_str(),
-            new_content: updated_content.as_str(),
+            new_content: planned.updated_content.as_str(),
             expected_sha256: user_expected_sha256.or(partial_baseline_sha256),
             timeout,
             fault_injection,

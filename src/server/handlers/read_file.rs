@@ -239,10 +239,11 @@ impl SshMcpServer {
             result["hint"] = serde_json::Value::String(hint);
         }
         result["sha256"] = serde_json::Value::String(content_sha256);
-        result["read_ticket"] = serde_json::Value::String(
-            self.ticket_signer
-                .issue(&remote_path, DEFAULT_TICKET_TTL_SECS),
-        );
+        result["read_ticket"] = serde_json::Value::String(self.ticket_signer.issue(
+            &remote_path,
+            result["sha256"].as_str().unwrap_or_default(),
+            DEFAULT_TICKET_TTL_SECS,
+        ));
 
         Ok(CallToolResult::success(vec![Content::text(
             result.to_string(),

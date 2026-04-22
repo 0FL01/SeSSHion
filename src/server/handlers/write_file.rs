@@ -1,13 +1,15 @@
 use rmcp::ErrorData as McpError;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Content};
 use std::time::Duration;
 use tracing::debug;
 
 use crate::server::SshMcpServer;
 use crate::server::handlers::file_edit_common::{
-    FileEditFaultInjection, FileWriteTransactionRequest,
+    FileEditFaultInjection, FileWriteTransactionRequest, RemoteTextFileState,
+    build_file_edit_conflict_result, build_unified_diff, local_text_sha256_hex,
 };
 use crate::server::validation::common::validate_read_file_path;
+use crate::server::validation::file_edit::FILE_EDIT_MISSING_SHA256;
 use crate::server::validation::file_edit::write_file_too_large_error;
 use crate::server::validation::read_file::normalize_sha256_hex;
 use crate::tools::WriteFileParams;
@@ -25,6 +27,7 @@ impl SshMcpServer {
             new_content,
             expected_sha256,
             read_ticket,
+            dry_run,
             timeout_ms,
         } = params;
 
@@ -49,9 +52,12 @@ impl SshMcpServer {
             None => self.timeout,
         };
 
-        match read_ticket {
+        let dry_run = dry_run.unwrap_or(false);
+
+        let ticket_bound_sha256 = match read_ticket {
             Some(ref ticket) => {
-                self.ticket_signer
+                let claims = self
+                    .ticket_signer
                     .verify(ticket, &remote_path)
                     .map_err(|e| {
                         McpError::invalid_params(
@@ -59,7 +65,22 @@ impl SshMcpServer {
                             None,
                         )
                     })?;
+                claims.content_sha256().map(str::to_string)
             }
+            None => None,
+        };
+
+        let effective_expected_sha256 = match (
+            user_expected_sha256.as_deref(),
+            ticket_bound_sha256.as_deref(),
+        ) {
+            (Some(user), _) => Some(user.to_string()),
+            (None, Some(ticket)) => Some(ticket.to_string()),
+            (None, None) => None,
+        };
+
+        match read_ticket {
+            Some(_) => {}
             None => {
                 if self
                     .check_remote_file_nonempty(&remote_path, timeout)
@@ -73,10 +94,50 @@ impl SshMcpServer {
             }
         }
 
+        if dry_run {
+            let current_state = match self
+                .load_remote_text_file_state(&remote_path, timeout)
+                .await
+            {
+                Ok(state) => state,
+                Err(result) => return Ok(result),
+            };
+
+            let (current_content, current_sha256) = match current_state {
+                RemoteTextFileState::Missing => {
+                    (String::new(), FILE_EDIT_MISSING_SHA256.to_string())
+                }
+                RemoteTextFileState::Existing { content, sha256 } => (content, sha256),
+            };
+
+            if let Some(expected) = effective_expected_sha256.as_deref()
+                && expected != current_sha256
+            {
+                return Ok(build_file_edit_conflict_result(
+                    &remote_path,
+                    expected,
+                    &current_sha256,
+                ));
+            }
+
+            let preview = serde_json::json!({
+                "path": remote_path,
+                "dry_run": true,
+                "changed": current_content != new_content,
+                "previous_sha256": current_sha256,
+                "predicted_new_sha256": local_text_sha256_hex(&new_content),
+                "bytes_written": new_content.len(),
+                "diff": build_unified_diff(&remote_path, &current_content, &new_content),
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                preview.to_string(),
+            )]));
+        }
+
         self.execute_file_write_transaction(FileWriteTransactionRequest {
             remote_path: remote_path.as_str(),
             new_content: new_content.as_str(),
-            expected_sha256: user_expected_sha256,
+            expected_sha256: effective_expected_sha256,
             timeout,
             fault_injection,
             too_large_error: write_file_too_large_error(

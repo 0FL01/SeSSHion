@@ -146,6 +146,9 @@ pub struct WriteFileParams {
     /// Opaque read-ticket from read-file response (required for editing non-empty existing files)
     pub read_ticket: Option<String>,
 
+    /// Return a diff preview without mutating the remote file
+    pub dry_run: Option<bool>,
+
     /// Optional timeout override in milliseconds
     pub timeout_ms: Option<u64>,
 }
@@ -165,6 +168,12 @@ pub struct ReplaceInFileParams {
 
     /// Replace all matches when true (default false)
     pub replace_all: Option<bool>,
+
+    /// 1-based match selector used when old_text appears multiple times
+    pub match_index: Option<usize>,
+
+    /// Return a diff preview without mutating the remote file
+    pub dry_run: Option<bool>,
 
     /// Optional SHA-256 precondition for optimistic locking
     pub expected_sha256: Option<String>,
@@ -271,6 +280,7 @@ mod tests {
         assert_eq!(params.new_content, "127.0.0.1 localhost\n");
         assert!(params.expected_sha256.is_none());
         assert!(params.read_ticket.is_none());
+        assert!(params.dry_run.is_none());
         assert!(params.timeout_ms.is_none());
     }
 
@@ -285,6 +295,7 @@ mod tests {
             Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
         );
         assert!(params.read_ticket.is_none());
+        assert!(params.dry_run.is_none());
         assert_eq!(params.timeout_ms, Some(4000));
     }
 
@@ -296,18 +307,22 @@ mod tests {
         assert_eq!(params.old_text, "127.0.0.1");
         assert_eq!(params.new_text, "127.0.0.2");
         assert!(params.replace_all.is_none());
+        assert!(params.match_index.is_none());
+        assert!(params.dry_run.is_none());
         assert!(params.expected_sha256.is_none());
         assert!(params.timeout_ms.is_none());
     }
 
     #[test]
     fn test_replace_in_file_params_deserialize_replace_all_true() {
-        let json = r#"{"remote_path":"/etc/hosts","old_text":"x","new_text":"y","replace_all":true,"timeout_ms":2000}"#;
+        let json = r#"{"remote_path":"/etc/hosts","old_text":"x","new_text":"y","replace_all":true,"match_index":3,"dry_run":true,"timeout_ms":2000}"#;
         let params: ReplaceInFileParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.remote_path, "/etc/hosts");
         assert_eq!(params.old_text, "x");
         assert_eq!(params.new_text, "y");
         assert_eq!(params.replace_all, Some(true));
+        assert_eq!(params.match_index, Some(3));
+        assert_eq!(params.dry_run, Some(true));
         assert_eq!(params.timeout_ms, Some(2000));
     }
 

@@ -20,6 +20,43 @@ struct PlannedReplacement {
     selected_match_indices: Vec<usize>,
 }
 
+struct ResolvedScope {
+    start: usize,
+    end: usize,
+}
+
+fn resolve_scope(
+    current_content: &str,
+    scope_text: Option<&str>,
+) -> std::result::Result<ResolvedScope, String> {
+    match scope_text {
+        None => Ok(ResolvedScope {
+            start: 0,
+            end: current_content.len(),
+        }),
+        Some(scope_text) => {
+            let scope_positions: Vec<usize> = current_content
+                .match_indices(scope_text)
+                .map(|(offset, _)| offset)
+                .collect();
+
+            match scope_positions.len() {
+                0 => Err("Error: scope_text was not found in remote file".to_string()),
+                1 => {
+                    let start = scope_positions[0];
+                    Ok(ResolvedScope {
+                        start,
+                        end: start + scope_text.len(),
+                    })
+                }
+                count => Err(format!(
+                    "Error: scope_text matched {count} times; provide a more specific scope_text"
+                )),
+            }
+        }
+    }
+}
+
 fn plan_exact_text_replacement(
     current_content: &str,
     old_text: &str,
@@ -93,6 +130,7 @@ impl SshMcpServer {
             remote_path,
             old_text,
             new_text,
+            scope_text,
             replace_all,
             match_index,
             dry_run,
@@ -126,6 +164,12 @@ impl SshMcpServer {
         if old_text.is_empty() {
             return Err(McpError::invalid_params(
                 "old_text must not be empty in replace-in-file",
+                None,
+            ));
+        }
+        if scope_text.as_deref() == Some("") {
+            return Err(McpError::invalid_params(
+                "scope_text must not be empty in replace-in-file",
                 None,
             ));
         }
@@ -187,16 +231,50 @@ impl SshMcpServer {
                 )
             })?;
 
+        let resolved_scope = match resolve_scope(current_content, scope_text.as_deref()) {
+            Ok(scope) => scope,
+            Err(message) => return Ok(CallToolResult::error(vec![Content::text(message)])),
+        };
+        let scoped_content = &current_content[resolved_scope.start..resolved_scope.end];
+
         let planned = match plan_exact_text_replacement(
-            current_content,
+            scoped_content,
             old_text.as_str(),
             new_text.as_str(),
             replace_all,
             match_index,
         ) {
             Ok(plan) => plan,
-            Err(message) => return Ok(CallToolResult::error(vec![Content::text(message)])),
+            Err(message) => {
+                let message = if scope_text.is_some()
+                    && message == "Error: old_text was not found in remote file"
+                {
+                    "Error: old_text was not found within scope_text".to_string()
+                } else {
+                    message
+                };
+                return Ok(CallToolResult::error(vec![Content::text(message)]));
+            }
         };
+        let PlannedReplacement {
+            updated_content: scoped_updated_content,
+            match_count,
+            selected_match_indices,
+        } = planned;
+
+        let updated_content =
+            if resolved_scope.start == 0 && resolved_scope.end == current_content.len() {
+                scoped_updated_content
+            } else {
+                let mut combined = String::with_capacity(
+                    current_content.len() - (resolved_scope.end - resolved_scope.start)
+                        + scoped_updated_content.len(),
+                );
+                combined.push_str(&current_content[..resolved_scope.start]);
+                combined.push_str(&scoped_updated_content);
+                combined.push_str(&current_content[resolved_scope.end..]);
+                combined
+            };
 
         if let Some(expected) = user_expected_sha256.as_deref()
             && expected != current_sha256
@@ -212,13 +290,13 @@ impl SshMcpServer {
             let preview = serde_json::json!({
                 "path": remote_path,
                 "dry_run": true,
-                "changed": current_content != planned.updated_content,
+                "changed": current_content != updated_content,
                 "previous_sha256": current_sha256,
-                "predicted_new_sha256": local_text_sha256_hex(&planned.updated_content),
-                "bytes_written": planned.updated_content.len(),
-                "match_count": planned.match_count,
-                "selected_match_indices": planned.selected_match_indices,
-                "diff": build_unified_diff(&remote_path, current_content, &planned.updated_content),
+                "predicted_new_sha256": local_text_sha256_hex(&updated_content),
+                "bytes_written": updated_content.len(),
+                "match_count": match_count,
+                "selected_match_indices": selected_match_indices,
+                "diff": build_unified_diff(&remote_path, current_content, &updated_content),
             });
             return Ok(CallToolResult::success(vec![Content::text(
                 preview.to_string(),
@@ -247,7 +325,7 @@ impl SshMcpServer {
 
         self.execute_file_write_transaction(FileWriteTransactionRequest {
             remote_path: remote_path.as_str(),
-            new_content: planned.updated_content.as_str(),
+            new_content: updated_content.as_str(),
             expected_sha256: user_expected_sha256.or(partial_baseline_sha256),
             timeout,
             fault_injection,

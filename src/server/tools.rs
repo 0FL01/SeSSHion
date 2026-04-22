@@ -129,6 +129,7 @@ PARAMETERS:
 - remote_path (string, required): Absolute remote file path to edit
 - old_text (string, required): Source text to replace
 - new_text (string, required): Replacement text
+- scope_text (string): Optional exact scope substring that must match once; replacement is limited to this scope
 - replace_all (boolean): Replace all matches when true; default false requires exactly one match
 - match_index (integer): Optional 1-based selector for a specific match when old_text appears multiple times
 - dry_run (boolean): When true, returns unified diff preview and does not modify the file
@@ -139,9 +140,10 @@ BEHAVIOR:
 - Validates remote_path like read-file
 - Reads the file internally using read-file full mode
 - Requires an existing regular file and never creates a new file
+- If scope_text is supplied, it must match exactly once in the file; old_text matching is then limited to that scope
 - Returns an error when old_text is not found
 - With replace_all=false, requires exactly one match unless match_index is supplied
-- match_index is 1-based and mutually exclusive with replace_all=true
+- match_index is 1-based, mutually exclusive with replace_all=true, and counts only matches inside scope_text when scope_text is supplied
 - Computes a baseline SHA-256 for race-safe compare+replace when expected_sha256 is not supplied
 - Uses the same atomic write transaction as write-file
 - Reclaims stale remote edit locks automatically when they are older than 120 seconds
@@ -364,6 +366,10 @@ pub(super) fn replace_in_file_tool() -> Tool {
             "new_text": {
                 "type": "string",
                 "description": "Replacement text"
+            },
+            "scope_text": {
+                "type": "string",
+                "description": "Optional exact scope substring that must match once; replacement is limited to this scope"
             },
             "replace_all": {
                 "type": "boolean",

@@ -634,6 +634,7 @@ async fn test_mcp_tools_with_docker() {
             remote_path: partial_path.to_string(),
             old_text: "dup".to_string(),
             new_text: "solo".to_string(),
+            scope_text: None,
             replace_all: Some(false),
             match_index: Some(2),
             dry_run: None,
@@ -676,6 +677,7 @@ async fn test_mcp_tools_with_docker() {
             remote_path: partial_path.to_string(),
             old_text: "dup".to_string(),
             new_text: "solo".to_string(),
+            scope_text: None,
             replace_all: Some(false),
             match_index: Some(2),
             dry_run: Some(true),
@@ -730,6 +732,164 @@ async fn test_mcp_tools_with_docker() {
         Some("dup dup\n")
     );
 
+    // 4a-12d. replace-in-file: scope_text limits replacement to one unique block.
+    server
+        .test_execute_command(&format!(
+            "printf 'server {{\\n    listen 80;\\n    server_name app-a;\\n}}\\n\\nserver {{\\n    listen 80;\\n    server_name app-b;\\n}}\\n' > {}",
+            ssh_mcp::escape_for_shell(partial_path)
+        ))
+        .await
+        .expect("failed to reset partial fixture for scope_text test");
+
+    let scoped_block = "server {\n    listen 80;\n    server_name app-b;\n}\n";
+    let partial_scoped_result = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "listen 80;".to_string(),
+            new_text: "listen 8080;".to_string(),
+            scope_text: Some(scoped_block.to_string()),
+            replace_all: Some(false),
+            match_index: None,
+            dry_run: None,
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("replace-in-file scope_text call failed");
+    assert!(
+        !partial_scoped_result.is_error.unwrap_or(false),
+        "scope_text replacement should return success"
+    );
+
+    let partial_scoped_read = server
+        .test_read_file(partial_path, None)
+        .await
+        .expect("failed to read file after scoped replacement");
+    let partial_scoped_read_text = extract_text_from_result(&partial_scoped_read);
+    let partial_scoped_read_json: serde_json::Value =
+        serde_json::from_str(partial_scoped_read_text.trim())
+            .expect("scoped replacement read-file response should be valid JSON");
+    assert_eq!(
+        partial_scoped_read_json
+            .get("content")
+            .and_then(|v| v.as_str()),
+        Some(
+            "server {\n    listen 80;\n    server_name app-a;\n}\n\nserver {\n    listen 8080;\n    server_name app-b;\n}\n"
+        )
+    );
+
+    // 4a-12e. replace-in-file: scope_text dry_run previews diff and leaves file unchanged.
+    server
+        .test_execute_command(&format!(
+            "printf 'server {{\\n    listen 80;\\n    server_name app-a;\\n}}\\n\\nserver {{\\n    listen 80;\\n    server_name app-b;\\n}}\\n' > {}",
+            ssh_mcp::escape_for_shell(partial_path)
+        ))
+        .await
+        .expect("failed to reset partial fixture for scope_text dry_run test");
+
+    let partial_scoped_dry_run_result = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "listen 80;".to_string(),
+            new_text: "listen 8080;".to_string(),
+            scope_text: Some(scoped_block.to_string()),
+            replace_all: Some(false),
+            match_index: None,
+            dry_run: Some(true),
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("replace-in-file scope_text dry_run call failed");
+    assert!(
+        !partial_scoped_dry_run_result.is_error.unwrap_or(false),
+        "scope_text dry_run should return success"
+    );
+    let partial_scoped_dry_run_text = extract_text_from_result(&partial_scoped_dry_run_result);
+    let partial_scoped_dry_run_json: serde_json::Value =
+        serde_json::from_str(partial_scoped_dry_run_text.trim())
+            .expect("scope_text dry_run response should be valid JSON");
+    assert_eq!(
+        partial_scoped_dry_run_json
+            .get("dry_run")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(
+        partial_scoped_dry_run_json
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .is_some_and(|diff| diff.contains("app-b") && diff.contains("listen 8080;")),
+        "scope_text dry_run should include scoped diff preview: {partial_scoped_dry_run_text}"
+    );
+
+    let partial_scoped_dry_run_read = server
+        .test_read_file(partial_path, None)
+        .await
+        .expect("failed to read file after scoped dry_run");
+    let partial_scoped_dry_run_read_text = extract_text_from_result(&partial_scoped_dry_run_read);
+    let partial_scoped_dry_run_read_json: serde_json::Value =
+        serde_json::from_str(partial_scoped_dry_run_read_text.trim())
+            .expect("scoped dry_run follow-up read should be valid JSON");
+    assert_eq!(
+        partial_scoped_dry_run_read_json
+            .get("content")
+            .and_then(|v| v.as_str()),
+        Some(
+            "server {\n    listen 80;\n    server_name app-a;\n}\n\nserver {\n    listen 80;\n    server_name app-b;\n}\n"
+        )
+    );
+
+    // 4a-12f. replace-in-file: missing scope_text returns an error.
+    let partial_missing_scope_result = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "listen 80;".to_string(),
+            new_text: "listen 8080;".to_string(),
+            scope_text: Some("server {\n    listen 80;\n    server_name app-z;\n}\n".to_string()),
+            replace_all: Some(false),
+            match_index: None,
+            dry_run: None,
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("replace-in-file missing scope_text call failed");
+    assert!(
+        partial_missing_scope_result.is_error.unwrap_or(false),
+        "missing scope_text should return an error"
+    );
+    let partial_missing_scope_text = extract_text_from_result(&partial_missing_scope_result);
+    assert!(
+        partial_missing_scope_text.contains("scope_text was not found"),
+        "unexpected missing scope_text error: {partial_missing_scope_text}"
+    );
+
+    // 4a-12g. replace-in-file: ambiguous scope_text returns an error.
+    let partial_ambiguous_scope_result = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "listen 80;".to_string(),
+            new_text: "listen 8080;".to_string(),
+            scope_text: Some("listen 80;".to_string()),
+            replace_all: Some(false),
+            match_index: None,
+            dry_run: None,
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect("replace-in-file ambiguous scope_text call failed");
+    assert!(
+        partial_ambiguous_scope_result.is_error.unwrap_or(false),
+        "ambiguous scope_text should return an error"
+    );
+    let partial_ambiguous_scope_text = extract_text_from_result(&partial_ambiguous_scope_result);
+    assert!(
+        partial_ambiguous_scope_text.contains("scope_text matched 2 times"),
+        "unexpected ambiguous scope_text error: {partial_ambiguous_scope_text}"
+    );
+
     // 4a-13. replace-in-file: missing file must fail and must not create.
     let partial_missing_path = "/tmp/ssh-mcp-replace-in-file-partial-missing.txt";
     server
@@ -769,6 +929,7 @@ async fn test_mcp_tools_with_docker() {
             remote_path: partial_path.to_string(),
             old_text: String::new(),
             new_text: "replacement".to_string(),
+            scope_text: None,
             replace_all: Some(false),
             match_index: None,
             dry_run: None,
@@ -782,6 +943,27 @@ async fn test_mcp_tools_with_docker() {
             .to_string()
             .contains("old_text must not be empty in replace-in-file"),
         "unexpected invalid_params error for empty old_text: {invalid_empty_old_text}"
+    );
+
+    let invalid_empty_scope_text = server
+        .test_replace_in_file_with_params(ssh_mcp::tools::ReplaceInFileParams {
+            remote_path: partial_path.to_string(),
+            old_text: "dup".to_string(),
+            new_text: "solo".to_string(),
+            scope_text: Some(String::new()),
+            replace_all: Some(false),
+            match_index: None,
+            dry_run: None,
+            expected_sha256: None,
+            timeout_ms: Some(30_000),
+        })
+        .await
+        .expect_err("partial scope_text='' should fail with invalid_params");
+    assert!(
+        invalid_empty_scope_text
+            .to_string()
+            .contains("scope_text must not be empty in replace-in-file"),
+        "unexpected invalid_params error for empty scope_text: {invalid_empty_scope_text}"
     );
 
     // 4a-15. Partial mode must not recreate file deleted between read and write.

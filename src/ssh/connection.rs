@@ -173,9 +173,15 @@ impl SshConnectionManager {
 
         // Connect with timeout
         let addr = format!("{}:{}", self.config.host, self.config.port);
+        let handler = SshHandler::new(
+            self.config.host.clone(),
+            self.config.port,
+            self.config.host_key_checking,
+            self.config.known_hosts.clone(),
+        );
         let connect_result = timeout(
             connection_timeout,
-            client::connect(ssh_config, addr.as_str(), SshHandler::new()),
+            client::connect(ssh_config, addr.as_str(), handler),
         )
         .await;
 

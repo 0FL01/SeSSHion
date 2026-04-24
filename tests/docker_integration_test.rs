@@ -102,6 +102,8 @@ async fn test_mcp_tools_with_docker() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     // 3. Create SshMcpServer instance
@@ -2100,6 +2102,8 @@ mod unix_transfer_tests {
             reconnect_retries: 3,
             reconnect_backoff_ms: 250,
             health_probe_timeout_ms: 1500,
+            strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+            known_hosts: None,
         };
 
         let server = SshMcpServer::new(config)
@@ -2251,6 +2255,8 @@ async fn test_compact_response_has_paths() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)

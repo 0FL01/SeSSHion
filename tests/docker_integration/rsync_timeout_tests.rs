@@ -64,6 +64,8 @@ async fn test_rsync_put_file_timeout() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -226,6 +228,8 @@ async fn test_rsync_get_file_timeout() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -370,6 +374,8 @@ async fn test_rsync_put_directory_timeout() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)

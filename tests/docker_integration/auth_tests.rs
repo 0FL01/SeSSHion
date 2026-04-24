@@ -6,6 +6,34 @@ use super::common::*;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+fn host_key_test_config(
+    host: &str,
+    port: u16,
+    mode: ssh_mcp::HostKeyCheckMode,
+    known_hosts: PathBuf,
+) -> Config {
+    Config {
+        host: host.to_string(),
+        port,
+        user: "test".to_string(),
+        password: Some("secret".to_string()),
+        key: None,
+        su_password: None,
+        sudo_password: None,
+        timeout_ms: 30000,
+        max_chars: Some(1000),
+        max_output_tokens: Some(12000),
+        disable_sudo: true,
+        keepalive_interval: 30,
+        keepalive_max: 3,
+        reconnect_retries: 3,
+        reconnect_backoff_ms: 250,
+        health_probe_timeout_ms: 1500,
+        strict_host_key_checking: mode,
+        known_hosts: Some(known_hosts),
+    }
+}
+
 /// Test that key authentication is tried first when both key and password are configured.
 /// The container is configured for key auth only (PASSWORD_ACCESS=false),
 /// so key auth should succeed and connection should work.
@@ -55,6 +83,8 @@ async fn test_key_auth_with_password_fallback() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -73,6 +103,102 @@ async fn test_key_auth_with_password_fallback() {
     );
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_host_key_accept_new_then_strict_succeeds() {
+    init_test_env().expect("Failed to initialize test environment");
+
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("ssh_mcp=debug,info")
+        .try_init();
+
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("Failed to start SSH container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("Failed to get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("Failed to get mapped SSH port");
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let known_hosts_dir = tempfile::TempDir::new().expect("known_hosts tempdir");
+    let known_hosts = known_hosts_dir.path().join("known_hosts");
+    let host_str = host.to_string();
+
+    let strict_unknown = SshMcpServer::new(host_key_test_config(
+        &host_str,
+        port,
+        ssh_mcp::HostKeyCheckMode::Yes,
+        known_hosts.clone(),
+    ))
+    .await
+    .expect("server construction should not connect");
+    let rejected = strict_unknown
+        .test_execute_command("whoami")
+        .await
+        .expect("tool call should return an MCP result");
+    assert!(
+        rejected.is_error.unwrap_or(false),
+        "strict mode should reject an unknown host key"
+    );
+    assert!(
+        extract_text_from_result(&rejected).contains("host key verification failed"),
+        "strict rejection should mention host key verification"
+    );
+    strict_unknown.shutdown().await;
+
+    let accept_new = SshMcpServer::new(host_key_test_config(
+        &host_str,
+        port,
+        ssh_mcp::HostKeyCheckMode::AcceptNew,
+        known_hosts.clone(),
+    ))
+    .await
+    .expect("accept-new server should construct");
+    let accepted = accept_new
+        .test_execute_command("whoami")
+        .await
+        .expect("accept-new command should return");
+    assert!(
+        !accepted.is_error.unwrap_or(false),
+        "accept-new should trust and record the first host key"
+    );
+    assert!(extract_text_from_result(&accepted).contains("test"));
+    accept_new.shutdown().await;
+
+    let known_hosts_text = std::fs::read_to_string(&known_hosts).expect("known_hosts should exist");
+    assert!(
+        known_hosts_text.contains("ssh-"),
+        "accept-new should write a host key entry"
+    );
+
+    let strict_known = SshMcpServer::new(host_key_test_config(
+        &host_str,
+        port,
+        ssh_mcp::HostKeyCheckMode::Yes,
+        known_hosts,
+    ))
+    .await
+    .expect("strict known server should construct");
+    let strict_ok = strict_known
+        .test_execute_command("whoami")
+        .await
+        .expect("strict known command should return");
+    assert!(
+        !strict_ok.is_error.unwrap_or(false),
+        "strict mode should accept the recorded host key"
+    );
+    assert!(extract_text_from_result(&strict_ok).contains("test"));
+    strict_known.shutdown().await;
 }
 
 /// Test password authentication works when key is also configured but invalid.
@@ -127,6 +253,8 @@ async fn test_password_auth_with_key_fallback() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -195,6 +323,8 @@ async fn test_both_key_and_password_configured() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -327,6 +457,8 @@ async fn test_key_auth_failure_then_password_success() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     // Should succeed via password fallback after key fails
@@ -398,6 +530,8 @@ async fn test_switch_auth_methods_between_transfers() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server1 = SshMcpServer::new(config_key_only)
@@ -468,6 +602,8 @@ async fn test_switch_auth_methods_between_transfers() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server2 = SshMcpServer::new(config_password_only)
@@ -531,6 +667,8 @@ async fn test_switch_auth_methods_between_transfers() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server3 = SshMcpServer::new(config_both)

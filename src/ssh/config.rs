@@ -2,6 +2,34 @@
 //!
 //! Configuration for SSH connection parameters including authentication.
 
+use std::path::PathBuf;
+
+use clap::ValueEnum;
+
+/// SSH host key verification policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum HostKeyCheckMode {
+    /// Require an existing matching known_hosts entry.
+    Yes,
+    /// Learn unknown keys, but reject changed keys.
+    #[default]
+    AcceptNew,
+    /// Disable host key verification.
+    No,
+}
+
+impl HostKeyCheckMode {
+    /// OpenSSH StrictHostKeyChecking value for this policy.
+    pub fn as_openssh_value(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::AcceptNew => "accept-new",
+            Self::No => "no",
+        }
+    }
+}
+
 /// Seconds to send SIGKILL after SIGTERM when using timeout
 pub const TIMEOUT_KILL_AFTER_SECS: u64 = 2;
 
@@ -52,6 +80,12 @@ pub struct SshConfig {
 
     /// Health probe timeout in milliseconds for active session checks (default: 1500)
     pub health_probe_timeout_ms: u64,
+
+    /// SSH host key verification policy.
+    pub host_key_checking: HostKeyCheckMode,
+
+    /// Optional known_hosts file path.
+    pub known_hosts: Option<PathBuf>,
 }
 
 impl SshConfig {
@@ -71,6 +105,8 @@ impl SshConfig {
             reconnect_retries: 3,
             reconnect_backoff_ms: 250,
             health_probe_timeout_ms: 1500,
+            host_key_checking: HostKeyCheckMode::default(),
+            known_hosts: None,
         }
     }
 
@@ -144,6 +180,18 @@ impl SshConfig {
         self.health_probe_timeout_ms = timeout_ms;
         self
     }
+
+    /// Set SSH host key verification policy.
+    pub fn with_host_key_checking(mut self, mode: HostKeyCheckMode) -> Self {
+        self.host_key_checking = mode;
+        self
+    }
+
+    /// Set a custom known_hosts file path.
+    pub fn with_known_hosts(mut self, known_hosts: Option<PathBuf>) -> Self {
+        self.known_hosts = known_hosts;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -168,5 +216,7 @@ mod tests {
         assert_eq!(config.reconnect_retries, 4);
         assert_eq!(config.reconnect_backoff_ms, 500);
         assert_eq!(config.health_probe_timeout_ms, 1_200);
+        assert_eq!(config.host_key_checking, HostKeyCheckMode::AcceptNew);
+        assert!(config.known_hosts.is_none());
     }
 }

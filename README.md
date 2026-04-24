@@ -88,9 +88,40 @@ The server is configured via CLI arguments or environment variables.
 | `--log-file` | `SSH_MCP_LOG_FILE` | Log file path (base name; daily/hourly adds date suffix) |
 | `--log-format` | `SSH_MCP_LOG_FORMAT` | Log file format: text, json (default: text) |
 | `--log-rotation` | `SSH_MCP_LOG_ROTATION` | Log rotation: daily, hourly, never (default: daily) |
+| `--strict-host-key-checking` | `SSH_MCP_STRICT_HOST_KEY_CHECKING` | Host key policy: `accept-new` (default), `yes`, or `no` |
+| `--known-hosts` | `SSH_MCP_KNOWN_HOSTS` | Custom `known_hosts` file path |
 
 Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
 Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
+
+### SSH Host Key Verification
+
+`ssh-mcp` verifies the SSH server host key before authentication. This prevents silent man-in-the-middle replacement after a host key has been trusted.
+
+- `accept-new` (default): trust and record an unknown host key on first connection; reject later key changes.
+- `yes`: require the host key to already exist in `known_hosts`; reject unknown or changed keys.
+- `no`: disable host key verification; use only for local test containers or other disposable environments.
+
+For strict production use, set the policy in your MCP client configuration and point it at a pre-populated `known_hosts` file:
+
+```jsonc
+{
+  "mcp": {
+    "ssh-remote": {
+      "type": "local",
+      "command": [
+        "/absolute/path/to/ssh-mcp",
+        "--host=example.com",
+        "--user=alice",
+        "--key=/home/alice/.ssh/id_ed25519",
+        "--strict-host-key-checking=yes",
+        "--known-hosts=/home/alice/.ssh/known_hosts"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
 
 ## 🚀 Adding to MCP Clients
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{Result, SshMcpError};
-use crate::ssh::{SshConnectionManager, escape_for_shell};
+use crate::ssh::{HostKeyCheckMode, SshConnectionManager, escape_for_shell};
 
 use super::process;
 use super::skeleton;
@@ -21,6 +21,8 @@ pub struct RsyncEndpoint {
     pub port: u16,
     pub user: String,
     pub key_path: Option<PathBuf>,
+    pub host_key_checking: HostKeyCheckMode,
+    pub known_hosts: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,12 +111,31 @@ fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
-        "-o".to_string(),
-        format!("UserKnownHostsFile={}", null_known_hosts_path()),
-        "-o".to_string(),
-        "LogLevel=ERROR".to_string(),
+        format!(
+            "StrictHostKeyChecking={}",
+            endpoint.host_key_checking.as_openssh_value()
+        ),
     ];
+
+    match endpoint.host_key_checking {
+        HostKeyCheckMode::No => {
+            opts.push("-o".to_string());
+            opts.push(format!("UserKnownHostsFile={}", null_known_hosts_path()));
+        }
+        HostKeyCheckMode::Yes | HostKeyCheckMode::AcceptNew => {
+            if let Some(path) = &endpoint.known_hosts {
+                let path_str = path.display().to_string();
+                opts.push("-o".to_string());
+                opts.push(format!(
+                    "UserKnownHostsFile='{}'",
+                    escape_for_shell(&path_str)
+                ));
+            }
+        }
+    }
+
+    opts.push("-o".to_string());
+    opts.push("LogLevel=ERROR".to_string());
 
     if endpoint.port != 22 {
         opts.push("-p".to_string());
@@ -468,6 +489,8 @@ Total bytes received: 172"#;
             port: 22,
             user: "alice".to_string(),
             key_path: None,
+            host_key_checking: HostKeyCheckMode::No,
+            known_hosts: None,
         };
         let spec = rsync_remote_spec(&endpoint, "/path/to/file.txt");
         assert_eq!(spec, "alice@example.com:/path/to/file.txt");
@@ -486,6 +509,8 @@ Total bytes received: 172"#;
             port: 2222,
             user: "alice".to_string(),
             key_path: Some(key_path.clone()),
+            host_key_checking: HostKeyCheckMode::No,
+            known_hosts: None,
         };
         let opts = build_ssh_options(&endpoint);
         assert!(opts.contains("-p 2222"));
@@ -496,5 +521,20 @@ Total bytes received: 172"#;
 
         let null_hosts = if cfg!(windows) { "NUL" } else { "/dev/null" };
         assert!(opts.contains(&format!("UserKnownHostsFile={null_hosts}")));
+    }
+
+    #[test]
+    fn test_build_ssh_options_accept_new_known_hosts() {
+        let endpoint = RsyncEndpoint {
+            host: "example.com".to_string(),
+            port: 22,
+            user: "alice".to_string(),
+            key_path: None,
+            host_key_checking: HostKeyCheckMode::AcceptNew,
+            known_hosts: Some(PathBuf::from("/tmp/my known_hosts")),
+        };
+        let opts = build_ssh_options(&endpoint);
+        assert!(opts.contains("StrictHostKeyChecking=accept-new"));
+        assert!(opts.contains("UserKnownHostsFile='/tmp/my known_hosts'"));
     }
 }

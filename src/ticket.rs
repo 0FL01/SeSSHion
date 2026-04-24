@@ -295,14 +295,16 @@ mod tests {
     #[test]
     fn test_malformed_ticket() {
         let signer = TicketSigner::new();
-        for bad in &[
-            "",
-            "rt1",
-            "rt1.abc",
-            "rt2.12345.aabb",
-            "rt2.12345.short.bad",
-            "notrt1.12345.aabb",
-        ] {
+        let future_exp = now_epoch_secs().saturating_add(DEFAULT_TICKET_TTL_SECS);
+        let bad_tickets = [
+            String::new(),
+            "rt1".to_string(),
+            "rt1.abc".to_string(),
+            "rt2.12345.aabb".to_string(),
+            format!("rt2.{future_exp}.short.bad"),
+            "notrt1.12345.aabb".to_string(),
+        ];
+        for bad in &bad_tickets {
             let err = signer.verify(bad, "/any/path").unwrap_err();
             assert!(
                 matches!(err, TicketError::Malformed | TicketError::InvalidSignature),

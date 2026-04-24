@@ -25,6 +25,8 @@ fn docker_test_config(host: &str, port: u16) -> Config {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     }
 }
 
@@ -128,6 +130,8 @@ async fn test_subsecond_timeout_500ms() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -216,6 +220,8 @@ async fn test_fractional_timeout_1500ms() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -293,6 +299,8 @@ async fn test_timeout_actually_fires_with_precision() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -380,6 +388,8 @@ async fn test_sudo_timeout_auto_detaches_to_background() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)

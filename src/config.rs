@@ -4,6 +4,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use crate::error::{Result, SshMcpError};
+use crate::ssh::HostKeyCheckMode;
 
 /// Default timeout for command execution in milliseconds
 pub const DEFAULT_TIMEOUT_MS: u64 = 60_000; // 60 seconds
@@ -131,6 +132,19 @@ pub struct Args {
     /// Health probe timeout in milliseconds for active session checks (default: 1500)
     #[arg(long, default_value = "1500", env = "SSH_MCP_HEALTH_PROBE_TIMEOUT_MS")]
     pub health_probe_timeout_ms: u64,
+
+    /// SSH host key checking mode: yes, accept-new, or no
+    #[arg(
+        long = "strict-host-key-checking",
+        env = "SSH_MCP_STRICT_HOST_KEY_CHECKING",
+        value_enum,
+        default_value_t = HostKeyCheckMode::AcceptNew
+    )]
+    pub strict_host_key_checking: HostKeyCheckMode,
+
+    /// Path to known_hosts file (default: OpenSSH user known_hosts)
+    #[arg(long = "known-hosts", env = "SSH_MCP_KNOWN_HOSTS")]
+    pub known_hosts: Option<PathBuf>,
 }
 
 /// Parsed and validated configuration
@@ -183,6 +197,12 @@ pub struct Config {
 
     /// Health probe timeout in milliseconds for active session checks
     pub health_probe_timeout_ms: u64,
+
+    /// SSH host key checking mode
+    pub strict_host_key_checking: HostKeyCheckMode,
+
+    /// Optional known_hosts file path
+    pub known_hosts: Option<PathBuf>,
 }
 
 impl Config {
@@ -210,6 +230,8 @@ impl Config {
             reconnect_retries: args.reconnect_retries,
             reconnect_backoff_ms: args.reconnect_backoff_ms,
             health_probe_timeout_ms: args.health_probe_timeout_ms,
+            strict_host_key_checking: args.strict_host_key_checking,
+            known_hosts: args.known_hosts,
         })
     }
 }
@@ -360,6 +382,8 @@ mod tests {
             reconnect_retries: DEFAULT_RECONNECT_RETRIES,
             reconnect_backoff_ms: DEFAULT_RECONNECT_BACKOFF_MS,
             health_probe_timeout_ms: DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+            strict_host_key_checking: HostKeyCheckMode::AcceptNew,
+            known_hosts: None,
         }
     }
 
@@ -400,6 +424,29 @@ mod tests {
         let config = Config::from_args(base_args()).unwrap();
 
         assert_eq!(config.max_chars, Some(2048));
+        assert_eq!(config.strict_host_key_checking, HostKeyCheckMode::AcceptNew);
+        assert!(config.known_hosts.is_none());
+    }
+
+    #[test]
+    fn test_args_parse_host_key_options() {
+        let args = Args::try_parse_from([
+            "ssh-mcp",
+            "--host",
+            "example.com",
+            "--user",
+            "alice",
+            "--password",
+            "secret",
+            "--strict-host-key-checking",
+            "yes",
+            "--known-hosts",
+            "/tmp/known_hosts",
+        ])
+        .unwrap();
+
+        assert_eq!(args.strict_host_key_checking, HostKeyCheckMode::Yes);
+        assert_eq!(args.known_hosts, Some(PathBuf::from("/tmp/known_hosts")));
     }
 
     #[test]

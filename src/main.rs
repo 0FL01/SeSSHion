@@ -40,6 +40,15 @@ async fn main() -> Result<()> {
         "Keepalive: interval={}s, max_failures={}",
         config.keepalive_interval, config.keepalive_max
     );
+    info!(
+        "Host key checking: {:?}, known_hosts={}",
+        config.strict_host_key_checking,
+        config
+            .known_hosts
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "default".to_string())
+    );
 
     if config.disable_sudo {
         info!("sudo-exec tool is disabled");

@@ -67,6 +67,8 @@ async fn test_fallback_from_rsync_to_sftp() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -202,6 +204,8 @@ async fn test_fallback_from_rsync_to_scp() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -339,6 +343,8 @@ async fn test_fallback_from_sftp_to_scp() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -466,6 +472,8 @@ async fn test_fallback_all_the_way_to_execraw() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)
@@ -653,6 +661,8 @@ async fn test_fallback_tries_all_on_generic_error() {
         reconnect_retries: 3,
         reconnect_backoff_ms: 250,
         health_probe_timeout_ms: 1500,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     };
 
     let server = SshMcpServer::new(config)

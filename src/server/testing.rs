@@ -323,6 +323,8 @@ impl SshMcpServer {
                         port: self.config.port,
                         user: self.config.user.clone(),
                         key_path,
+                        host_key_checking: self.config.strict_host_key_checking,
+                        known_hosts: self.config.known_hosts.clone(),
                     },
                 },
             )

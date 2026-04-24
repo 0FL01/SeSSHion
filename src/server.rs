@@ -171,6 +171,11 @@ impl SshMcpServer {
             .with_reconnect_backoff_ms(config.reconnect_backoff_ms)
             .with_health_probe_timeout_ms(config.health_probe_timeout_ms);
 
+        // Add host key verification settings
+        ssh_config = ssh_config
+            .with_host_key_checking(config.strict_host_key_checking)
+            .with_known_hosts(config.known_hosts.clone());
+
         // Add output token limit for OOM protection
         ssh_config = ssh_config.with_max_output_tokens(config.max_output_tokens);
 
@@ -626,6 +631,8 @@ impl SshMcpServer {
                         port: self.config.port,
                         user: self.config.user.clone(),
                         key_path,
+                        host_key_checking: self.config.strict_host_key_checking,
+                        known_hosts: self.config.known_hosts.clone(),
                     },
                 },
             )

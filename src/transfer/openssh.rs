@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::error::{Result, SshMcpError};
-use crate::ssh::{SshConnectionManager, escape_for_shell};
+use crate::ssh::{HostKeyCheckMode, SshConnectionManager, escape_for_shell};
 
 use super::process;
 use super::skeleton;
@@ -25,6 +25,8 @@ pub struct OpenSshEndpoint {
     pub port: u16,
     pub user: String,
     pub key_path: PathBuf,
+    pub host_key_checking: HostKeyCheckMode,
+    pub known_hosts: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +98,7 @@ fn null_known_hosts_path() -> &'static str {
 }
 
 fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
-    vec![
+    let mut opts = vec![
         "-i".to_string(),
         endpoint.key_path.display().to_string(),
         "-o".to_string(),
@@ -108,12 +110,28 @@ fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
         "-o".to_string(),
         "PreferredAuthentications=publickey".to_string(),
         "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
-        "-o".to_string(),
-        format!("UserKnownHostsFile={}", null_known_hosts_path()),
-        "-o".to_string(),
-        "LogLevel=ERROR".to_string(),
-    ]
+        format!(
+            "StrictHostKeyChecking={}",
+            endpoint.host_key_checking.as_openssh_value()
+        ),
+    ];
+
+    match endpoint.host_key_checking {
+        HostKeyCheckMode::No => {
+            opts.push("-o".to_string());
+            opts.push(format!("UserKnownHostsFile={}", null_known_hosts_path()));
+        }
+        HostKeyCheckMode::Yes | HostKeyCheckMode::AcceptNew => {
+            if let Some(path) = &endpoint.known_hosts {
+                opts.push("-o".to_string());
+                opts.push(format!("UserKnownHostsFile={}", path.display()));
+            }
+        }
+    }
+
+    opts.push("-o".to_string());
+    opts.push("LogLevel=ERROR".to_string());
+    opts
 }
 
 async fn run_sftp_batch(
@@ -605,8 +623,40 @@ mod tests {
             port: 22,
             user: "alice".to_string(),
             key_path: PathBuf::from("/k"),
+            host_key_checking: HostKeyCheckMode::No,
+            known_hosts: None,
         };
         let spec = scp_remote_spec(&endpoint, "/path/with space/it's.txt");
         assert_eq!(spec, "alice@example.com:'/path/with space/it'\"'\"'s.txt'");
+    }
+
+    #[test]
+    fn test_common_ssh_options_no_disables_known_hosts() {
+        let endpoint = OpenSshEndpoint {
+            host: "example.com".to_string(),
+            port: 22,
+            user: "alice".to_string(),
+            key_path: PathBuf::from("/k"),
+            host_key_checking: HostKeyCheckMode::No,
+            known_hosts: None,
+        };
+        let opts = common_ssh_options(&endpoint);
+        assert!(opts.contains(&"StrictHostKeyChecking=no".to_string()));
+        assert!(opts.iter().any(|o| o.starts_with("UserKnownHostsFile=")));
+    }
+
+    #[test]
+    fn test_common_ssh_options_accept_new_uses_configured_known_hosts() {
+        let endpoint = OpenSshEndpoint {
+            host: "example.com".to_string(),
+            port: 22,
+            user: "alice".to_string(),
+            key_path: PathBuf::from("/k"),
+            host_key_checking: HostKeyCheckMode::AcceptNew,
+            known_hosts: Some(PathBuf::from("/tmp/known_hosts")),
+        };
+        let opts = common_ssh_options(&endpoint);
+        assert!(opts.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(opts.contains(&"UserKnownHostsFile=/tmp/known_hosts".to_string()));
     }
 }

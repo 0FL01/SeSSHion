@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::error::{Result, SshMcpError};
-use crate::ssh::SshConnectionManager;
+use crate::ssh::{HostKeyCheckMode, SshConnectionManager};
 
 fn io_to_transport_attempt(err: std::io::Error) -> TransportAttemptError {
     TransportAttemptError::Other(SshMcpError::Io(err))
@@ -84,6 +84,8 @@ pub struct TransferSshOptions {
     pub port: u16,
     pub user: String,
     pub key_path: Option<PathBuf>,
+    pub host_key_checking: HostKeyCheckMode,
+    pub known_hosts: Option<PathBuf>,
 }
 
 impl TransferEngine {
@@ -465,6 +467,8 @@ impl TransferEngine {
             port: ctx.ssh.port,
             user: ctx.ssh.user.clone(),
             key_path: key_path.to_path_buf(),
+            host_key_checking: ctx.ssh.host_key_checking,
+            known_hosts: ctx.ssh.known_hosts.clone(),
         };
 
         let overwrite = response.params.overwrite;
@@ -542,6 +546,8 @@ impl TransferEngine {
             port: ctx.ssh.port,
             user: ctx.ssh.user.clone(),
             key_path: ctx.key_path.map(|p| p.to_path_buf()),
+            host_key_checking: ctx.ssh.host_key_checking,
+            known_hosts: ctx.ssh.known_hosts.clone(),
         };
 
         let overwrite = response.params.overwrite;

@@ -12,7 +12,7 @@ pub mod sanitize;
 
 // Re-exports
 pub use command::{CommandOutput, TransferRawOutput, wrap_command_with_timeout};
-pub use config::SshConfig;
+pub use config::{HostKeyCheckMode, SshConfig};
 pub use connection::SshConnectionManager;
 pub use elevation::{escape_for_shell, sanitize_password, wrap_sudo_command};
 pub use handler::SshHandler;

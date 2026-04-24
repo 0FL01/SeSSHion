@@ -21,6 +21,8 @@ fn docker_test_config(host: &str, port: u16) -> Config {
         reconnect_retries: 4,
         reconnect_backoff_ms: 200,
         health_probe_timeout_ms: 400,
+        strict_host_key_checking: ssh_mcp::HostKeyCheckMode::No,
+        known_hosts: None,
     }
 }
 

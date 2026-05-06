@@ -38,6 +38,7 @@ use crate::server::validation::read_file::{
     apply_read_file_window, estimate_tokens_from_bytes, resolve_read_file_line_limit,
     resolve_read_file_max_bytes,
 };
+#[cfg(test)]
 use crate::server::validation::validate_background_log_path;
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,

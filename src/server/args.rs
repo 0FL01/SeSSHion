@@ -1,7 +1,5 @@
 use rmcp::ErrorData as McpError;
 
-use std::path::Path;
-
 use serde_json::{Map, Value};
 
 use super::SshMcpServer;
@@ -16,7 +14,6 @@ pub(super) struct CommonToolArgs {
 
 pub(super) fn parse_common_tool_args(
     args: &Map<String, Value>,
-    spool_base_dir: &Path,
 ) -> std::result::Result<CommonToolArgs, McpError> {
     let command = args
         .get("command")
@@ -66,9 +63,10 @@ pub(super) fn parse_common_tool_args(
                 let s = v
                     .as_str()
                     .ok_or_else(|| McpError::invalid_params("log_path must be a string", None))?;
-                super::validate_background_log_path(spool_base_dir, s)
-                    .map_err(|msg| McpError::invalid_params(msg, None))?;
 
+                // Path safety validation is handled in the background executor so
+                // invalid custom paths become normal tool errors instead of MCP
+                // protocol-level -32602 invalid_params responses.
                 Some(s.to_string())
             }
         }
@@ -91,22 +89,16 @@ impl SshMcpServer {
         &self,
         args: &serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<CommonToolArgs, McpError> {
-        parse_common_tool_args(args, self.spooler.base_dir())
+        parse_common_tool_args(args)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use rmcp::model::ErrorCode;
     use serde_json::json;
 
     use super::parse_common_tool_args;
-
-    fn spool_base_dir() -> &'static Path {
-        Path::new("/tmp/ssh-mcp")
-    }
 
     #[test]
     fn background_true_ignores_timeout_ms_without_validation() {
@@ -116,8 +108,7 @@ mod tests {
                 "background": true,
                 "timeout_ms": timeout_val,
             });
-            let parsed =
-                parse_common_tool_args(params.as_object().unwrap(), spool_base_dir()).unwrap();
+            let parsed = parse_common_tool_args(params.as_object().unwrap()).unwrap();
             assert!(parsed.background);
             assert!(parsed.timeout_ms.is_none());
         }
@@ -131,8 +122,7 @@ mod tests {
                 "background": false,
                 "log_path": log_path_val,
             });
-            let parsed =
-                parse_common_tool_args(params.as_object().unwrap(), spool_base_dir()).unwrap();
+            let parsed = parse_common_tool_args(params.as_object().unwrap()).unwrap();
             assert!(!parsed.background);
             assert!(parsed.log_path.is_none());
         }
@@ -145,21 +135,22 @@ mod tests {
             "background": true,
             "log_path": 123,
         });
-        let err =
-            parse_common_tool_args(params.as_object().unwrap(), spool_base_dir()).unwrap_err();
+        let err = parse_common_tool_args(params.as_object().unwrap()).unwrap_err();
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[test]
-    fn background_true_log_path_invalid_is_invalid_params() {
+    fn background_true_log_path_invalid_is_parsed_for_tool_error() {
         let params = json!({
             "command": "echo hi",
             "background": true,
             "log_path": "/tmp/ssh-mcp/subdir/test.log",
         });
-        let err =
-            parse_common_tool_args(params.as_object().unwrap(), spool_base_dir()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        let parsed = parse_common_tool_args(params.as_object().unwrap()).unwrap();
+        assert_eq!(
+            parsed.log_path.as_deref(),
+            Some("/tmp/ssh-mcp/subdir/test.log")
+        );
     }
 
     #[test]
@@ -170,8 +161,7 @@ mod tests {
                 "background": false,
                 "timeout_ms": timeout_val,
             });
-            let err =
-                parse_common_tool_args(params.as_object().unwrap(), spool_base_dir()).unwrap_err();
+            let err = parse_common_tool_args(params.as_object().unwrap()).unwrap_err();
             assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
             assert_eq!(
                 err.message.as_ref(),

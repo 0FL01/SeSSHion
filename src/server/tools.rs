@@ -11,7 +11,7 @@ PARAMETERS:
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path,log_exists}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
 - timeout_ms (integer): Foreground-only. If timeout is reached on a target that supports detach handoff, exec auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail}. Ignored when background=true (not validated in that mode).
-- log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
+- log_path (string): Advanced background-only override. Omit normally. If provided, must be a .log file directly under the local spool directory (e.g., /tmp/ssh-mcp/name.log on Unix, %TEMP%\ssh-mcp\name.log on Windows). Invalid custom paths return a tool JSON error.
 
 BACKGROUND MODE:
 For commands longer than RPC timeout, use background=true:
@@ -39,7 +39,7 @@ PARAMETERS:
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path,log_exists}.
   Output is streamed to local log file on MCP server. Monitor via check-process using job_id.
 - timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo-exec auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail, log_path}. Ignored when background=true (not validated in that mode).
-- log_path (string): Background-only. Ignored when background=false (not validated in that mode). Must be under the system temp directory (e.g., /tmp/ssh-mcp on Unix, %TEMP%\ssh-mcp on Windows).
+- log_path (string): Advanced background-only override. Omit normally. If provided, must be a .log file directly under the local spool directory (e.g., /tmp/ssh-mcp/name.log on Unix, %TEMP%\ssh-mcp\name.log on Windows). Invalid custom paths return a tool JSON error.
 
 NOTE:
 - check-process returns strict states: `running`, `completed`, `failed`, or `state_lost`.
@@ -175,7 +175,8 @@ fn command_tool(
                 "type": "integer"
             },
             "log_path": {
-                "type": "string"
+                "type": "string",
+                "description": "Advanced background-only override. Omit normally; defaults to /tmp/ssh-mcp/<job_id>.log. If provided, must be a .log file directly under the local spool directory."
             }
         },
         "required": ["command"]

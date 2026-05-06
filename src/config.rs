@@ -7,7 +7,7 @@ use crate::error::{Result, SshMcpError};
 use crate::ssh::HostKeyCheckMode;
 
 /// Default timeout for command execution in milliseconds
-pub const DEFAULT_TIMEOUT_MS: u64 = 60_000; // 60 seconds
+pub const DEFAULT_TIMEOUT_MS: u64 = 300_000; // 300 seconds
 
 /// Default max characters for command length (None = unlimited)
 pub const DEFAULT_MAX_CHARS: Option<usize> = Some(4096);
@@ -75,7 +75,7 @@ pub struct Args {
     pub sudo_password: Option<String>,
 
     /// Command execution timeout in milliseconds
-    #[arg(long, default_value = "60000", env = "SSH_MCP_TIMEOUT")]
+    #[arg(long, default_value = "300000", env = "SSH_MCP_TIMEOUT")]
     pub timeout: u64,
 
     /// Maximum characters for command length.

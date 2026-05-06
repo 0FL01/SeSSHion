@@ -20,6 +20,7 @@ use crate::ssh::{CommandOutput, sanitize_command, wrap_sudo_command};
 use crate::tools::DEFAULT_CHECK_PROCESS_TAIL_LINES;
 
 use super::SshMcpServer;
+use super::validation::validate_background_log_path;
 
 pub(super) enum BackgroundPrivilege<'a> {
     Normal,
@@ -461,6 +462,12 @@ impl SshMcpServer {
                 }
             },
         };
+
+        if let Some(p) = log_path
+            && let Err(e) = validate_background_log_path(self.spooler.base_dir(), p)
+        {
+            return Ok(background_json_err(&job_id, &final_log_path, &e, ""));
+        }
 
         if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
             return Ok(background_json_err(

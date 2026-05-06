@@ -81,7 +81,7 @@ The server is configured via CLI arguments or environment variables.
 | `--key` | `SSH_MCP_KEY` | Path to private key file |
 | `--su-password` | `SSH_MCP_SU_PASSWORD` | Password for `su` elevation |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` pipes |
-| `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 60000) |
+| `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
 | `--maxChars` | `SSH_MCP_MAX_CHARS` | Command length limit (default: 2048, "none" to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo-exec` tool |
 | `--log-level` | `SSH_MCP_LOG_LEVEL` | Log level: trace, debug, info, warn, error (default: info) |
@@ -461,6 +461,7 @@ When using `background=true` or when a command auto-detaches on timeout:
 When providing a custom `log_path`:
 - Must be an absolute path
 - Must be directly under `/tmp/ssh-mcp/` (no subdirectories)
+- Invalid custom paths return a tool JSON error rather than an MCP protocol error
 - Must have `.log` extension
 - Cannot contain `.` or `..` components
 - Must not have leading/trailing whitespace
@@ -513,7 +514,7 @@ When `--log-file` is specified with `--log-format=json`, logs are written in str
 ```json
 {"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v1.4.0 starting...","target":"ssh_mcp"}
 {"timestamp":"2024-01-24T10:15:23.458Z","level":"INFO","message":"Connecting to admin@prod-server:22","target":"ssh_mcp"}
-{"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 60000ms","target":"ssh_mcp::command"}
+{"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 300000ms","target":"ssh_mcp::command"}
 ```
 
 Use `jq` for pretty printing:

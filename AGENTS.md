@@ -110,3 +110,13 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │       ├── types.rs            # Transfer type definitions
 │       └── local_root.rs       # Local filesystem root operations
 ```
+
+## Commit Style
+
+- Use conventional commits with a real body; avoid short one-line commits.
+- Format:
+  - `<type>(<scope>): <description>`
+  - blank line
+  - indented body starting with `Changes:` and 2-4 concrete bullets
+- Keep the summary imperative, specific, and concise.
+- Preferred types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`.

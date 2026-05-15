@@ -1537,11 +1537,12 @@ async fn raw_channel_task(
                                     return Ok(());
                                 }
                             }
-                            ChannelMsg::ExitStatus { exit_status } => {
-                                if send_evt(RawStreamEvent::ExitStatus(exit_status)).await.is_err() {
-                                    return Ok(());
-                                }
+                            ChannelMsg::ExitStatus { exit_status }
+                                if send_evt(RawStreamEvent::ExitStatus(exit_status)).await.is_err() =>
+                            {
+                                return Ok(());
                             }
+                            ChannelMsg::ExitStatus { .. } => {}
                             ChannelMsg::ExitSignal { signal_name, .. } => {
                                 // Map signal to exit code (128 + signal number)
                                 // Common signals: HUP=1, INT=2, QUIT=3, ILL=4, TRAP=5, ABRT=6, BUS=7, FPE=8, KILL=9
@@ -1564,13 +1565,12 @@ async fn raw_channel_task(
                                     return Ok(());
                                 }
                             }
-                            ChannelMsg::Close | ChannelMsg::Eof => {
+                            ChannelMsg::Close | ChannelMsg::Eof if !sent_closed => {
                                 // Send Closed once but keep looping to capture trailing ExitStatus
-                                if !sent_closed {
-                                    sent_closed = true;
-                                    let _ = send_evt(RawStreamEvent::Closed).await;
-                                }
+                                sent_closed = true;
+                                let _ = send_evt(RawStreamEvent::Closed).await;
                             }
+                            ChannelMsg::Close | ChannelMsg::Eof => {}
                             _ => {}
                         }
                     }

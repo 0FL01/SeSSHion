@@ -68,7 +68,7 @@ pub struct SshConfig {
     /// How many keepalive packets can be missed before connection drops
     pub keepalive_max: u64,
 
-    /// Maximum output tokens for command execution (default: 12_000)
+    /// Maximum output tokens for command execution (default: 16_000)
     /// Prevents OOM and context overflow for large outputs
     pub max_output_tokens: Option<usize>,
 
@@ -101,7 +101,7 @@ impl SshConfig {
             sudo_password: None,
             keepalive_interval: 30,
             keepalive_max: 3,
-            max_output_tokens: Some(12_000),
+            max_output_tokens: Some(16_000),
             reconnect_retries: 3,
             reconnect_backoff_ms: 250,
             health_probe_timeout_ms: 1500,
@@ -156,7 +156,7 @@ impl SshConfig {
         self
     }
 
-    /// Set maximum output tokens for command execution (default: 12_000)
+    /// Set maximum output tokens for command execution (default: 16_000)
     /// Set to None for unlimited output (not recommended for large outputs)
     pub fn with_max_output_tokens(mut self, tokens: Option<usize>) -> Self {
         self.max_output_tokens = tokens;

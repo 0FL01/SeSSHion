@@ -10,7 +10,7 @@ use crate::ssh::HostKeyCheckMode;
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000; // 300 seconds
 
 /// Default max characters for command length (None = unlimited)
-pub const DEFAULT_MAX_CHARS: Option<usize> = Some(4096);
+pub const DEFAULT_MAX_CHARS: Option<usize> = Some(16_000);
 
 /// Connection timeout in seconds
 pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
@@ -80,7 +80,7 @@ pub struct Args {
 
     /// Maximum characters for command length.
     /// Use "none", "0", or negative value to disable limit.
-    /// Default: 4096
+    /// Default: 16000
     #[arg(long = "maxChars", env = "SSH_MCP_MAX_CHARS")]
     pub max_chars: Option<String>,
 
@@ -90,8 +90,8 @@ pub struct Args {
 
     /// Maximum output tokens for command execution.
     /// Use "none" or "0" to disable limit.
-    /// Supports "k" suffix (e.g., "12k" for 12000).
-    /// Default: 12000 (approximately 50KB)
+    /// Supports "k" suffix (e.g., "16k" for 16000).
+    /// Default: 16000 (approximately 64KB)
     #[arg(long = "max-output-tokens", env = "SSH_MCP_MAX_OUTPUT_TOKENS")]
     pub max_output_tokens: Option<String>,
 
@@ -290,8 +290,8 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Default max output tokens (12_000 ≈ 50KB)
-pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<usize> = Some(12_000);
+/// Default max output tokens (16_000 ≈ 64KB)
+pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<usize> = Some(16_000);
 
 /// Parse max_chars argument
 ///
@@ -423,7 +423,7 @@ mod tests {
     fn test_config_from_args_uses_default_max_chars() {
         let config = Config::from_args(base_args()).unwrap();
 
-        assert_eq!(config.max_chars, Some(4096));
+        assert_eq!(config.max_chars, Some(16_000));
         assert_eq!(config.strict_host_key_checking, HostKeyCheckMode::AcceptNew);
         assert!(config.known_hosts.is_none());
     }

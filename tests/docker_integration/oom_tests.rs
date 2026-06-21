@@ -1,7 +1,7 @@
 //! E2E tests for output truncation behavior
 //!
 //! These tests verify that large command output is properly truncated when
-//! it exceeds the configured token limit (default: 12,000 tokens ~ 48KB).
+//! it exceeds the configured token limit (test limit: 12,000 tokens ~ 48KB).
 //!
 //! The truncation behavior includes:
 //! - Setting `stdout_truncated`/`stderr_truncated` flags

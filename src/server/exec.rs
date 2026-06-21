@@ -123,8 +123,13 @@ impl SshMcpServer {
             self.spooler.clone(),
         );
 
+        // The permit is only needed for opening the channel and reading markers
+        // (both completed above). Streaming reads from an already-owned channel
+        // and writes to a local file — it does not touch the SSH session or the
+        // semaphore. Releasing the permit here prevents long-running detachable
+        // commands from starving the command-slot pool and blocking check-process.
+        drop(permit);
         let join = tokio::spawn(async move {
-            let _permit = permit;
             streamer.stream_channel(channel, initial_stdout).await
         });
 
@@ -601,8 +606,13 @@ impl SshMcpServer {
 
         let job_id_for_log = job_id.clone();
 
+        // The permit is only needed for opening the channel and reading markers
+        // (both completed above). Streaming reads from an already-owned channel
+        // and writes to a local file — it does not touch the SSH session or the
+        // semaphore. Releasing the permit here prevents long-running background
+        // jobs from starving the command-slot pool and blocking check-process.
+        drop(permit);
         tokio::spawn(async move {
-            let _permit = permit;
             if let Err(e) = streamer.stream_channel(channel, initial_stdout).await {
                 error!(job_id = ?job_id_for_log, error = ?e, "{log_msg}");
             }

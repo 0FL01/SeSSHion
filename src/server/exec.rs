@@ -129,9 +129,8 @@ impl SshMcpServer {
         // semaphore. Releasing the permit here prevents long-running detachable
         // commands from starving the command-slot pool and blocking check-process.
         drop(permit);
-        let join = tokio::spawn(async move {
-            streamer.stream_channel(channel, initial_stdout).await
-        });
+        let join =
+            tokio::spawn(async move { streamer.stream_channel(channel, initial_stdout).await });
 
         let completed = tokio::time::timeout(timeout, join).await;
         let join_exit_code: Option<i32> = match completed {

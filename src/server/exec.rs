@@ -499,7 +499,7 @@ impl SshMcpServer {
             return Ok(background_json_err(
                 &job_id,
                 &final_log_path,
-                &format!("SSH connection error: {}", e),
+                &e.to_string(),
                 "",
             ));
         }

@@ -306,7 +306,7 @@ impl SshMcpServer {
             return crate::transfer::TransferResponse::error(
                 params,
                 self.transfer.local_root(),
-                &format!("SSH connection error: {e}"),
+                &e.to_string(),
             );
         }
 

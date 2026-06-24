@@ -3,6 +3,7 @@
 //! Provides persistent SSH connection handling with automatic reconnection,
 //! concurrent access protection, and optional privilege elevation via `su`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -14,8 +15,10 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
-use super::config::SshConfig;
-use super::handler::SshHandler;
+use super::config::{HostKeyCheckMode, SshConfig};
+use super::handler::{
+    KeyCheckOutcome, SshHandler, default_known_hosts_path, remove_known_hosts_entry,
+};
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
 use russh::ChannelMsg;
@@ -155,6 +158,10 @@ impl SshConnectionManager {
     }
 
     /// Internal connection logic
+    ///
+    /// On a changed host key in `accept-new` mode, removes the stale
+    /// known_hosts entry and retries once.  All other failures are
+    /// returned immediately.
     async fn do_connect(&self) -> Result<()> {
         info!(
             "Connecting to SSH server {}:{}...",
@@ -163,43 +170,121 @@ impl SshConnectionManager {
 
         let connection_timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
 
-        // Create russh config with keepalive to mimic human behavior
-        let ssh_config = client::Config {
+        let ssh_config = Arc::new(client::Config {
             keepalive_interval: Some(Duration::from_secs(self.config.keepalive_interval)),
             keepalive_max: self.config.keepalive_max as usize,
             ..Default::default()
-        };
-        let ssh_config = Arc::new(ssh_config);
+        });
 
-        // Connect with timeout
         let addr = format!("{}:{}", self.config.host, self.config.port);
+
+        // First attempt — record key check outcome for recovery decisions.
+        let key_outcome = Arc::new(std::sync::Mutex::new(None::<KeyCheckOutcome>));
         let handler = SshHandler::new(
             self.config.host.clone(),
             self.config.port,
             self.config.host_key_checking,
             self.config.known_hosts.clone(),
-        );
-        let connect_result = timeout(
-            connection_timeout,
-            client::connect(ssh_config, addr.as_str(), handler),
         )
-        .await;
+        .with_key_check_outcome(key_outcome.clone());
 
-        let mut session = match connect_result {
-            Ok(Ok(session)) => session,
-            Ok(Err(e)) => {
-                error!(error = ?e, "SSH connection failed");
-                return Err(SshMcpError::connection(e.to_string()));
-            }
-            Err(_) => {
-                error!("SSH connection timeout after {}s", CONNECTION_TIMEOUT_SECS);
-                return Err(SshMcpError::connection(format!(
-                    "Connection timeout after {}s",
-                    CONNECTION_TIMEOUT_SECS
-                )));
-            }
-        };
+        match self
+            .attempt_connect(&ssh_config, &addr, handler, connection_timeout)
+            .await
+        {
+            Ok(session) => self.finish_connect(session).await,
+            Err(first_err) => {
+                // If the failure was a changed host key in accept-new mode,
+                // remove the stale entry and retry once.
+                let outcome = key_outcome.lock().unwrap().take();
+                if matches!(outcome, Some(KeyCheckOutcome::KeyChanged))
+                    && self.config.host_key_checking == HostKeyCheckMode::AcceptNew
+                {
+                    let Some(path) = self.resolve_known_hosts_path() else {
+                        error!(
+                            host = %self.config.host,
+                            port = self.config.port,
+                            "Host key changed but cannot resolve known_hosts path for recovery"
+                        );
+                        return Err(first_err);
+                    };
 
+                    warn!(
+                        host = %self.config.host,
+                        port = self.config.port,
+                        path = %path.display(),
+                        "Host key changed in accept-new mode; \
+                         removing stale known_hosts entry and retrying once"
+                    );
+                    remove_known_hosts_entry(&self.config.host, self.config.port, &path)
+                        .map_err(|e| {
+                            SshMcpError::connection(format!(
+                                "Failed to remove stale known_hosts entry: {e}"
+                            ))
+                        })?;
+
+                    // Single retry — fresh handler, no outcome recording.
+                    let retry_handler = SshHandler::new(
+                        self.config.host.clone(),
+                        self.config.port,
+                        self.config.host_key_checking,
+                        self.config.known_hosts.clone(),
+                    );
+                    match self
+                        .attempt_connect(&ssh_config, &addr, retry_handler, connection_timeout)
+                        .await
+                    {
+                        Ok(session) => {
+                            info!(
+                                host = %self.config.host,
+                                port = self.config.port,
+                                "SSH reconnection succeeded after host key rotation"
+                            );
+                            self.finish_connect(session).await
+                        }
+                        Err(retry_err) => {
+                            error!(
+                                error = ?retry_err,
+                                "SSH connection failed on retry after key rotation"
+                            );
+                            Err(retry_err)
+                        }
+                    }
+                } else {
+                    error!(error = ?first_err, "SSH connection failed");
+                    Err(first_err)
+                }
+            }
+        }
+    }
+
+    /// Attempt a single SSH connection (no retry logic).
+    async fn attempt_connect(
+        &self,
+        ssh_config: &Arc<client::Config>,
+        addr: &str,
+        handler: SshHandler,
+        connection_timeout: Duration,
+    ) -> Result<Handle<SshHandler>> {
+        timeout(
+            connection_timeout,
+            client::connect(ssh_config.clone(), addr, handler),
+        )
+        .await
+        .map_err(|_| {
+            error!("SSH connection timeout after {}s", CONNECTION_TIMEOUT_SECS);
+            SshMcpError::connection(format!(
+                "Connection timeout after {}s",
+                CONNECTION_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| {
+            SshMcpError::connection(e.to_string())
+        })
+    }
+
+    /// Authenticate, store the session, and optionally elevate.
+    async fn finish_connect(&self, mut session: Handle<SshHandler>) -> Result<()> {
         // Authenticate
         self.authenticate(&mut session).await?;
 
@@ -222,12 +307,19 @@ impl SshConnectionManager {
         if self.config.su_password.is_some() {
             debug!("su_password configured, attempting elevation...");
             if let Err(e) = self.ensure_elevated().await {
-                // Don't fail connection if elevation fails, just log it
                 warn!(error = ?e, "Failed to elevate to root. Commands will run as normal user.");
             }
         }
 
         Ok(())
+    }
+
+    /// Resolve the known_hosts file path — explicit config or default.
+    fn resolve_known_hosts_path(&self) -> Option<PathBuf> {
+        self.config
+            .known_hosts
+            .clone()
+            .or_else(default_known_hosts_path)
     }
 
     /// Authenticate with the SSH server

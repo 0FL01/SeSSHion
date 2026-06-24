@@ -372,10 +372,7 @@ impl SshMcpServer {
         if requires_elevation {
             if let Err(e) = self.connection.ensure_connected().await {
                 error!(error = ?e, "Failed to ensure SSH connection");
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "SSH connection error: {}",
-                    e
-                ))]));
+                return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
             }
 
             if let Err(e) = self.connection.ensure_elevated().await {
@@ -401,10 +398,7 @@ impl SshMcpServer {
         // Ensure connection is established for detached foreground execution path.
         if !requires_elevation && let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "SSH connection error: {}",
-                e
-            ))]));
+            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
         self.execute_detachable_foreground_impl(detach_mode, &sanitized, &sanitized, timeout)
@@ -455,10 +449,7 @@ impl SshMcpServer {
 
         if let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "SSH connection error: {}",
-                e
-            ))]));
+            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
         let detach_mode = self.determine_detach_mode().await;
@@ -612,7 +603,7 @@ impl SshMcpServer {
             let resp = crate::transfer::TransferResponse::error(
                 params,
                 self.transfer.local_root(),
-                &format!("SSH connection error: {e}"),
+                &e.to_string(),
             );
             let body = resp
                 .to_json(verbose)

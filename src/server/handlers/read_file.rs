@@ -52,10 +52,7 @@ impl SshMcpServer {
 
         if let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "SSH connection error: {}",
-                e
-            ))]));
+            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
         let capture_path = self

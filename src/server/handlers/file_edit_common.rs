@@ -398,10 +398,7 @@ impl SshMcpServer {
 
         if let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "SSH connection error: {}",
-                e
-            ))]));
+            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
         let local_tmp_rel = format!("target/tmp/file-edit-{}.tmp", make_job_id());

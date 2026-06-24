@@ -15,5 +15,7 @@ pub use command::{CommandOutput, TransferRawOutput, wrap_command_with_timeout};
 pub use config::{HostKeyCheckMode, SshConfig};
 pub use connection::SshConnectionManager;
 pub use elevation::{escape_for_shell, sanitize_password, wrap_sudo_command};
-pub use handler::SshHandler;
+pub use handler::{
+    KeyCheckOutcome, SshHandler, default_known_hosts_path, remove_known_hosts_entry,
+};
 pub use sanitize::{escape_command_for_shell, escape_for_timeout_wrapper, sanitize_command};

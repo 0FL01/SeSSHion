@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
@@ -74,12 +74,12 @@ impl McpClient {
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                    if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
-                        let map = responses.lock().await;
-                        if let Some(tx) = map.get(&id) {
-                            let _ = tx.send(msg.clone()).await;
-                        }
+                if let Ok(msg) = serde_json::from_str::<Value>(&line)
+                    && let Some(id) = msg.get("id").and_then(|v| v.as_u64())
+                {
+                    let map = responses.lock().await;
+                    if let Some(tx) = map.get(&id) {
+                        let _ = tx.send(msg.clone()).await;
                     }
                 }
             }
@@ -292,15 +292,21 @@ fn print_results(title: &str, results: &[CallResult]) {
 
 async fn check_alive(client: &McpClient, label: &str) -> bool {
     let start = Instant::now();
-    match timeout(Duration::from_secs(15), client.call_tool("exec", json!({
-        "command": "echo ALIVE_CHECK",
-        "timeout_ms": 5000,
-    })))
+    match timeout(
+        Duration::from_secs(15),
+        client.call_tool(
+            "exec",
+            json!({
+                "command": "echo ALIVE_CHECK",
+                "timeout_ms": 5000,
+            }),
+        ),
+    )
     .await
     {
         Ok(Ok(resp)) => {
             let elapsed = start.elapsed();
-            let contains = serde_json::to_string(&resp).map_or(false, |s| s.contains("ALIVE_CHECK"));
+            let contains = serde_json::to_string(&resp).is_ok_and(|s| s.contains("ALIVE_CHECK"));
             println!("  [ALIVE] {label} — {elapsed:?} — ok={contains}");
             contains
         }
@@ -540,7 +546,10 @@ async fn run_test() -> anyhow::Result<()> {
     match &down {
         Ok(out) => {
             if !out.status.success() {
-                println!("  docker compose down failed: {}", String::from_utf8_lossy(&out.stderr));
+                println!(
+                    "  docker compose down failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
         }
         Err(e) => {
@@ -558,7 +567,10 @@ async fn run_test() -> anyhow::Result<()> {
     match &up {
         Ok(out) => {
             if !out.status.success() {
-                println!("  docker compose up failed: {}", String::from_utf8_lossy(&out.stderr));
+                println!(
+                    "  docker compose up failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
         }
         Err(e) => {
@@ -612,7 +624,9 @@ async fn run_test() -> anyhow::Result<()> {
     let alive6 = check_alive(&client2, "post_hostkey_change").await;
 
     if !alive6 {
-        println!("\n*** DEFECT REPRODUCED: Server DEAD after host key change + concurrent load ***\n");
+        println!(
+            "\n*** DEFECT REPRODUCED: Server DEAD after host key change + concurrent load ***\n"
+        );
         for attempt in 1..=5 {
             tokio::time::sleep(Duration::from_secs(3)).await;
             check_alive(&client2, &format!("recovery_{attempt}")).await;

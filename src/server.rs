@@ -318,7 +318,7 @@ impl SshMcpServer {
         self.connection.close().await;
     }
 
-    async fn determine_detach_mode(&self) -> DetachMode {
+    async fn determine_detach_mode(&self) -> Result<DetachMode> {
         let server = self.clone();
         crate::background::detach::determine_detach_mode(
             self.detach_mode.as_ref(),
@@ -380,7 +380,13 @@ impl SshMcpServer {
             }
         }
 
-        let detach_mode = self.determine_detach_mode().await;
+        let detach_mode = match self.determine_detach_mode().await {
+            Ok(mode) => mode,
+            Err(e) => {
+                debug!(error = ?e, "detach-mode probe failed; falling back to direct foreground exec");
+                DetachMode::DirectOnly
+            }
+        };
         if detach_mode == DetachMode::DirectOnly {
             match self.connection.exec_command(&sanitized, timeout).await {
                 Ok(output) => return Ok(Self::calltool_from_command_output(output)),
@@ -452,7 +458,13 @@ impl SshMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
-        let detach_mode = self.determine_detach_mode().await;
+        let detach_mode = match self.determine_detach_mode().await {
+            Ok(mode) => mode,
+            Err(e) => {
+                debug!(error = ?e, "detach-mode probe failed; falling back to direct sudo foreground exec");
+                DetachMode::DirectOnly
+            }
+        };
         if detach_mode == DetachMode::DirectOnly {
             match self
                 .connection

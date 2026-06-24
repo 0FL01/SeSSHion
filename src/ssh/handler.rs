@@ -101,10 +101,10 @@ impl SshHandler {
 
     /// Record the key check outcome into shared state if attached.
     fn record_outcome(&self, outcome: KeyCheckOutcome) {
-        if let Some(ref state) = self.key_check_outcome {
-            if let Ok(mut guard) = state.lock() {
-                *guard = Some(outcome);
-            }
+        if let Some(ref state) = self.key_check_outcome
+            && let Ok(mut guard) = state.lock()
+        {
+            *guard = Some(outcome);
         }
     }
 
@@ -113,10 +113,7 @@ impl SshHandler {
     /// The connection manager calls this before each connect attempt so
     /// that `do_connect` can inspect the outcome after a failure and
     /// decide whether to retry (e.g. remove a stale entry on key change).
-    pub fn with_key_check_outcome(
-        mut self,
-        outcome: Arc<Mutex<Option<KeyCheckOutcome>>>,
-    ) -> Self {
+    pub fn with_key_check_outcome(mut self, outcome: Arc<Mutex<Option<KeyCheckOutcome>>>) -> Self {
         self.key_check_outcome = Some(outcome);
         self
     }
@@ -212,11 +209,7 @@ impl russh::client::Handler for SshHandler {
 /// Comments, blank lines, and hashed (`|1|…`) entries are preserved.
 ///
 /// Returns `Ok(())` when the file does not exist (nothing to remove).
-pub fn remove_known_hosts_entry(
-    host: &str,
-    port: u16,
-    known_hosts: &Path,
-) -> io::Result<()> {
+pub fn remove_known_hosts_entry(host: &str, port: u16, known_hosts: &Path) -> io::Result<()> {
     let content = match std::fs::read_to_string(known_hosts) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -437,15 +430,19 @@ mod tests {
         let old_key = public_key(KEY_ONE);
 
         // Learn an entry for example.com:2222
-        russh::keys::known_hosts::learn_known_hosts_path("example.com", 2222, &old_key, &known_hosts)
-            .expect("should write known_hosts");
+        russh::keys::known_hosts::learn_known_hosts_path(
+            "example.com",
+            2222,
+            &old_key,
+            &known_hosts,
+        )
+        .expect("should write known_hosts");
 
         let before = std::fs::read_to_string(&known_hosts).expect("read");
         assert!(before.contains("example.com"));
 
         // Remove the entry
-        remove_known_hosts_entry("example.com", 2222, &known_hosts)
-            .expect("should remove entry");
+        remove_known_hosts_entry("example.com", 2222, &known_hosts).expect("should remove entry");
 
         let after = std::fs::read_to_string(&known_hosts).expect("read");
         assert!(!after.contains("example.com"), "entry should be gone");
@@ -494,8 +491,7 @@ mod tests {
         }
 
         // 3 — remove stale entry
-        remove_known_hosts_entry("example.com", 2222, &known_hosts)
-            .expect("should remove entry");
+        remove_known_hosts_entry("example.com", 2222, &known_hosts).expect("should remove entry");
 
         // 4 — new key is now accepted as a new host
         let outcome2 = Arc::new(Mutex::new(None));

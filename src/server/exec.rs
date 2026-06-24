@@ -534,7 +534,17 @@ impl SshMcpServer {
             debug!(error = ?e, "Elevation failed, will run as normal user");
         }
 
-        let detach_mode = self.determine_detach_mode().await;
+        let detach_mode = match self.determine_detach_mode().await {
+            Ok(mode) => mode,
+            Err(e) => {
+                return Ok(background_json_err(
+                    &job_id,
+                    &final_log_path,
+                    &format!("Failed to determine background detach support: {e}"),
+                    "",
+                ));
+            }
+        };
         if detach_mode == DetachMode::DirectOnly {
             return Ok(background_json_err(
                 &job_id,

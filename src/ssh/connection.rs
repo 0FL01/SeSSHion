@@ -216,12 +216,13 @@ impl SshConnectionManager {
                         "Host key changed in accept-new mode; \
                          removing stale known_hosts entry and retrying once"
                     );
-                    remove_known_hosts_entry(&self.config.host, self.config.port, &path)
-                        .map_err(|e| {
+                    remove_known_hosts_entry(&self.config.host, self.config.port, &path).map_err(
+                        |e| {
                             SshMcpError::connection(format!(
                                 "Failed to remove stale known_hosts entry: {e}"
                             ))
-                        })?;
+                        },
+                    )?;
 
                     // Single retry — fresh handler, no outcome recording.
                     let retry_handler = SshHandler::new(
@@ -278,9 +279,7 @@ impl SshConnectionManager {
                 CONNECTION_TIMEOUT_SECS
             ))
         })?
-        .map_err(|e| {
-            SshMcpError::connection(e.to_string())
-        })
+        .map_err(|e| SshMcpError::connection(e.to_string()))
     }
 
     /// Authenticate, store the session, and optionally elevate.

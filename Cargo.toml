@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP SDK
-rmcp = { version = "1.2.0", features = ["server", "transport-io"] }
+rmcp = { version = "=1.8.0", features = ["server", "transport-io"] }
 
 # SSH
 russh = { version = "=0.61.2", features = ["aws-lc-rs"] }

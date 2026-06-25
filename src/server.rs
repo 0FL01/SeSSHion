@@ -532,8 +532,10 @@ impl SshMcpServer {
             result_text.push_str(&output.stderr);
         }
 
-        // Check for error exit code
-        if output.exit_code.map(|code| code != 0).unwrap_or(false) {
+        // Check for error exit code.
+        // exit_code=None means the SSH channel was torn down without delivering
+        // an exit status or exit signal — treat as error, not success.
+        if output.exit_code.map(|code| code != 0).unwrap_or(true) {
             CallToolResult::error(vec![Content::text(result_text)])
         } else {
             CallToolResult::success(vec![Content::text(result_text)])

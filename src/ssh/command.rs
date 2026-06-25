@@ -102,7 +102,7 @@ impl CommandOutput {
 
     /// Check if the command succeeded (exit code 0 or no exit code available)
     pub fn success(&self) -> bool {
-        self.exit_code.is_none_or(|code| code == 0)
+        self.exit_code.is_some_and(|code| code == 0)
     }
 
     /// Get combined output (stdout + stderr)
@@ -883,6 +883,26 @@ impl SshConnectionManager {
                 ChannelMsg::ExitStatus { exit_status } => {
                     output.exit_code = Some(exit_status);
                 }
+                ChannelMsg::ExitSignal { signal_name, .. } => {
+                    // Map signal to conventional shell exit code (128 + signal),
+                    // matching stream_channel_inner in background/stream.rs.
+                    let code = match signal_name {
+                        russh::Sig::HUP => 129,
+                        russh::Sig::INT => 130,
+                        russh::Sig::QUIT => 131,
+                        russh::Sig::ILL => 132,
+                        russh::Sig::ABRT => 134,
+                        russh::Sig::FPE => 136,
+                        russh::Sig::KILL => 137,
+                        russh::Sig::USR1 => 138,
+                        russh::Sig::SEGV => 139,
+                        russh::Sig::PIPE => 141,
+                        russh::Sig::ALRM => 142,
+                        russh::Sig::TERM => 143,
+                        russh::Sig::Custom(_) => 128,
+                    };
+                    output.exit_code = Some(code);
+                }
                 ChannelMsg::Close | ChannelMsg::Eof => {
                     // Don't break - ExitStatus may arrive after Close/Eof
                     // Loop will exit naturally when channel.wait() returns None
@@ -921,6 +941,18 @@ impl SshConnectionManager {
             output.stdout_truncated,
             output.stderr_truncated
         );
+
+        // A channel that closed without an exit status or exit signal indicates
+        // the SSH session was torn down (e.g. concurrent invalidate_session,
+        // network drop, server kill).  Returning Ok with exit_code=None would
+        // be treated as success by calltool_from_command_output — a silent
+        // failure.  Return an explicit error instead so the caller can surface
+        // it and trigger reconnection.
+        if output.exit_code.is_none() {
+            return Err(SshMcpError::connection(
+                "SSH channel closed without exit status (session may have been torn down)",
+            ));
+        }
 
         Ok(output)
     }
@@ -1644,8 +1676,8 @@ mod tests {
             exit_code: None,
             ..Default::default()
         };
-        // No exit code should be treated as success
-        assert!(output.success());
+        // No exit code means the channel was torn down — not success
+        assert!(!output.success());
     }
 
     #[test]

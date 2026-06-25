@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mcp"
-version = "2.0.9"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",

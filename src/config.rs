@@ -10,7 +10,7 @@ use crate::ssh::HostKeyCheckMode;
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000; // 300 seconds
 
 /// Default max characters for command length (None = unlimited)
-pub const DEFAULT_MAX_CHARS: Option<usize> = Some(16_000);
+pub const DEFAULT_MAX_CHARS: Option<usize> = Some(64_000);
 
 /// Connection timeout in seconds
 pub const CONNECTION_TIMEOUT_SECS: u64 = 30;
@@ -80,7 +80,7 @@ pub struct Args {
 
     /// Maximum characters for command length.
     /// Use "none", "0", or negative value to disable limit.
-    /// Default: 16000
+    /// Default: 64000
     #[arg(long = "maxChars", env = "SSH_MCP_MAX_CHARS")]
     pub max_chars: Option<String>,
 
@@ -423,7 +423,7 @@ mod tests {
     fn test_config_from_args_uses_default_max_chars() {
         let config = Config::from_args(base_args()).unwrap();
 
-        assert_eq!(config.max_chars, Some(16_000));
+        assert_eq!(config.max_chars, Some(64_000));
         assert_eq!(config.strict_host_key_checking, HostKeyCheckMode::AcceptNew);
         assert!(config.known_hosts.is_none());
     }

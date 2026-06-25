@@ -25,6 +25,7 @@ impl SshMcpServer {
         {
             Ok(status) => {
                 let result = serde_json::json!({
+                    "pid": status.pid,
                     "state": status.state,
                     "running": status.running,
                     "exit_code": status.exit_code,

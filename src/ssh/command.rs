@@ -74,6 +74,8 @@ pub struct TransferRawOutput {
 /// Process status check result
 #[derive(Debug, Clone)]
 pub struct ProcessStatus {
+    /// PID of the background process on the remote host.
+    pub pid: u32,
     /// Strict job state label: running, completed, failed, or state_lost.
     pub state: String,
     /// Whether the process is currently running
@@ -1337,6 +1339,7 @@ impl SshConnectionManager {
         let log_tail = read_local_log_tail(&log_path, tail_lines).await?;
 
         Ok(ProcessStatus {
+            pid,
             state: effective_status.as_str().to_string(),
             running,
             exit_code,

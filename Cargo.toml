@@ -36,9 +36,9 @@ serde_json = "1.0.149"
 schemars = "1.2"
 
 # Crypto (read-ticket HMAC)
-sha2 = "0.10"
-hmac = "0.12"
-getrandom = "0.2"
+sha2 = "0.11"
+hmac = "0.13"
+getrandom = "0.4"
 similar = "2.7"
 
 # Tracing/Logging

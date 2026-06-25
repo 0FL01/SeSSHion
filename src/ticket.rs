@@ -25,7 +25,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -88,7 +88,7 @@ impl TicketSigner {
     /// Panics if the OS CSPRNG is unavailable — an unrecoverable situation.
     pub fn new() -> Self {
         let mut key = [0u8; 32];
-        getrandom::getrandom(&mut key).unwrap_or_else(|e| panic!("OS CSPRNG unavailable: {e}"));
+        getrandom::fill(&mut key).unwrap_or_else(|e| panic!("OS CSPRNG unavailable: {e}"));
         Self { key }
     }
 

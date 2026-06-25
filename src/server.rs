@@ -35,8 +35,7 @@ use crate::server::validation::read_file::{
 };
 #[cfg(test)]
 use crate::server::validation::read_file::{
-    apply_read_file_window, estimate_tokens_from_bytes, resolve_read_file_line_limit,
-    resolve_read_file_max_bytes,
+    estimate_tokens_from_bytes, resolve_read_file_line_limit, resolve_read_file_max_bytes,
 };
 #[cfg(test)]
 use crate::server::validation::validate_background_log_path;
@@ -1005,36 +1004,6 @@ mod tests {
             resolve_read_file_line_limit(ReadFileMode::Tail, Some(READ_FILE_MAX_LINE_WINDOW + 1))
                 .unwrap_err();
         assert!(err.contains("<="));
-    }
-
-    #[test]
-    fn test_apply_read_file_window_preview_truncates_and_sets_hint() {
-        let text = "line1\nline2\nline3\nline4\n";
-        let window = apply_read_file_window(text, ReadFileMode::Preview, Some(2));
-        assert_eq!(window.content, "line1\nline2\n");
-        assert_eq!(window.returned_lines, 2);
-        assert!(window.truncated);
-        assert!(window.hint.is_some());
-    }
-
-    #[test]
-    fn test_apply_read_file_window_tail_returns_last_lines() {
-        let text = "line1\nline2\nline3\nline4\n";
-        let window = apply_read_file_window(text, ReadFileMode::Tail, Some(2));
-        assert_eq!(window.content, "line3\nline4\n");
-        assert_eq!(window.returned_lines, 2);
-        assert!(window.truncated);
-        assert!(window.hint.is_some());
-    }
-
-    #[test]
-    fn test_apply_read_file_window_full_returns_all_content_without_hint() {
-        let text = "line1\nline2\nline3\n";
-        let window = apply_read_file_window(text, ReadFileMode::Full, Some(1));
-        assert_eq!(window.content, text);
-        assert_eq!(window.returned_lines, 3);
-        assert!(!window.truncated);
-        assert!(window.hint.is_none());
     }
 
     #[test]

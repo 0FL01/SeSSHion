@@ -11,7 +11,7 @@ use crate::server::validation::{parse_read_file_error_marker, validate_read_file
 use crate::server::{READ_FILE_ERROR_MARKER, make_job_id};
 use crate::ssh::escape_for_shell;
 use crate::ticket::DEFAULT_TICKET_TTL_SECS;
-use crate::tools::ReadFileParams;
+use crate::tools::{ReadFileMode, ReadFileParams};
 
 impl SshMcpServer {
     /// Execute read-file tool
@@ -78,9 +78,35 @@ impl SshMcpServer {
         };
 
         let escaped_path = escape_for_shell(&remote_path);
+        let n = line_limit.unwrap_or(0);
+
+        // Mode-specific producer appended after the shared preamble.
+        //   full:     stat-gate rejects oversized files BEFORE any byte is streamed.
+        //   head/preview/tail: bounded remote producers (head/tail -n N | head -c max+1)
+        //                       so they work correctly on files of ANY size.
+        let mode_suffix = match mode {
+            ReadFileMode::Full => format!(
+                r#"; if [ "$size" -gt "$max" ]; then printf "%s\n" "{err}too_large" >&2; exit 0; fi; head -c "$((max + 1))" < "$p""#,
+                err = READ_FILE_ERROR_MARKER,
+            ),
+            ReadFileMode::Head | ReadFileMode::Preview => format!(
+                r#"; head -n "$n" "$p" | head -c "$((max + 1))"; if [ -n "$(sed -n "$((n+1))=" "$p")" ]; then printf "%s\n" "{trunc_m}" >&2; fi"#,
+                trunc_m = READ_FILE_TRUNC_MARKER,
+            ),
+            ReadFileMode::Tail => format!(
+                r#"; tail -n "$n" "$p" | head -c "$((max + 1))"; if [ -n "$(sed -n "$((n+1))=" "$p")" ]; then printf "%s\n" "{trunc_m}" >&2; fi"#,
+                trunc_m = READ_FILE_TRUNC_MARKER,
+            ),
+        };
+
         let read_cmd = format!(
-            r#"sh -c 'set -eu; p=$1; max_bytes=$2; if [ ! -e "$p" ]; then printf "%s\n" "{}not_found" >&2; exit 1; fi; if [ ! -f "$p" ]; then printf "%s\n" "{}not_regular_file" >&2; exit 1; fi; head -c "$((max_bytes + 1))" < "$p"' sh '{escaped_path}' '{max_read_bytes}'"#,
-            READ_FILE_ERROR_MARKER, READ_FILE_ERROR_MARKER,
+            r#"sh -c 'set -eu; p=$1; max=$2; n=$3; if [ ! -e "$p" ]; then printf "%s\n" "{err}not_found" >&2; exit 1; fi; if [ ! -f "$p" ]; then printf "%s\n" "{err}not_regular_file" >&2; exit 1; fi; size=$(stat -c %s "$p" 2>/dev/null || stat -f %z "$p" 2>/dev/null || printf 0); printf "%s%s\n" "{size_m}" "$size" >&2{mode_suffix}' sh '{escaped_path}' '{max_read_bytes}' '{n}'"#,
+            err = READ_FILE_ERROR_MARKER,
+            size_m = READ_FILE_SIZE_MARKER,
+            mode_suffix = mode_suffix,
+            escaped_path = escaped_path,
+            max_read_bytes = max_read_bytes,
+            n = n,
         );
 
         let mut empty_stdin = tokio::io::empty();
@@ -122,6 +148,7 @@ impl SshMcpServer {
             let msg = match marker {
                 "not_found" => "Error: remote_path does not exist".to_string(),
                 "not_regular_file" => "Error: remote_path is not a regular file".to_string(),
+                "too_large" => read_file_too_large_error(max_read_bytes),
                 _ => "Error: read-file failed on remote host".to_string(),
             };
             let _ = tokio::fs::remove_file(&capture_path).await;
@@ -219,20 +246,33 @@ impl SshMcpServer {
         };
         let _ = tokio::fs::remove_file(&capture_path).await;
 
-        let content_window = apply_read_file_window(&content, mode, line_limit);
-        let returned_content = content_window.content;
-        let approx_tokens_returned = estimate_tokens_from_bytes(returned_content.len());
-        let approx_tokens_total_estimate = estimate_tokens_from_bytes(metadata.len() as usize);
+        // Content is already windowed by the remote producer (head/tail -n N | head -c max+1).
+        // Truncation and total-file-size come from stderr markers the remote command emitted.
+        let returned_lines = read_file_line_count(&content);
+        let truncated = if matches!(mode, ReadFileMode::Full) {
+            false
+        } else {
+            read_file_stderr_indicates_truncated(&exec_out.stderr)
+        };
+        let approx_tokens_returned = estimate_tokens_from_bytes(content.len());
+        let total_bytes =
+            parse_read_file_size_marker(&exec_out.stderr).unwrap_or(metadata.len() as usize);
+        let approx_tokens_total_estimate = estimate_tokens_from_bytes(total_bytes);
+        let hint = build_read_file_hint(
+            mode,
+            line_limit.unwrap_or(READ_FILE_DEFAULT_PREVIEW_LINES),
+            truncated,
+        );
         let mut result = serde_json::json!({
             "path": remote_path,
             "mode": mode.as_str(),
-            "content": returned_content,
-            "returned_lines": content_window.returned_lines,
-            "truncated": content_window.truncated,
+            "content": content,
+            "returned_lines": returned_lines,
+            "truncated": truncated,
             "approx_tokens_returned": approx_tokens_returned,
             "approx_tokens_total_estimate": approx_tokens_total_estimate,
         });
-        if let Some(hint) = content_window.hint {
+        if let Some(hint) = hint {
             result["hint"] = serde_json::Value::String(hint);
         }
         result["sha256"] = serde_json::Value::String(content_sha256);

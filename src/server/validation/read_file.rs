@@ -9,13 +9,14 @@ pub(crate) const READ_FILE_MAX_LINE_WINDOW: usize = 10_000;
 pub(crate) const READ_FILE_STDERR_SNIPPET_LIMIT_CHARS: usize = 256;
 pub(crate) const SHA256_HEX_LEN: usize = 64;
 
-/// Windowed read result for preview/head/tail modes.
-pub(crate) struct ReadFileWindow {
-    pub(crate) content: String,
-    pub(crate) returned_lines: usize,
-    pub(crate) truncated: bool,
-    pub(crate) hint: Option<String>,
-}
+/// stderr marker prefix carrying the real remote file size in bytes.
+/// Emitted by the server-side read-file command so the local handler can
+/// report `approx_tokens_total_estimate` without transferring the whole file.
+pub(crate) const READ_FILE_SIZE_MARKER: &str = "__SSH_MCP_READ_FILE_SIZE__";
+
+/// stderr marker indicating the remote file has more lines than the windowed
+/// read returned (truncation).  Emitted by head/preview/tail producers.
+pub(crate) const READ_FILE_TRUNC_MARKER: &str = "__SSH_MCP_READ_FILE_TRUNC__";
 
 /// Normalizes a SHA-256 hex string to lowercase and validates length.
 pub(crate) fn normalize_sha256_hex(
@@ -82,26 +83,6 @@ pub(crate) fn resolve_read_file_line_limit(
     }
 }
 
-/// Returns byte offsets of line starts in content.
-pub(crate) fn read_file_line_starts(content: &str) -> Vec<usize> {
-    let mut starts = Vec::new();
-    if content.is_empty() {
-        return starts;
-    }
-
-    starts.push(0);
-    for (idx, byte) in content.bytes().enumerate() {
-        if byte == b'\n' {
-            let next = idx.saturating_add(1);
-            if next < content.len() {
-                starts.push(next);
-            }
-        }
-    }
-
-    starts
-}
-
 /// Counts lines in content.
 pub(crate) fn read_file_line_count(content: &str) -> usize {
     if content.is_empty() {
@@ -116,53 +97,33 @@ pub(crate) fn read_file_line_count(content: &str) -> usize {
     }
 }
 
-/// Applies windowing to content based on mode and line limit.
-pub(crate) fn apply_read_file_window(
-    content: &str,
-    mode: ReadFileMode,
-    line_limit: Option<usize>,
-) -> ReadFileWindow {
-    if matches!(mode, ReadFileMode::Full) {
-        return ReadFileWindow {
-            content: content.to_string(),
-            returned_lines: read_file_line_count(content),
-            truncated: false,
-            hint: None,
-        };
-    }
+/// Parses the remote file size (in bytes) from the SIZE marker in stderr.
+///
+/// Returns `None` when the marker is absent, which should only happen if the
+/// remote command failed before emitting it.  Callers fall back to the
+/// captured-byte count in that case.
+pub(crate) fn parse_read_file_size_marker(stderr: &str) -> Option<usize> {
+    stderr.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(READ_FILE_SIZE_MARKER)
+            .and_then(|rest| rest.trim().parse::<usize>().ok())
+    })
+}
 
-    let limit = line_limit.unwrap_or(READ_FILE_DEFAULT_PREVIEW_LINES);
-    let line_starts = read_file_line_starts(content);
-    let total_lines = line_starts.len();
-    let returned_lines = total_lines.min(limit);
-    let truncated = total_lines > returned_lines;
-
-    let content_slice = if matches!(mode, ReadFileMode::Tail) {
-        let start = if returned_lines >= total_lines {
-            0
-        } else {
-            line_starts[total_lines - returned_lines]
-        };
-        content[start..].to_string()
-    } else {
-        let end = if returned_lines >= total_lines {
-            content.len()
-        } else {
-            line_starts[returned_lines]
-        };
-        content[..end].to_string()
-    };
-
-    ReadFileWindow {
-        content: content_slice,
-        returned_lines,
-        truncated,
-        hint: build_read_file_hint(mode, limit, truncated),
-    }
+/// Returns `true` when the TRUNC marker is present in stderr, meaning the
+/// remote file has more lines than the windowed read returned.
+pub(crate) fn read_file_stderr_indicates_truncated(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim().starts_with(READ_FILE_TRUNC_MARKER))
 }
 
 /// Builds a hint message for read-file responses.
-fn build_read_file_hint(mode: ReadFileMode, line_limit: usize, truncated: bool) -> Option<String> {
+pub(crate) fn build_read_file_hint(
+    mode: ReadFileMode,
+    line_limit: usize,
+    truncated: bool,
+) -> Option<String> {
     match mode {
         ReadFileMode::Preview => Some(format!(
             "Preview mode returns up to {line_limit} lines. Re-run with mode=\"full\" to read the entire file, or mode=\"tail\" to inspect the file end"

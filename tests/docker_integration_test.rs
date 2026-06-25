@@ -367,6 +367,136 @@ async fn test_mcp_tools_with_docker() {
     assert!(full_tokens > 0);
     assert_eq!(full_tokens, full_total_tokens);
 
+    // 4a-5b. Large-file regression: windowed reads work on multi-MB files
+    // (Bug #3 — previously, all modes streamed the full file then rejected).
+    let huge_path = "/tmp/ssh-mcp-read-file-huge.txt";
+    server
+        .test_execute_command(
+            r#"sh -c 'set -eu; out=/tmp/ssh-mcp-read-file-huge.txt; : > "$out"; i=1; while [ "$i" -le 200000 ]; do printf "huge-line-%06d\n" "$i" >> "$out"; i=$((i+1)); done'"#,
+        )
+        .await
+        .expect("failed to create huge read-file fixture");
+
+    // preview on a 200k-line file must return only the first 800 lines
+    let huge_preview_result = server
+        .test_read_file(huge_path, None)
+        .await
+        .expect("read-file preview on huge file failed");
+    let huge_preview_text = extract_text_from_result(&huge_preview_result);
+    let huge_preview_json: serde_json::Value = serde_json::from_str(huge_preview_text.trim())
+        .expect("huge preview response should be valid JSON");
+    assert_eq!(
+        huge_preview_json.get("mode").and_then(|v| v.as_str()),
+        Some("preview")
+    );
+    assert_eq!(
+        huge_preview_json
+            .get("returned_lines")
+            .and_then(|v| v.as_u64()),
+        Some(800)
+    );
+    assert_eq!(
+        huge_preview_json.get("truncated").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    let huge_preview_content = huge_preview_json
+        .get("content")
+        .and_then(|v| v.as_str())
+        .expect("huge preview should include content");
+    assert!(huge_preview_content.starts_with("huge-line-000001\n"));
+    assert!(huge_preview_content.ends_with("huge-line-000800\n"));
+    let huge_preview_returned = huge_preview_json
+        .get("approx_tokens_returned")
+        .and_then(|v| v.as_u64())
+        .expect("huge preview should include approx_tokens_returned");
+    let huge_preview_total = huge_preview_json
+        .get("approx_tokens_total_estimate")
+        .and_then(|v| v.as_u64())
+        .expect("huge preview should include approx_tokens_total_estimate");
+    assert!(
+        huge_preview_total > huge_preview_returned,
+        "total token estimate must exceed returned for truncated preview"
+    );
+
+    // head lines=5 on the same huge file
+    let huge_head_result = server
+        .test_read_file_with_options(
+            huge_path,
+            ssh_mcp::tools::ReadFileMode::Head,
+            Some(5),
+            None,
+        )
+        .await
+        .expect("read-file head on huge file failed");
+    let huge_head_json: serde_json::Value =
+        serde_json::from_str(extract_text_from_result(&huge_head_result).trim())
+            .expect("huge head response should be valid JSON");
+    assert_eq!(
+        huge_head_json
+            .get("returned_lines")
+            .and_then(|v| v.as_u64()),
+        Some(5)
+    );
+    assert_eq!(
+        huge_head_json.get("content").and_then(|v| v.as_str()),
+        Some("huge-line-000001\nhuge-line-000002\nhuge-line-000003\nhuge-line-000004\nhuge-line-000005\n")
+    );
+
+    // tail lines=4 on the same huge file — must return the REAL last 4 lines
+    let huge_tail_result = server
+        .test_read_file_with_options(
+            huge_path,
+            ssh_mcp::tools::ReadFileMode::Tail,
+            Some(4),
+            None,
+        )
+        .await
+        .expect("read-file tail on huge file failed");
+    let huge_tail_json: serde_json::Value =
+        serde_json::from_str(extract_text_from_result(&huge_tail_result).trim())
+            .expect("huge tail response should be valid JSON");
+    assert_eq!(
+        huge_tail_json
+            .get("returned_lines")
+            .and_then(|v| v.as_u64()),
+        Some(4)
+    );
+    assert_eq!(
+        huge_tail_json.get("content").and_then(|v| v.as_str()),
+        Some(
+            "huge-line-199997\nhuge-line-199998\nhuge-line-199999\nhuge-line-200000\n"
+        )
+    );
+
+    // full mode on the huge file must reject with too_large (0 bytes streamed)
+    let huge_full_result = server
+        .test_read_file_with_options(
+            huge_path,
+            ssh_mcp::tools::ReadFileMode::Full,
+            None,
+            None,
+        )
+        .await
+        .expect("read-file full on huge file failed");
+    let huge_full_text = extract_text_from_result(&huge_full_result);
+    assert!(
+        huge_full_result.is_error.unwrap_or(false),
+        "full read of oversized file should error"
+    );
+    assert!(
+        huge_full_text.contains("exceeds read-file size limit"),
+        "oversized full read should mention size limit: {huge_full_text}"
+    );
+
+    // cleanup huge fixture
+    server
+        .test_execute_command(&format!(
+            "rm -f -- {}",
+            ssh_mcp::escape_for_shell(huge_path)
+        ))
+        .await
+        .expect("failed to clean up huge file");
+
     // 4a-6. write-file creates a missing file when parent exists.
     let create_dir = "/tmp/ssh-mcp-apply-create";
     let create_path = "/tmp/ssh-mcp-apply-create/new.txt";

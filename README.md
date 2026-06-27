@@ -103,26 +103,7 @@ Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
 - `yes`: require the host key to already exist in `known_hosts`; reject unknown or changed keys.
 - `no`: disable host key verification; use only for local test containers or other disposable environments.
 
-For strict production use, set the policy in your MCP client configuration and point it at a pre-populated `known_hosts` file:
-
-```jsonc
-{
-  "mcp": {
-    "ssh-remote": {
-      "type": "local",
-      "command": [
-        "/absolute/path/to/ssh-mcp",
-        "--host=example.com",
-        "--user=alice",
-        "--key=/home/alice/.ssh/id_ed25519",
-        "--strict-host-key-checking=yes",
-        "--known-hosts=/home/alice/.ssh/known_hosts"
-      ],
-      "enabled": true
-    }
-  }
-}
-```
+A strict-production example using `--strict-host-key-checking=yes` with a pre-populated `known_hosts` file is shown in the [OpenCode](#opencode) section below.
 
 ## 🚀 Adding to MCP Clients
 
@@ -163,6 +144,30 @@ Add this to your `opencode.jsonc`:
         "--port=22",
         "--user=agent-nc",
         "--password=your-password"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Strict production (verified host key):**
+
+For strict production use, set the policy in your MCP client configuration and point it at a pre-populated `known_hosts` file:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ssh-remote": {
+      "type": "local",
+      "command": [
+        "/absolute/path/to/ssh-mcp",
+        "--host=example.com",
+        "--user=alice",
+        "--key=/home/alice/.ssh/id_ed25519",
+        "--strict-host-key-checking=yes",
+        "--known-hosts=/home/alice/.ssh/known_hosts"
       ],
       "enabled": true
     }

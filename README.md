@@ -69,6 +69,9 @@ cargo build --release
 
 ## ⚙️ Configuration
 
+<details>
+<summary><b>CLI arguments & environment variables</b></summary>
+
 The server is configured via CLI arguments or environment variables.
 
 | Argument | Environment Variable | Description |
@@ -98,6 +101,8 @@ The server is configured via CLI arguments or environment variables.
 
 Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
 Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
+
+</details>
 
 ### SSH Host Key Verification
 

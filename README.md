@@ -8,7 +8,6 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 
 ## ✨ Features
 
-- **DevOps-Optimized**: Purpose-built for CI/CD, infrastructure automation, deployment pipelines, and system administration workflows.
 - **Persistent Connections**: Maintains a single SSH session across multiple tool calls for maximum speed.
 - **Auto-Reconnect**: Automatically restores the connection if it drops.
 - **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.

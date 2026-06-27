@@ -1,10 +1,11 @@
-# SSH MCP Server (Rust Implementation)
+# SSH MCP Server
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
+[![crates.io](https://img.shields.io/crates/v/ssh-mcp-rs.svg)](https://crates.io/crates/ssh-mcp-rs)
 
-A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution, file operations, and administrative tasks.
+A high-performance implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution, file operations, and administrative tasks.
 
 ## ✨ Features
 
@@ -50,6 +51,20 @@ Invoke-WebRequest -Uri "https://github.com/0FL01/ssh-mcp-rs/releases/download/ro
 # Add to PATH (choose a directory in your PATH or add current directory)
 # Verify installation
 .\ssh-mcp.exe --version
+```
+
+### Cargo (crates.io)
+
+The crate is published on [crates.io](https://crates.io/crates/ssh-mcp-rs). Install the `ssh-mcp` binary with a single command (requires a [Rust toolchain](https://rustup.rs/)):
+
+```bash
+cargo install ssh-mcp-rs
+```
+
+This downloads, compiles, and installs the `ssh-mcp` binary to `~/.cargo/bin/` (ensure that directory is on your `PATH`). Verify the installation:
+
+```bash
+ssh-mcp --version
 ```
 
 ### Build from Source

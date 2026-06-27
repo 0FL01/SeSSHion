@@ -116,8 +116,7 @@ A strict-production example using `--strict-host-key-checking=yes` with a pre-po
 
 ## 🚀 Adding to MCP Clients
 
-<details>
-<summary><b>OpenCode</b> — opencode.jsonc</summary>
+### OpenCode
 
 Add this to your `opencode.jsonc`:
 
@@ -160,8 +159,6 @@ Add this to your `opencode.jsonc`:
   }
 }
 ```
-
-</details>
 
 <details>
 <summary><b>Claude Code</b> — .mcp.json or ~/.claude.json</summary>

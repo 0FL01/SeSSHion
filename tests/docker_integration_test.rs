@@ -420,12 +420,7 @@ async fn test_mcp_tools_with_docker() {
 
     // head lines=5 on the same huge file
     let huge_head_result = server
-        .test_read_file_with_options(
-            huge_path,
-            ssh_mcp::tools::ReadFileMode::Head,
-            Some(5),
-            None,
-        )
+        .test_read_file_with_options(huge_path, ssh_mcp::tools::ReadFileMode::Head, Some(5), None)
         .await
         .expect("read-file head on huge file failed");
     let huge_head_json: serde_json::Value =
@@ -439,17 +434,14 @@ async fn test_mcp_tools_with_docker() {
     );
     assert_eq!(
         huge_head_json.get("content").and_then(|v| v.as_str()),
-        Some("huge-line-000001\nhuge-line-000002\nhuge-line-000003\nhuge-line-000004\nhuge-line-000005\n")
+        Some(
+            "huge-line-000001\nhuge-line-000002\nhuge-line-000003\nhuge-line-000004\nhuge-line-000005\n"
+        )
     );
 
     // tail lines=4 on the same huge file — must return the REAL last 4 lines
     let huge_tail_result = server
-        .test_read_file_with_options(
-            huge_path,
-            ssh_mcp::tools::ReadFileMode::Tail,
-            Some(4),
-            None,
-        )
+        .test_read_file_with_options(huge_path, ssh_mcp::tools::ReadFileMode::Tail, Some(4), None)
         .await
         .expect("read-file tail on huge file failed");
     let huge_tail_json: serde_json::Value =
@@ -463,19 +455,12 @@ async fn test_mcp_tools_with_docker() {
     );
     assert_eq!(
         huge_tail_json.get("content").and_then(|v| v.as_str()),
-        Some(
-            "huge-line-199997\nhuge-line-199998\nhuge-line-199999\nhuge-line-200000\n"
-        )
+        Some("huge-line-199997\nhuge-line-199998\nhuge-line-199999\nhuge-line-200000\n")
     );
 
     // full mode on the huge file must reject with too_large (0 bytes streamed)
     let huge_full_result = server
-        .test_read_file_with_options(
-            huge_path,
-            ssh_mcp::tools::ReadFileMode::Full,
-            None,
-            None,
-        )
+        .test_read_file_with_options(huge_path, ssh_mcp::tools::ReadFileMode::Full, None, None)
         .await
         .expect("read-file full on huge file failed");
     let huge_full_text = extract_text_from_result(&huge_full_result);

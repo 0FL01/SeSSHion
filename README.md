@@ -90,6 +90,11 @@ The server is configured via CLI arguments or environment variables.
 | `--log-rotation` | `SSH_MCP_LOG_ROTATION` | Log rotation: daily, hourly, never (default: daily) |
 | `--strict-host-key-checking` | `SSH_MCP_STRICT_HOST_KEY_CHECKING` | Host key policy: `accept-new` (default), `yes`, or `no` |
 | `--known-hosts` | `SSH_MCP_KNOWN_HOSTS` | Custom `known_hosts` file path |
+| `--keepalive-interval` | `SSH_MCP_KEEPALIVE_INTERVAL` | Keepalive packet interval in seconds (default: 30) |
+| `--keepalive-max` | `SSH_MCP_KEEPALIVE_MAX` | Max keepalive failures before disconnect (default: 3) |
+| `--reconnect-retries` | `SSH_MCP_RECONNECT_RETRIES` | Reconnect retries after initial attempt (default: 3) |
+| `--reconnect-backoff-ms` | `SSH_MCP_RECONNECT_BACKOFF_MS` | Base reconnect backoff in ms (default: 250) |
+| `--health-probe-timeout-ms` | `SSH_MCP_HEALTH_PROBE_TIMEOUT_MS` | Health probe timeout in ms (default: 1500) |
 
 Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
 Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
@@ -102,11 +107,12 @@ Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
 - `yes`: require the host key to already exist in `known_hosts`; reject unknown or changed keys.
 - `no`: disable host key verification; use only for local test containers or other disposable environments.
 
-A strict-production example using `--strict-host-key-checking=yes` with a pre-populated `known_hosts` file is shown in the [OpenCode](#opencode) section below.
+A strict-production example using `--strict-host-key-checking=yes` with a pre-populated `known_hosts` file is shown in the Strict production configuration below.
 
 ## 🚀 Adding to MCP Clients
 
-### OpenCode
+<details>
+<summary><b>OpenCode</b> — opencode.jsonc</summary>
 
 Add this to your `opencode.jsonc`:
 
@@ -150,9 +156,55 @@ Add this to your `opencode.jsonc`:
 }
 ```
 
-**Strict production (verified host key):**
+</details>
 
-For strict production use, set the policy in your MCP client configuration and point it at a pre-populated `known_hosts` file:
+<details>
+<summary><b>Claude Code</b> — .mcp.json or ~/.claude.json</summary>
+
+Add this to your project's `.mcp.json` (shared via git) or to `~/.claude.json` under the top-level `mcpServers` key (user scope):
+
+**With SSH key (recommended for best transfer performance):**
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "type": "stdio",
+      "command": "/absolute/path/to/ssh-mcp",
+      "args": [
+        "--host=192.168.1.10",
+        "--port=22",
+        "--user=agent-nc",
+        "--key=/path/to/private/key"
+      ]
+    }
+  }
+}
+```
+
+**With password (file transfer uses exec-raw transport):**
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "type": "stdio",
+      "command": "/absolute/path/to/ssh-mcp",
+      "args": [
+        "--host=192.168.1.10",
+        "--port=22",
+        "--user=agent-nc",
+        "--password=your-password"
+      ]
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><b>Strict production</b> — verified host key</summary>
+
+For strict production use, set `--strict-host-key-checking=yes` and point it at a pre-populated `known_hosts` file. The same flags work in any client config above; the OpenCode example is shown below:
 
 ```jsonc
 {
@@ -174,43 +226,7 @@ For strict production use, set the policy in your MCP client configuration and p
 }
 ```
 
-### Claude Desktop
-
-Add this to your `claude_desktop_config.json`:
-
-**With SSH key (recommended for best transfer performance):**
-```json
-{
-  "mcpServers": {
-    "ssh-remote": {
-      "command": "/absolute/path/to/ssh-mcp",
-      "args": [
-        "--host=192.168.1.10",
-        "--port=22",
-        "--user=agent-nc",
-        "--key=/path/to/private/key"
-      ]
-    }
-  }
-}
-```
-
-**With password (file transfer uses exec-raw transport):**
-```json
-{
-  "mcpServers": {
-    "ssh-remote": {
-      "command": "/absolute/path/to/ssh-mcp",
-      "args": [
-        "--host=192.168.1.10",
-        "--port=22",
-        "--user=agent-nc",
-        "--password=your-password"
-      ]
-    }
-  }
-}
-```
+</details>
 
 ## 🛠 Tools
 
@@ -509,7 +525,7 @@ When using `--log-rotation=daily`, log files are suffixed with the date: `<log_f
 When `--log-file` is specified with `--log-format=json`, logs are written in structured JSON format:
 
 ```json
-{"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v1.4.0 starting...","target":"ssh_mcp"}
+{"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v2.1.0 starting...","target":"ssh_mcp"}
 {"timestamp":"2024-01-24T10:15:23.458Z","level":"INFO","message":"Connecting to admin@prod-server:22","target":"ssh_mcp"}
 {"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 300000ms","target":"ssh_mcp::command"}
 ```

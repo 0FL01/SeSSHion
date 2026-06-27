@@ -1,5 +1,5 @@
 [package]
-name = "ssh-mcp"
+name = "ssh-mcp-rs"
 version = "2.1.0"
 edition = "2024"
 authors = ["0FL01"]
@@ -7,7 +7,12 @@ description = "MCP server exposing SSH control for Linux systems via Model Conte
 license = "MIT"
 repository = "https://github.com/0FL01/ssh-mcp-rs"
 homepage = "https://github.com/0FL01/ssh-mcp-rs#readme"
-keywords = ["ssh", "mcp", "model-context-protocol", "server", "linux", "automation", "remote", "cli"]
+readme = "README.md"
+keywords = ["ssh", "mcp", "cli", "remote", "server"]
+categories = ["command-line-utilities", "network-programming", "development-tools"]
+
+[lib]
+name = "ssh_mcp"
 
 [[bin]]
 name = "ssh-mcp"

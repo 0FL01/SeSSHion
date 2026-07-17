@@ -8,8 +8,7 @@
 //! - `sudo-exec` - Execute shell commands with sudo privileges
 //! - `check-process` - Check if a process is still running and read its log
 //! - `read-file` - Read UTF-8 text files from the remote SSH server
-//! - `write-file` - Atomically overwrite or create a remote file
-//! - `replace-in-file` - Atomically replace text in a remote file
+//! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
 //!
 //! See `server.rs` for the implementation.
 
@@ -130,59 +129,12 @@ pub struct ReadFileParams {
     pub timeout_ms: Option<u64>,
 }
 
-/// Parameters for the write-file tool
+/// Parameters for the apply_patch tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct WriteFileParams {
-    /// Absolute remote file path to overwrite/create atomically
-    pub remote_path: String,
-
-    /// Full UTF-8 content that will replace the file atomically
-    pub new_content: String,
-
-    /// Optional SHA-256 precondition for optimistic locking
-    pub expected_sha256: Option<String>,
-
-    /// Opaque read-ticket from read-file response (required for editing non-empty existing files)
-    pub read_ticket: Option<String>,
-
-    /// Return a diff preview without mutating the remote file
-    pub dry_run: Option<bool>,
-
-    /// Optional timeout override in milliseconds
-    pub timeout_ms: Option<u64>,
-}
-
-/// Parameters for the replace-in-file tool
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ReplaceInFileParams {
-    /// Absolute remote file path to edit in place
-    pub remote_path: String,
-
-    /// Source text to replace in the current file
-    pub old_text: String,
-
-    /// Replacement text used for the edit
-    pub new_text: String,
-
-    /// Optional exact scope that must match once; replacement is limited to this substring
-    pub scope_text: Option<String>,
-
-    /// Replace all matches when true (default false)
-    pub replace_all: Option<bool>,
-
-    /// 1-based match selector used when old_text appears multiple times
-    pub match_index: Option<usize>,
-
-    /// Return a diff preview without mutating the remote file
-    pub dry_run: Option<bool>,
-
-    /// Optional SHA-256 precondition for optimistic locking
-    pub expected_sha256: Option<String>,
-
-    /// Optional timeout override in milliseconds
-    pub timeout_ms: Option<u64>,
+pub struct ApplyPatchParams {
+    /// One-file patch envelope with an absolute remote path
+    pub patch: String,
 }
 
 fn default_tail_lines() -> usize {
@@ -276,73 +228,14 @@ mod tests {
     }
 
     #[test]
-    fn test_write_file_params_deserialize() {
-        let json = r#"{"remote_path":"/etc/hosts","new_content":"127.0.0.1 localhost\n"}"#;
-        let params: WriteFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.new_content, "127.0.0.1 localhost\n");
-        assert!(params.expected_sha256.is_none());
-        assert!(params.read_ticket.is_none());
-        assert!(params.dry_run.is_none());
-        assert!(params.timeout_ms.is_none());
-    }
+    fn test_apply_patch_params_deserialize_and_reject_unknown_fields() {
+        let json = r#"{"patch":"*** Begin Patch\n*** Delete File: /tmp/old\n*** End Patch"}"#;
+        let params: ApplyPatchParams = serde_json::from_str(json).unwrap();
+        assert!(params.patch.contains("*** Delete File"));
 
-    #[test]
-    fn test_write_file_params_deserialize_with_expected_hash_and_timeout() {
-        let json = r#"{"remote_path":"/etc/hosts","new_content":"x","expected_sha256":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","timeout_ms":4000}"#;
-        let params: WriteFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.new_content, "x");
-        assert_eq!(
-            params.expected_sha256.as_deref(),
-            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
-        );
-        assert!(params.read_ticket.is_none());
-        assert!(params.dry_run.is_none());
-        assert_eq!(params.timeout_ms, Some(4000));
-    }
-
-    #[test]
-    fn test_replace_in_file_params_deserialize_defaults_replace_all() {
-        let json = r#"{"remote_path":"/etc/hosts","old_text":"127.0.0.1","new_text":"127.0.0.2"}"#;
-        let params: ReplaceInFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.old_text, "127.0.0.1");
-        assert_eq!(params.new_text, "127.0.0.2");
-        assert!(params.scope_text.is_none());
-        assert!(params.replace_all.is_none());
-        assert!(params.match_index.is_none());
-        assert!(params.dry_run.is_none());
-        assert!(params.expected_sha256.is_none());
-        assert!(params.timeout_ms.is_none());
-    }
-
-    #[test]
-    fn test_replace_in_file_params_deserialize_replace_all_true() {
-        let json = r#"{"remote_path":"/etc/hosts","old_text":"x","new_text":"y","scope_text":"block","replace_all":true,"match_index":3,"dry_run":true,"timeout_ms":2000}"#;
-        let params: ReplaceInFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.old_text, "x");
-        assert_eq!(params.new_text, "y");
-        assert_eq!(params.scope_text.as_deref(), Some("block"));
-        assert_eq!(params.replace_all, Some(true));
-        assert_eq!(params.match_index, Some(3));
-        assert_eq!(params.dry_run, Some(true));
-        assert_eq!(params.timeout_ms, Some(2000));
-    }
-
-    #[test]
-    fn test_write_file_params_reject_unknown_fields() {
-        let json = r#"{"remote_path":"/etc/hosts","new_content":"x","old_text":"y"}"#;
-        let err = serde_json::from_str::<WriteFileParams>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown field `old_text`"));
-    }
-
-    #[test]
-    fn test_replace_in_file_params_reject_unknown_fields() {
-        let json =
-            r#"{"remote_path":"/etc/hosts","old_text":"x","new_text":"y","read_ticket":"rt1.x"}"#;
-        let err = serde_json::from_str::<ReplaceInFileParams>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown field `read_ticket`"));
+        let err =
+            serde_json::from_str::<ApplyPatchParams>(r#"{"patch":"x","remote_path":"/tmp/x"}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown field `remote_path`"));
     }
 }

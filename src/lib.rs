@@ -17,8 +17,7 @@
 //! - `exec` - Execute a shell command on the remote SSH server
 //! - `sudo-exec` - Execute a command with sudo privileges (can be disabled with `--disable-sudo`)
 //! - `read-file` - Read a remote UTF-8 file with preview/head/tail/full modes
-//! - `write-file` - Atomically overwrite or create a remote UTF-8 file
-//! - `replace-in-file` - Atomically replace text within a remote UTF-8 file
+//! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
 //!
 //! # Example Usage (CLI)
 //!
@@ -37,12 +36,12 @@ pub mod background;
 pub mod config;
 pub mod error;
 pub mod logging;
+pub(crate) mod patch;
 #[cfg(unix)]
 pub(crate) mod platform;
 pub mod server;
 mod shell_escape;
 pub mod ssh;
-pub mod ticket;
 pub mod tools;
 pub mod transfer;
 pub(crate) mod validate;

@@ -1,8 +1,6 @@
-//! Common validation helpers used across read-file, write-file, and replace-in-file tools.
+//! Common validation helpers used by server tools.
 
 use std::path::{Component, Path};
-
-use rmcp::model::CallToolResult;
 
 use crate::validate::validate_basic_path_str;
 
@@ -55,30 +53,6 @@ pub(crate) fn validate_read_file_path(remote_path: &str) -> std::result::Result<
     }
 
     Ok(())
-}
-
-/// Extracts text content from a CallToolResult.
-pub(crate) fn extract_text_from_call_tool_result(result: &CallToolResult) -> String {
-    let mut combined = String::new();
-
-    for item in &result.content {
-        if let Some(text) = item.raw.as_text() {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(&text.text);
-        }
-    }
-
-    combined
-}
-
-/// Trims optional text input and treats empty strings as absent.
-pub(crate) fn normalize_optional_text_input(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 /// Parses a read-file error marker from stderr.

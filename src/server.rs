@@ -42,10 +42,7 @@ use crate::server::validation::validate_background_log_path;
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
-use crate::ticket::TicketSigner;
-use crate::tools::{
-    CheckProcessParams, ReadFileMode, ReadFileParams, ReplaceInFileParams, WriteFileParams,
-};
+use crate::tools::{ApplyPatchParams, CheckProcessParams, ReadFileMode, ReadFileParams};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 mod args;
@@ -115,7 +112,6 @@ pub struct SshMcpServer {
     job_registry: Arc<JobRegistry>,
 
     transfer: TransferEngine,
-    ticket_signer: Arc<TicketSigner>,
 }
 
 impl SshMcpServer {
@@ -195,7 +191,6 @@ impl SshMcpServer {
             spooler,
             job_registry,
             transfer: TransferEngine::new(local_root),
-            ticket_signer: Arc::new(TicketSigner::new()),
         })
     }
 
@@ -567,14 +562,9 @@ impl SshMcpServer {
         tools::read_file_tool()
     }
 
-    /// Build write-file tool definition
-    fn write_file_tool() -> Tool {
-        tools::write_file_tool()
-    }
-
-    /// Build replace-in-file tool definition
-    fn replace_in_file_tool() -> Tool {
-        tools::replace_in_file_tool()
+    /// Build apply_patch tool definition
+    fn apply_patch_tool() -> Tool {
+        tools::apply_patch_tool()
     }
 
     /// Get extended documentation for a tool by name
@@ -674,15 +664,14 @@ impl ServerHandler for SshMcpServer {
 
         let mut tools = vec![Self::exec_tool()];
 
-        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer, read-file, write-file, replace-in-file.
+        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer, read-file, apply_patch.
         if !self.config.disable_sudo {
             tools.push(Self::sudo_exec_tool());
         }
         tools.push(Self::check_process_tool());
         tools.push(Self::transfer_tool());
         tools.push(Self::read_file_tool());
-        tools.push(Self::write_file_tool());
-        tools.push(Self::replace_in_file_tool());
+        tools.push(Self::apply_patch_tool());
 
         Ok(ListToolsResult {
             tools,
@@ -748,18 +737,9 @@ impl ServerHandler for SshMcpServer {
                 let params: ReadFileParams = self.parse_tool_params(args, "read-file")?;
                 self.execute_read_file(params).await
             }
-            "write-file" => {
-                let params: WriteFileParams = self.parse_tool_params(args, "write-file")?;
-                self.execute_write_file(
-                    params,
-                    crate::server::handlers::file_edit_common::FileEditFaultInjection::None,
-                )
-                .await
-            }
-            "replace-in-file" => {
-                let params: ReplaceInFileParams =
-                    self.parse_tool_params(args, "replace-in-file")?;
-                self.execute_replace_in_file(
+            "apply_patch" => {
+                let params: ApplyPatchParams = self.parse_tool_params(args, "apply_patch")?;
+                self.execute_apply_patch(
                     params,
                     crate::server::handlers::file_edit_common::FileEditFaultInjection::None,
                 )
@@ -782,9 +762,6 @@ mod tests {
     use crate::background::wrapper::remote_job_log_path;
     use crate::server::validation::common::validate_read_file_path;
     use crate::server::validation::read_file::sanitize_read_file_stderr_snippet;
-    use crate::server::validation::read_file::{
-        normalize_optional_sha256_hex, normalize_sha256_hex,
-    };
 
     fn extract_text_from_result(result: &CallToolResult) -> String {
         result
@@ -826,16 +803,9 @@ mod tests {
     }
 
     #[test]
-    fn test_write_file_tool_definition() {
-        let tool = SshMcpServer::write_file_tool();
-        assert_eq!(tool.name.as_ref(), "write-file");
-        assert!(tool.description.is_some());
-    }
-
-    #[test]
-    fn test_replace_in_file_tool_definition() {
-        let tool = SshMcpServer::replace_in_file_tool();
-        assert_eq!(tool.name.as_ref(), "replace-in-file");
+    fn test_apply_patch_tool_definition() {
+        let tool = SshMcpServer::apply_patch_tool();
+        assert_eq!(tool.name.as_ref(), "apply_patch");
         assert!(tool.description.is_some());
     }
 
@@ -918,28 +888,6 @@ mod tests {
     fn test_validate_read_file_path_rejects_trailing_slash() {
         let err = validate_read_file_path("/etc/").unwrap_err();
         assert!(err.contains("must not end with '/'"));
-    }
-
-    #[test]
-    fn test_normalize_sha256_hex_accepts_uppercase_input() {
-        let input = "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899";
-        let normalized = normalize_sha256_hex(input, "expected_sha256").unwrap();
-        assert_eq!(
-            normalized,
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-        );
-    }
-
-    #[test]
-    fn test_normalize_sha256_hex_rejects_invalid_length() {
-        let err = normalize_sha256_hex("abcd", "expected_sha256").unwrap_err();
-        assert!(err.contains("64-character"));
-    }
-
-    #[test]
-    fn test_normalize_optional_sha256_hex_treats_blank_as_absent() {
-        let normalized = normalize_optional_sha256_hex(Some("   "), "expected_sha256").unwrap();
-        assert!(normalized.is_none());
     }
 
     #[test]
@@ -1157,8 +1105,9 @@ mod tests {
         assert!(SshMcpServer::get_tool_documentation("sudo-exec").is_some());
         assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
         assert!(SshMcpServer::get_tool_documentation("read-file").is_some());
-        assert!(SshMcpServer::get_tool_documentation("write-file").is_some());
-        assert!(SshMcpServer::get_tool_documentation("replace-in-file").is_some());
+        assert!(SshMcpServer::get_tool_documentation("apply_patch").is_some());
+        assert!(SshMcpServer::get_tool_documentation("write-file").is_none());
+        assert!(SshMcpServer::get_tool_documentation("replace-in-file").is_none());
         assert!(SshMcpServer::get_tool_documentation("unknown").is_none());
     }
 
@@ -1199,19 +1148,11 @@ mod tests {
     }
 
     #[test]
-    fn test_write_file_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("write-file").unwrap();
-        assert!(docs.contains("WRITE-FILE TOOL"));
-        assert!(docs.contains("expected_sha256"));
-        assert!(docs.contains("atomic"));
-    }
-
-    #[test]
-    fn test_replace_in_file_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("replace-in-file").unwrap();
-        assert!(docs.contains("REPLACE-IN-FILE TOOL"));
-        assert!(docs.contains("old_text"));
-        assert!(docs.contains("replace_all"));
+    fn test_apply_patch_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("apply_patch").unwrap();
+        assert!(docs.contains("APPLY_PATCH TOOL"));
+        assert!(docs.contains("Add File"));
+        assert!(docs.contains("Delete File"));
     }
 
     #[test]
@@ -1221,8 +1162,7 @@ mod tests {
         let sudo_exec = SshMcpServer::sudo_exec_tool();
         let transfer = SshMcpServer::transfer_tool();
         let read_file = SshMcpServer::read_file_tool();
-        let write_file = SshMcpServer::write_file_tool();
-        let replace_in_file = SshMcpServer::replace_in_file_tool();
+        let apply_patch = SshMcpServer::apply_patch_tool();
 
         // Descriptions should be present but concise (under 100 chars)
         if let Some(desc) = exec.description {
@@ -1253,17 +1193,10 @@ mod tests {
                 desc.len()
             );
         }
-        if let Some(desc) = write_file.description {
+        if let Some(desc) = apply_patch.description {
             assert!(
                 desc.len() < 100,
-                "write-file description too long: {} chars",
-                desc.len()
-            );
-        }
-        if let Some(desc) = replace_in_file.description {
-            assert!(
-                desc.len() < 100,
-                "replace-in-file description too long: {} chars",
+                "apply_patch description too long: {} chars",
                 desc.len()
             );
         }

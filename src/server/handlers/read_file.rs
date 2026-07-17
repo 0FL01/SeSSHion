@@ -10,7 +10,6 @@ use crate::server::validation::read_file::*;
 use crate::server::validation::{parse_read_file_error_marker, validate_read_file_path};
 use crate::server::{READ_FILE_ERROR_MARKER, make_job_id};
 use crate::ssh::escape_for_shell;
-use crate::ticket::DEFAULT_TICKET_TTL_SECS;
 use crate::tools::{ReadFileMode, ReadFileParams};
 
 impl SshMcpServer {
@@ -234,16 +233,6 @@ impl SshMcpServer {
                 ))]));
             }
         };
-        let content_sha256 = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(content.as_bytes());
-            hash.iter()
-                .fold(String::with_capacity(SHA256_HEX_LEN), |mut acc, b| {
-                    use std::fmt::Write as _;
-                    let _ = write!(acc, "{b:02x}");
-                    acc
-                })
-        };
         let _ = tokio::fs::remove_file(&capture_path).await;
 
         // Content is already windowed by the remote producer (head/tail -n N | head -c max+1).
@@ -275,12 +264,6 @@ impl SshMcpServer {
         if let Some(hint) = hint {
             result["hint"] = serde_json::Value::String(hint);
         }
-        result["sha256"] = serde_json::Value::String(content_sha256);
-        result["read_ticket"] = serde_json::Value::String(self.ticket_signer.issue(
-            &remote_path,
-            result["sha256"].as_str().unwrap_or_default(),
-            DEFAULT_TICKET_TTL_SECS,
-        ));
 
         Ok(CallToolResult::success(vec![Content::text(
             result.to_string(),

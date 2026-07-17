@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp-rs"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["0FL01"]
 description = "MCP server exposing SSH control for Linux systems via Model Context Protocol"
@@ -40,11 +40,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 schemars = "1.2"
 
-# Crypto (read-ticket HMAC)
+# Text hashing
 sha2 = "0.11"
-hmac = "0.13"
-getrandom = "0.4"
-similar = "2.7"
 
 # Tracing/Logging
 tracing = "0.1.44"

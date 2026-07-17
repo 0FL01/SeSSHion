@@ -15,7 +15,7 @@ A high-performance implementation of the SSH Model Context Protocol (MCP) server
 - **Sudo Integration**: Provides a `sudo-exec` tool with password wrapping.
 - **File Operations**: Read, edit, and transfer files with atomic operations and optimistic locking.
 - **Smart File Reading**: Preview mode prevents context overflow with token estimates and pagination.
-- **Atomic File Editing**: Full replacement or partial text replacement with conflict detection.
+- **Atomic File Editing**: Exact one-file patches for create, update, and delete with conflict detection.
 - **Command Sanitization**: Built-in safety checks for command inputs.
 - **Output Control**: Configurable output length limits to prevent token overflow.
 - **Cross-Platform**: Compiled binary runs on any system with SSH access.
@@ -298,8 +298,6 @@ Read a remote file with smart preview to prevent context overflow.
     "path": "/etc/config.conf",
     "content": "# First 800 lines...",
     "mode": "preview",
-    "sha256": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
-    "read_ticket": "rt1.1700000000.abcd...",
     "returned_lines": 800,
     "truncated": true,
     "approx_tokens_returned": 2048,
@@ -328,103 +326,38 @@ Read a remote file with smart preview to prevent context overflow.
 {"remote_path": "/etc/nginx/nginx.conf", "mode": "full"}
 ```
 
-### `write-file`
-Atomically overwrite or create a remote file with conflict detection.
+### `apply_patch`
+Create, update, or delete one remote UTF-8 text file using an exact patch.
 
 - **Arguments**:
-  - `remote_path` (string, required): Absolute path to the remote file.
-  - `new_content` (string, required): Complete new file content (UTF-8, max 1MB).
-  - `expected_sha256` (string, optional): 64-char hex SHA-256 hash for optimistic locking.
-  - `read_ticket` (string, conditionally required): Opaque token from `read-file`. Required when editing an existing non-empty file. Not required for file creation or zero-byte files.
+  - `patch` (string, required): A `*** Begin Patch` / `*** End Patch` envelope containing exactly one `*** Add File`, `*** Update File`, or `*** Delete File` section with an absolute remote path.
+
+- **Behavior**:
+  - Add requires a missing path; Update and Delete require an existing regular file.
+  - Add lines begin with `+`. Update hunks begin with `@@` and use exact context (` `), removal (`-`), and addition (`+`) lines.
+  - Missing or ambiguous update context is an error; fuzzy matching, moves, and multi-file patches are not supported.
+  - Files must be UTF-8, resulting content is limited to 1 MiB, and the parent directory must already exist.
+  - No prior `read-file` call or caller-managed state is required. The tool reads the current file and rejects concurrent changes before commit.
+  - Per-call snapshot and staging files live under the MCP server's `/tmp/ssh-mcp` spool and are removed after the operation.
+  - Add and Update finalize atomically on the remote host.
 
 - **Response**:
   ```json
   {
+    "ok": true,
     "path": "/etc/app.conf",
-    "previous_sha256": "d2d2d2...",
-    "new_sha256": "a3a3a3...",
-    "bytes_written": 1234,
-    "changed": true
+    "operation": "update"
   }
   ```
 
-- **Error Responses**:
-  - `conflict`: File changed since `expected_sha256`
-  - `not_found`: Parent directory doesn't exist
-  - `sha256_unavailable`: Remote host lacks `sha256sum`/`shasum` utilities
-  - `invalid_params`: Missing/invalid/expired/wrong-path `read_ticket`, or edit attempted on an existing non-empty file without calling `read-file` first
-
-**Example - Full replacement with optimistic lock (after calling `read-file`):**
+**Example - Exact update:**
 ```json
 {
-  "remote_path": "/etc/app.conf",
-  "new_content": "key=new_value\n",
-  "expected_sha256": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
-  "read_ticket": "rt1.1700000000.abcd..."
+  "patch": "*** Begin Patch\n*** Update File: /etc/app.conf\n@@\n-key=old\n+key=new\n*** End Patch"
 }
 ```
 
-### `replace-in-file`
-Atomically replace text within an existing remote file with conflict detection.
-
-- **Arguments**:
-  - `remote_path` (string, required): Absolute path to the remote file (must exist).
-  - `old_text` (string, required): Text to search for and replace.
-  - `new_text` (string, required): Replacement text.
-  - `replace_all` (boolean, default: false): If false and multiple matches are found, returns an error.
-  - `expected_sha256` (string, optional): Expected SHA-256 hash for optimistic locking.
-
-- **Response**:
-  ```json
-  {
-    "path": "/etc/app.conf",
-    "previous_sha256": "d2d2d2...",
-    "new_sha256": "a3a3a3...",
-    "bytes_written": 1234,
-    "changed": true
-  }
-  ```
-
-- **Error Responses**:
-  - `conflict`: File changed since expected_sha256 (or baseline hash changed during replace)
-  - `not_found`: File doesn't exist
-  - `sha256_unavailable`: Remote host lacks sha256sum/shasum utilities
-  - `invalid_params`: Empty `old_text` or invalid hash/timeout input
-
-- **Safety Features**:
-  - Atomic writes via staging + rename (never leaves partially written files)
-  - Lock directory prevents concurrent edits to same file
-  - Automatic rollback on failure
-  - Conflict detection prevents overwriting concurrent changes
-  - `replace-in-file` always pins to a read baseline SHA when `expected_sha256` is omitted
-
-**Example - Text replacement (single match):**
-```json
-{
-  "remote_path": "/etc/nginx/nginx.conf",
-  "old_text": "listen 80;",
-  "new_text": "listen 8080;",
-  "expected_sha256": "a1b2c3..."
-}
-```
-
-**Example - Replace all occurrences:**
-```json
-{
-  "remote_path": "/etc/config.conf",
-  "old_text": "localhost",
-  "new_text": "127.0.0.1",
-  "replace_all": true
-}
-```
-
-**Workflow for editing without losing changes:**
-1. Read file: `read-file` with mode `"preview"` or `"full"`
-2. Capture `read_ticket` from the read-file response (and optionally `sha256`)
-3. Make local edits to content
-4. Apply changes with `write-file` and `read_ticket` for full rewrites, or use `replace-in-file` for text substitutions
-5. Optional: also send `expected_sha256` for explicit optimistic locking
-6. If conflict error: re-read file (it changed), merge changes, retry
+For creation use `*** Add File: /absolute/path` with `+`-prefixed content lines. For deletion use `*** Delete File: /absolute/path` with no body.
 
 ### `transfer`
 Transfer a file or directory over SSH.

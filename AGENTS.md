@@ -52,6 +52,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 ├── src/                        # Source code
 │   ├── main.rs                 # Application entry point
 │   ├── lib.rs                  # Library root
+│   ├── patch.rs                # Strict one-file apply_patch parser and planner
 │   ├── server.rs               # MCP protocol server implementation (orchestrator, ~1,500 lines; reduced from 2,930)
 │   ├── server/                 # Server submodules (extracted from server.rs)
 │   │   ├── tools.rs            # MCP tool schemas and documentation
@@ -67,11 +68,9 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │       ├── mod.rs          # Module exports
 │   │       ├── check_process.rs # check-process tool handler
 │   │       ├── read_file.rs    # read-file tool handler
-│   │       ├── write_file.rs   # write-file tool handler
-│   │       ├── replace_in_file.rs # replace-in-file tool handler
-│   │       └── file_edit_common.rs # shared atomic file-edit transaction helpers
+│   │       ├── apply_patch.rs  # apply_patch orchestration and MCP responses
+│   │       └── file_edit_common.rs # /tmp-backed snapshot and atomic commit helpers
 │   ├── shell_escape.rs         # Shell string escaping utilities (neutral, no ssh/background deps)
-│   ├── ticket.rs               # Read-ticket generation and HMAC verification for safe file overwrites
 │   ├── config.rs               # Configuration and CLI argument parsing
 │   ├── error.rs                # Centralized error handling
 │   ├── logging.rs              # Logging configuration and initialization

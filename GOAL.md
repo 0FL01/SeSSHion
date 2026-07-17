@@ -1,14 +1,14 @@
-# Goal: Replace text edit tools with `apply_patch`
+# Goal: Simplify `apply_patch` state and contract
 
-Status: active
-Source: user-approved plan in `plan.md` and user clarification to support create, edit, and delete
+Status: complete
+Source: user-approved simplification plan after the OpenCode comparison
 Last updated: 2026-07-17
 
 ## Objective
 
-Ship a breaking `3.0.0` MCP tool contract in which one public `apply_patch`
-tool creates, edits, or deletes one remote text file per call, replacing
-`write-file`, `replace-in-file`, and read tickets.
+Keep the one-file exact Add/Update/Delete behavior while reducing the public
+tool to `{patch}`, hiding concurrency state inside one call, and storing local
+temporary state under `/tmp/ssh-mcp`.
 
 ## Execution Directive
 
@@ -22,161 +22,116 @@ remain satisfied.
 
 ### Required Outcomes
 
-- R1: Expose one text-edit tool.
-  - Source: User instruction to replace the write/create tools with one
-    `apply_patch`, followed by approval of the reviewed plan.
-  - Acceptance: `list_tools` exposes canonical `apply_patch`; `write-file` and
-    `replace-in-file` are absent and are not retained as aliases. Transfer tools
-    remain unchanged.
-  - Primary evidence: Public tool-list and dispatch unit tests, then
-    `cargo test --lib`.
-  - Status: pending
-  - Evidence:
+- R1: Expose only the patch text as public edit input.
+  - Source: User-approved plan to remove explicit SHA, dry-run, and timeout
+    arguments.
+  - Acceptance: `apply_patch` accepts exactly `{patch}` and rejects unknown
+    fields. Success is `{ok,path,operation}`; errors expose no hashes.
+  - Primary evidence: Parameter/tool tests and source diff.
+  - Status: verified
+  - Evidence: 2026-07-17 parameter/schema tests passed in `cargo test`; the
+    public struct and MCP schema contain only `patch`, and Docker verified the
+    compact success response.
 
-- R2: Parse and plan deterministic one-file patches.
-  - Source: Approved plan and the user's clarification that the tool must
-    create, edit, and delete files.
-  - Acceptance: The strict `*** Begin Patch` / `*** End Patch` envelope accepts
-    exactly one absolute-path `*** Add File`, `*** Update File`, or
-    `*** Delete File` section. Update supports multiple exact hunks and rejects
-    missing or ambiguous context without fuzzy matching.
-  - Primary evidence: Parser and planner unit tests via `cargo test --lib patch`.
-  - Status: pending
-  - Evidence:
+- R2: Keep concurrency protection internal to one call.
+  - Source: Approved plan to copy OpenCode ergonomics without copying unsafe
+    direct-write behavior.
+  - Acceptance: The handler reads its own snapshot and commit still checks that
+    hidden baseline under the remote same-path lock. No prior `read-file` or
+    persistent cross-call state is required.
+  - Primary evidence: Focused Docker Add/Update/Delete and injected-conflict
+    cases.
+  - Status: verified
+  - Evidence: 2026-07-17 Docker Add/Update/Delete and injected concurrent
+    mutation cases passed; the conflict response contains no hash state.
 
-- R3: Apply create, edit, and delete safely on the current remote runtime path.
-  - Source: Approved plan, including `dry_run`, SHA conflict detection, and the
-    user's create/edit/delete clarification.
-  - Acceptance: Add requires a missing destination, Update and Delete require
-    an existing UTF-8 file, `dry_run` makes no remote change, and an optional
-    `expected_sha256` mismatch fails. Commit rechecks the loaded snapshot under
-    the existing same-path lock so a concurrent change is not overwritten or
-    deleted. Successful writes retain atomic final rename behavior.
-  - Primary evidence: Relevant cases in
-    `cargo test --test docker_integration_test`.
-  - Status: pending
-  - Evidence:
+- R3: Store ephemeral local edit state in the server spool.
+  - Source: User instruction to keep state in `/tmp` on the host.
+  - Acceptance: Both snapshot and result staging use the existing
+    `/tmp/ssh-mcp` spool and are cleaned after each call; edit runtime no longer
+    depends on transfer `local_root`.
+  - Primary evidence: Source diff and Docker edit cases.
+  - Status: verified
+  - Evidence: 2026-07-17 source diff uses `spooler.base_dir()` for both
+    `apply-patch-read-*` and `apply-patch-write-*`; focused Docker edits passed.
 
-- R4: Remove ticket and MCP-handler coupling from the edit path.
-  - Source: Approved plan requirement that handlers use typed snapshot and
-    commit results rather than invoking handlers and parsing `CallToolResult`.
-  - Acceptance: `apply_patch` consumes typed remote snapshots and commit
-    results; internal edit code does not parse public MCP JSON. `read_ticket`,
-    `TicketSigner`, and their dedicated dependencies are removed. `read-file`
-    reports `content_sha256` for returned content and `file_sha256` only for a
-    full-file read.
-  - Primary evidence: Source diff plus read/tool contract tests via
-    `cargo test --lib` and the read-file cases in
-    `cargo test --test docker_integration_test`.
-  - Status: pending
-  - Evidence:
+- R4: Remove superseded code and tests.
+  - Source: User instruction to remove dead code/tests and not cover deleted
+    behavior.
+  - Acceptance: Read responses have no SHA fields; dry-run/diff, explicit SHA,
+    detailed hash responses, obsolete fault helpers/markers, and `similar` are
+    removed with their dedicated tests.
+  - Primary evidence: Source/dependency grep and final test gate.
+  - Status: verified
+  - Evidence: 2026-07-17 removed public/hash/dry-run branches, markers, fault
+    helpers, integration cases, and `similar`; final tests passed.
 
-- R5: Publish the approved breaking contract in repository metadata and docs.
-  - Source: Approved plan.
-  - Acceptance: The crate version is `3.0.0`; ticket-only dependencies and
-    legacy edit modules are gone; `README.md`, crate docs, and `AGENTS.md`
-    describe the resulting tool and module layout.
-  - Primary evidence: Final source/documentation diff and `cargo test`.
-  - Status: pending
-  - Evidence:
-
-- R6: Pass the approved validation gates.
-  - Source: Acceptance criteria in the approved plan.
-  - Acceptance: Formatting, the Rust test suite, and relevant Docker read/edit
-    integration tests pass after the final implementation diff.
-  - Primary evidence: `cargo fmt --check`, `cargo test`, and
-    `cargo test --test docker_integration_test`.
-  - Status: pending
-  - Evidence:
+- R5: Pass proportional validation.
+  - Source: User instruction to complete the work and use Pareto tests.
+  - Acceptance: Formatting, Rust tests, and relevant Docker runtime tests pass.
+  - Primary evidence: `cargo fmt --check`, `cargo test`, Docker test command,
+    and final `git status`/commit.
+  - Status: verified
+  - Evidence: 2026-07-17 `cargo fmt --check`, focused Docker MCP runtime, and
+    final `cargo test` passed: 180 library tests, 62 Docker integration tests,
+    remaining integration suites, and 6 doctests.
 
 ### Constraints
 
-- C1: One patch may target exactly one absolute remote path.
-- C2: Remote text and resulting content remain UTF-8 and limited to the current
-  1 MiB edit limit; the destination parent directory must already exist.
-- C3: Keep the current same-path lock, snapshot SHA conflict behavior, remote
-  staging cleanup, and atomic final rename for Add and Update.
-- C4: Expected domain failures are structured tool errors; malformed MCP
-  parameters remain MCP errors.
-- C5: The public response identifies the path, operation, dry-run state,
-  changed state, previous/new SHA where applicable, and resulting byte count.
+- One patch targets one absolute path and supports Add, Update, or Delete only.
+- Exact unique matching, UTF-8, the 1 MiB limit, parent-exists rule, remote
+  staging, hidden snapshot check, same-path lock, and atomic Add/Update finalize
+  remain.
+- Tests stay focused on current observable behavior; removed behavior receives
+  no replacement coverage.
 
 ### Non-goals
 
-- Multi-file patches or batch atomicity.
-- `Move File` or rename operations.
-- Configured edit roots, a new authorization layer, or path-policy redesign.
-- New mode/ownership preservation or symlink semantics.
-- Retry frameworks, persistent state, outcome ledgers, or background workers.
-- Changes to transfer tool behavior.
-- Hidden compatibility aliases for removed edit tools.
+- Persistent state across calls, sessions, or restarts.
+- Fuzzy matching, Move, multi-file patches, formatter/LSP integration.
+- Transfer behavior changes, edit roots/auth, metadata, or symlink redesign.
 
 ## Change Envelope
 
-- Target: The public text-file edit API and its directly used read, planning,
-  remote snapshot, commit, response, test, and documentation paths.
-- Expected paths, symbols, and direct consumers:
-  - `Cargo.toml`, `Cargo.lock`, `README.md`, `AGENTS.md`, and `src/lib.rs`.
-  - `src/tools/mod.rs`, `src/server.rs`, and `src/server/tools.rs` for params,
-    schemas, tool listing, routing, and response documentation.
-  - A minimal patch parser/planner module and
-    `src/server/handlers/apply_patch.rs`.
-  - `src/server/handlers/read_file.rs` and
-    `src/server/handlers/file_edit_common.rs` for typed snapshot/commit flow.
-  - Handler/module exports and `src/server/testing.rs`.
-  - Removal of `write_file.rs`, `replace_in_file.rs`, `src/ticket.rs`, and their
-    parameters, routes, tests, and dependencies.
-  - Direct unit and Docker integration tests for tool contracts and retained
-    edit/read behavior.
-- Allowed artifacts: Rust implementation, directly relevant tests, MCP schemas
-  and docs, dependency cleanup, and the required version bump.
-- Forbidden artifacts: New dependencies unless the frozen outcomes are proven
-  impossible without one; services, workers, queues, persistent stores,
-  generic remote-filesystem frameworks, auth layers, or compatibility shims.
-- User or harness budget: No numeric file or diff budget was supplied. Stay
-  within the paths and artifact categories above; record a concrete blocker
-  before expanding them.
+- Public apply/read schemas, handlers, typed edit runtime, direct tests, docs,
+  dependency metadata, and this goal state.
+- Allowed: deletion and simplification of superseded implementation and tests.
+- Forbidden: new dependencies, persistent stores, services, workers, retries,
+  auth layers, compatibility aliases, and unrelated cleanup.
 
 ## Current Checkpoint
 
-- Closes: R2.
-- Smallest next action: Implement the one-file Add/Update/Delete AST, strict
-  parser, exact planner, and their unit tests without wiring remote I/O yet.
-- Expected evidence: `cargo test --lib patch` passes for valid operations,
-  malformed envelopes, unsupported/multiple sections, non-absolute paths, and
-  missing or ambiguous Update context.
-- Stop or replan if: The approved envelope cannot represent one of the three
-  required operations deterministically without expanding the public contract.
+- Closes: R1-R5.
+- Smallest next action: None; closure check passed.
+- Expected evidence: Recorded above and in Completion.
+- Stop or replan if: Not applicable; objective is complete.
 
 ## Current State
 
-- Resolved: The finish line and scope were approved; Delete was explicitly
-  added alongside Add and Update.
-- Last relevant evidence: Repository inspection confirmed the current public
-  tools, ticket coupling, typed-boundary gap, lock/CAS transaction, 1 MiB limit,
-  and existing unit/Docker test surfaces.
+- Resolved: R1-R5. Public edit input is only `patch`; temporary state is local
+  to each call under the spool; obsolete public fields and code are removed.
+- Last relevant evidence: Final `cargo test` passed after implementation and
+  test cleanup.
 - Blocker: None.
-- Next: Execute the R2 checkpoint.
+- Next: None.
 
 ## Material Decisions
 
-- 2026-07-17: Use canonical `apply_patch` only and remove both legacy text-edit
-  tools rather than retaining aliases.
-- 2026-07-17: Support Add, Update, and Delete for one absolute path; exclude
-  Move and multi-file patches.
-- 2026-07-17: Preserve the existing absolute-path contract instead of adding
-  configured edit roots.
-- 2026-07-17: Keep the patch implementation local and typed; do not introduce a
-  generic remote-filesystem abstraction.
-
-## Checkpoint History
-
-- 2026-07-17: Contract frozen after repository/`plan.md` review and explicit
-  user approval. No implementation changes made. Next: R2 parser/planner.
+- 2026-07-17: “State in `/tmp`” means ephemeral per-call snapshot/result files,
+  not a persistent cache of prior reads.
+- 2026-07-17: Retain hidden SHA comparison and remote lock, but remove all
+  caller-visible hashes and preconditions.
+- 2026-07-17: Remove dry-run/diff and its dependency rather than preserving
+  tests for deleted behavior.
 
 ## Completion
 
-- Resolved outcomes: Not complete.
-- Commands and artifacts: Not complete.
-- Constraint and diff-scope check: Not complete.
-- Final status: active.
+- Resolved outcomes: R1-R5 verified.
+- Commands and artifacts: `cargo fmt --check`; focused Docker MCP tool test;
+  final `cargo test`; implementation, schemas, focused tests, docs, and
+  dependency cleanup.
+- Constraint and diff-scope check: One exact absolute-path Add/Update/Delete
+  patch remains; hidden per-call CAS and lock remain; no persistent state,
+  public hashes, dry-run, diff dependency, transfer behavior change, or new
+  infrastructure was added.
+- Final status: complete.

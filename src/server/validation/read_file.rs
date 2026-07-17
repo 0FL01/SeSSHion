@@ -7,7 +7,6 @@ pub(crate) const READ_FILE_HARD_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const READ_FILE_DEFAULT_PREVIEW_LINES: usize = 800;
 pub(crate) const READ_FILE_MAX_LINE_WINDOW: usize = 10_000;
 pub(crate) const READ_FILE_STDERR_SNIPPET_LIMIT_CHARS: usize = 256;
-pub(crate) const SHA256_HEX_LEN: usize = 64;
 
 /// stderr marker prefix carrying the real remote file size in bytes.
 /// Emitted by the server-side read-file command so the local handler can
@@ -17,37 +16,6 @@ pub(crate) const READ_FILE_SIZE_MARKER: &str = "__SSH_MCP_READ_FILE_SIZE__";
 /// stderr marker indicating the remote file has more lines than the windowed
 /// read returned (truncation).  Emitted by head/preview/tail producers.
 pub(crate) const READ_FILE_TRUNC_MARKER: &str = "__SSH_MCP_READ_FILE_TRUNC__";
-
-/// Normalizes a SHA-256 hex string to lowercase and validates length.
-pub(crate) fn normalize_sha256_hex(
-    value: &str,
-    field: &str,
-) -> std::result::Result<String, String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.len() != SHA256_HEX_LEN {
-        return Err(format!(
-            "{field} must be a {SHA256_HEX_LEN}-character lowercase hex string"
-        ));
-    }
-    if !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(format!(
-            "{field} must be a {SHA256_HEX_LEN}-character lowercase hex string"
-        ));
-    }
-
-    Ok(normalized)
-}
-
-/// Trims optional SHA-256 input and treats empty strings as absent.
-pub(crate) fn normalize_optional_sha256_hex(
-    value: Option<&str>,
-    field: &str,
-) -> std::result::Result<Option<String>, String> {
-    match value.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => normalize_sha256_hex(value, field).map(Some),
-        None => Ok(None),
-    }
-}
 
 /// Resolves the max bytes limit from max_output_tokens.
 pub(crate) fn resolve_read_file_max_bytes(max_output_tokens: Option<usize>) -> usize {

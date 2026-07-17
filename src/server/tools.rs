@@ -86,73 +86,34 @@ PARAMETERS:
 BEHAVIOR:
 - Uses raw streaming transport (no exec output token truncation)
 - Default preview mode returns the first 800 lines to avoid context bombs
-- Returns JSON with path/content/returned_lines/truncated/token estimates, sha256, read_ticket, and optional hint
-- sha256: SHA-256 hex digest of the full file content (always present)
-- read_ticket: opaque token required by write-file when editing non-empty existing files (valid for 10 minutes)
+- Returns JSON with path/content/returned_lines/truncated/token estimates and an optional hint
 - Enforces deterministic size limits (aligned with max_output_tokens, hard-capped)
 - Returns an error for missing path, non-file paths, oversized files, or invalid UTF-8 content
 
 EXAMPLE:
 {"remote_path": "/etc/nginx/nginx.conf", "mode": "preview"}"#;
 
-    pub const WRITE_FILE: &str = r#"WRITE-FILE TOOL
-Atomically overwrite or create a remote UTF-8 file with optional optimistic locking.
+    pub const APPLY_PATCH: &str = r#"APPLY_PATCH TOOL
+Create, update, or delete one remote UTF-8 text file with an exact patch.
 
 PARAMETERS:
-- remote_path (string, required): Absolute remote file path to overwrite/create
-- new_content (string, required): Full replacement content (max 1048576 bytes)
-- expected_sha256 (string): Optional 64-char hex SHA-256 precondition of current file
-- read_ticket (string): Opaque token from read-file response. Required when editing a non-empty existing file. Not needed for file creation or empty files.
-- dry_run (boolean): When true, returns unified diff preview and does not modify the file
-- timeout_ms (integer): Optional timeout override in milliseconds
+- patch (string, required): One-file patch envelope using an absolute remote path
+
+PATCH FORMAT:
+- *** Begin Patch / *** End Patch envelope
+- Exactly one *** Add File, *** Update File, or *** Delete File section
+- Add body lines start with +
+- Update hunks start with @@ and use exact space/+/- prefixed lines
+- Missing or ambiguous context is an error; Move and multi-file patches are unsupported
 
 BEHAVIOR:
-- Validates remote_path like read-file
-- Acquires a per-file remote lock, computes SHA-256, and performs compare+replace in one transaction
-- Reclaims stale remote edit locks automatically when they are older than 120 seconds
-- Creates the target file atomically when it is missing and the parent directory already exists
-- If expected_sha256 is set and does not match, returns conflict and does not modify file
-- If expected_sha256 is set while file is missing, returns conflict and does not create file
-- Uses a same-directory sibling staging file and atomic rename
-- Requires a valid read_ticket when the target file exists and is non-empty; obtain it by calling read-file first. Current tickets are content-hash-bound and act as an implicit optimistic-lock baseline.
-- If the path is actively locked, returns retryable JSON with error="lock_busy"; retry the same tool call instead of falling back to exec/sudo-exec
-- With dry_run=true, returns preview JSON including diff and predicted_new_sha256 without mutating the file
-- Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
+- Add requires a missing path; Update and Delete require an existing UTF-8 regular file
+- Resulting content is limited to 1048576 bytes and the parent directory must exist
+- The tool reads the current file itself and rejects concurrent changes before commit
+- Patch planning and remote commit failures return structured tool errors
 
 EXAMPLE:
-{"remote_path":"/etc/app.conf","new_content":"key=value\n","expected_sha256":"d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"}"#;
-
-    pub const REPLACE_IN_FILE: &str = r#"REPLACE-IN-FILE TOOL
-Atomically replace text within an existing remote UTF-8 file with optional optimistic locking.
-
-PARAMETERS:
-- remote_path (string, required): Absolute remote file path to edit
-- old_text (string, required): Source text to replace
-- new_text (string, required): Replacement text
-- scope_text (string): Optional exact scope substring that must match once; replacement is limited to this scope
-- replace_all (boolean): Replace all matches when true; default false requires exactly one match
-- match_index (integer): Optional 1-based selector for a specific match when old_text appears multiple times
-- dry_run (boolean): When true, returns unified diff preview and does not modify the file
-- expected_sha256 (string): Optional 64-char hex SHA-256 precondition of current file
-- timeout_ms (integer): Optional timeout override in milliseconds
-
-BEHAVIOR:
-- Validates remote_path like read-file
-- Reads the file internally using read-file full mode
-- Requires an existing regular file and never creates a new file
-- If scope_text is supplied, it must match exactly once in the file; old_text matching is then limited to that scope
-- Returns an error when old_text is not found
-- With replace_all=false, requires exactly one match unless match_index is supplied
-- match_index is 1-based, mutually exclusive with replace_all=true, and counts only matches inside scope_text when scope_text is supplied
-- Computes a baseline SHA-256 for race-safe compare+replace when expected_sha256 is not supplied
-- Uses the same atomic write transaction as write-file
-- Reclaims stale remote edit locks automatically when they are older than 120 seconds
-- If the path is actively locked, returns retryable JSON with error="lock_busy"; retry the same tool call instead of falling back to exec/sudo-exec
-- With dry_run=true, returns preview JSON including diff, match_count, and selected_match_indices without mutating the file
-- Returns JSON: {\"path\":\"...\",\"previous_sha256\":\"...\",\"new_sha256\":\"...\",\"bytes_written\":123,\"changed\":true}
-
-EXAMPLE:
-{"remote_path":"/etc/nginx/nginx.conf","old_text":"listen 80;","new_text":"listen 8080;"}"#;
+{"patch":"*** Begin Patch\n*** Delete File: /tmp/old.conf\n*** End Patch"}"#;
 }
 
 fn command_tool(
@@ -309,100 +270,23 @@ pub(super) fn read_file_tool() -> Tool {
     )
 }
 
-pub(super) fn write_file_tool() -> Tool {
+pub(super) fn apply_patch_tool() -> Tool {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "remote_path": {
+            "patch": {
                 "type": "string",
-                "description": "Absolute remote file path to overwrite/create"
-            },
-            "new_content": {
-                "type": "string",
-                "description": "Full replacement UTF-8 content (max 1048576 bytes)",
-                "maxLength": 1048576
-            },
-            "expected_sha256": {
-                "type": "string",
-                "description": "Optional 64-char hex SHA-256 precondition of current file"
-            },
-            "read_ticket": {
-                "type": "string",
-                "description": "Opaque read-ticket from read-file (required when editing a non-empty existing file)"
-            },
-            "dry_run": {
-                "type": "boolean",
-                "default": false,
-                "description": "Return unified diff preview without modifying the file"
-            },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Optional timeout override in milliseconds"
+                "description": "One-file Add/Update/Delete patch using an absolute remote path"
             }
         },
-        "required": ["remote_path", "new_content"],
+        "required": ["patch"],
         "additionalProperties": false
     });
 
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
     Tool::new(
-        "write-file",
-        "Atomically overwrite or create a remote file.",
-        Arc::new(schema_obj),
-    )
-}
-
-pub(super) fn replace_in_file_tool() -> Tool {
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "remote_path": {
-                "type": "string",
-                "description": "Absolute remote file path to edit"
-            },
-            "old_text": {
-                "type": "string",
-                "description": "Source text to replace"
-            },
-            "new_text": {
-                "type": "string",
-                "description": "Replacement text"
-            },
-            "scope_text": {
-                "type": "string",
-                "description": "Optional exact scope substring that must match once; replacement is limited to this scope"
-            },
-            "replace_all": {
-                "type": "boolean",
-                "default": false,
-                "description": "Replace all matches (default false requires exactly one match)"
-            },
-            "match_index": {
-                "type": "integer",
-                "description": "Optional 1-based selector for a specific match when old_text appears multiple times"
-            },
-            "dry_run": {
-                "type": "boolean",
-                "default": false,
-                "description": "Return unified diff preview without modifying the file"
-            },
-            "expected_sha256": {
-                "type": "string",
-                "description": "Optional 64-char hex SHA-256 precondition of current file"
-            },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Optional timeout override in milliseconds"
-            }
-        },
-        "required": ["remote_path", "old_text", "new_text"],
-        "additionalProperties": false
-    });
-
-    let schema_obj = schema.as_object().cloned().unwrap_or_default();
-    Tool::new(
-        "replace-in-file",
-        "Atomically replace text in a remote file.",
+        "apply_patch",
+        "Apply one exact Add/Update/Delete patch to a remote UTF-8 text file.",
         Arc::new(schema_obj),
     )
 }
@@ -413,8 +297,7 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         "sudo-exec" => Some(tool_docs::SUDO_EXEC),
         "transfer" => Some(tool_docs::TRANSFER),
         "read-file" => Some(tool_docs::READ_FILE),
-        "replace-in-file" => Some(tool_docs::REPLACE_IN_FILE),
-        "write-file" => Some(tool_docs::WRITE_FILE),
+        "apply_patch" => Some(tool_docs::APPLY_PATCH),
         _ => None,
     }
 }

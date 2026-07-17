@@ -295,7 +295,7 @@ async fn check_alive(client: &McpClient, label: &str) -> bool {
     match timeout(
         Duration::from_secs(15),
         client.call_tool(
-            "exec",
+            "shell",
             json!({
                 "command": "echo ALIVE_CHECK",
                 "timeout_ms": 5000,
@@ -392,7 +392,7 @@ async fn run_test() -> anyhow::Result<()> {
         .map(|(i, cmd)| {
             (
                 format!("call_{i}: {cmd}"),
-                "exec".to_string(),
+                "shell".to_string(),
                 json!({
                     "command": cmd,
                     "timeout_ms": 10000,
@@ -428,7 +428,7 @@ async fn run_test() -> anyhow::Result<()> {
                 };
                 (
                     format!("sat_{i}: {cmd}"),
-                    "exec".to_string(),
+                    "shell".to_string(),
                     json!({
                         "command": cmd,
                         "timeout_ms": 8000,
@@ -460,7 +460,7 @@ async fn run_test() -> anyhow::Result<()> {
                     };
                     (
                         format!("drop_{i}: {cmd}"),
-                        "exec".to_string(),
+                        "shell".to_string(),
                         json!({
                             "command": cmd,
                             "timeout_ms": 10000,
@@ -607,7 +607,7 @@ async fn run_test() -> anyhow::Result<()> {
         .map(|(i, cmd)| {
             (
                 format!("hostkey_{i}: {cmd}"),
-                "exec".to_string(),
+                "shell".to_string(),
                 json!({
                     "command": cmd,
                     "timeout_ms": 10000,

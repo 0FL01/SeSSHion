@@ -9,7 +9,7 @@ pub(crate) const READ_FILE_MAX_LINE_WINDOW: usize = 10_000;
 pub(crate) const READ_FILE_STDERR_SNIPPET_LIMIT_CHARS: usize = 256;
 
 /// stderr marker prefix carrying the real remote file size in bytes.
-/// Emitted by the server-side read-file command so the local handler can
+/// Emitted by the server-side read command so the local handler can
 /// report `approx_tokens_total_estimate` without transferring the whole file.
 pub(crate) const READ_FILE_SIZE_MARKER: &str = "__SSH_MCP_READ_FILE_SIZE__";
 
@@ -86,7 +86,7 @@ pub(crate) fn read_file_stderr_indicates_truncated(stderr: &str) -> bool {
         .any(|line| line.trim().starts_with(READ_FILE_TRUNC_MARKER))
 }
 
-/// Builds a hint message for read-file responses.
+/// Builds a hint message for read responses.
 pub(crate) fn build_read_file_hint(
     mode: ReadFileMode,
     line_limit: usize,
@@ -107,7 +107,7 @@ pub(crate) fn build_read_file_hint(
 /// Builds an error message for file size exceeded.
 pub(crate) fn read_file_too_large_error(max_bytes: usize) -> String {
     format!(
-        "Error: remote file exceeds read-file size limit ({max_bytes} bytes). Use transfer for large files"
+        "Error: remote file exceeds read size limit ({max_bytes} bytes). Use transfer for large files"
     )
 }
 
@@ -149,7 +149,7 @@ pub(crate) fn sanitize_read_file_stderr_snippet(stderr: &str) -> Option<String> 
     Some(normalized)
 }
 
-/// Builds a remote failure message for read-file operations.
+/// Builds a remote failure message for read operations.
 pub(crate) fn build_read_file_remote_failure(exit_code: Option<u32>, stderr: &str) -> String {
     let mut message = match exit_code {
         Some(code) => format!("Error reading file: remote command failed with exit_code={code}"),

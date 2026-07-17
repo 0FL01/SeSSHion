@@ -343,7 +343,7 @@ async fn test_timeout_actually_fires_with_precision() {
     tracing::info!("Timeout precision test passed - fired after ~800ms");
 }
 
-/// Foreground sudo-exec should auto-detach on timeout like exec.
+/// Foreground sudo_shell should auto-detach on timeout like shell.
 #[tokio::test]
 async fn test_sudo_timeout_auto_detaches_to_background() {
     init_test_env().expect("Failed to initialize test environment");
@@ -399,7 +399,7 @@ async fn test_sudo_timeout_auto_detaches_to_background() {
     let timeout_result = server
         .test_execute_sudo_command_with_timeout_ms("sleep 2; echo done", 1100)
         .await
-        .expect("sudo-exec timeout override failed");
+        .expect("sudo_shell timeout override failed");
 
     let timeout_text = extract_text_from_result(&timeout_result);
     let timeout_json: serde_json::Value =
@@ -452,9 +452,9 @@ async fn test_sudo_timeout_auto_detaches_to_background() {
         let check = server
             .test_check_process(job_id, 50)
             .await
-            .expect("check-process should succeed for detached sudo job");
+            .expect("check_process should succeed for detached sudo job");
         let status: serde_json::Value = serde_json::from_str(&extract_text_from_result(&check))
-            .expect("check-process response should be valid JSON");
+            .expect("check_process response should be valid JSON");
 
         let running = status
             .get("running")

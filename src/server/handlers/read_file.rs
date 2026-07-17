@@ -13,7 +13,7 @@ use crate::ssh::escape_for_shell;
 use crate::tools::{ReadFileMode, ReadFileParams};
 
 impl SshMcpServer {
-    /// Execute read-file tool
+    /// Execute read tool
     pub(in crate::server) async fn execute_read_file(
         &self,
         params: ReadFileParams,
@@ -29,7 +29,7 @@ impl SshMcpServer {
             remote_path = ?remote_path,
             mode = mode.as_str(),
             lines = ?lines,
-            "read-file tool called"
+            "read tool called"
         );
 
         validate_read_file_path(&remote_path).map_err(|msg| McpError::invalid_params(msg, None))?;
@@ -148,7 +148,7 @@ impl SshMcpServer {
                 "not_found" => "Error: remote_path does not exist".to_string(),
                 "not_regular_file" => "Error: remote_path is not a regular file".to_string(),
                 "too_large" => read_file_too_large_error(max_read_bytes),
-                _ => "Error: read-file failed on remote host".to_string(),
+                _ => "Error: read failed on remote host".to_string(),
             };
             let _ = tokio::fs::remove_file(&capture_path).await;
             return Ok(CallToolResult::error(vec![Content::text(msg)]));

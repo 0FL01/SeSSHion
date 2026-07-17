@@ -18,7 +18,7 @@ use crate::platform::O_NOFOLLOW_FLAG;
 ///
 /// Phase 1 is responsible for local directory existence and deterministic
 /// path generation. Later phases will stream remote stdout/stderr into these
-/// files and use the registry to serve `check-process`.
+/// files and use the registry to serve `check_process`.
 #[derive(Debug, Clone)]
 pub struct LocalLogSpooler {
     base_dir: PathBuf,

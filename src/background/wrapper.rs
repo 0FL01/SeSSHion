@@ -2,7 +2,7 @@ use crate::shell_escape::escape_for_shell;
 
 pub(crate) fn remote_job_log_path(job_id: &str) -> String {
     // Transitional behavior:
-    // - Kept for API compatibility (exec/sudo-exec responses may still include remote_log_path).
+    // - Kept for API compatibility (shell/sudo_shell responses may still include remote_log_path).
     // - Current versions serve logs from local spool files on the MCP server.
     format!("/tmp/.ssh-mcp-job-{job_id}.log")
 }

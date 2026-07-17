@@ -127,7 +127,7 @@ impl SshMcpServer {
         // (both completed above). Streaming reads from an already-owned channel
         // and writes to a local file — it does not touch the SSH session or the
         // semaphore. Releasing the permit here prevents long-running detachable
-        // commands from starving the command-slot pool and blocking check-process.
+        // commands from starving the command-slot pool and blocking check_process.
         drop(permit);
         let join =
             tokio::spawn(async move { streamer.stream_channel(channel, initial_stdout).await });
@@ -316,7 +316,7 @@ impl SshMcpServer {
                     job_id = ?job_id,
                     pid,
                     error = ?e,
-                    "Failed to gather timeout recovery snapshot via check-process path"
+                    "Failed to gather timeout recovery snapshot via check_process path"
                 );
 
                 let mut still_running = true;
@@ -619,7 +619,7 @@ impl SshMcpServer {
         // (both completed above). Streaming reads from an already-owned channel
         // and writes to a local file — it does not touch the SSH session or the
         // semaphore. Releasing the permit here prevents long-running background
-        // jobs from starving the command-slot pool and blocking check-process.
+        // jobs from starving the command-slot pool and blocking check_process.
         drop(permit);
         tokio::spawn(async move {
             if let Err(e) = streamer.stream_channel(channel, initial_stdout).await {

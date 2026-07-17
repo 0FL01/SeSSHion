@@ -6,17 +6,19 @@
 //!
 //! # Features
 //!
-//! - Execute shell commands on remote SSH servers (`exec` tool)
-//! - Support for `sudo` command execution with password (`sudo-exec` tool)
+//! - Execute shell commands on remote SSH servers (`shell` tool)
+//! - Support for `sudo` command execution with password (`sudo_shell` tool)
 //! - Persistent SSH connection with auto-reconnect
 //! - Configurable command timeout
 //! - Command length limits for safety
 //!
 //! # MCP Tools
 //!
-//! - `exec` - Execute a shell command on the remote SSH server
-//! - `sudo-exec` - Execute a command with sudo privileges (can be disabled with `--disable-sudo`)
-//! - `read-file` - Read a remote UTF-8 file with preview/head/tail/full modes
+//! - `shell` - Execute a shell command on the remote SSH server
+//! - `sudo_shell` - Execute a command with sudo privileges (can be disabled with `--disable-sudo`)
+//! - `check_process` - Monitor background commands and read their local logs
+//! - `transfer` - Transfer files and directories over SSH
+//! - `read` - Read a remote UTF-8 file with preview/head/tail/full modes
 //! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
 //!
 //! # Example Usage (CLI)

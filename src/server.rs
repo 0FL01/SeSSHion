@@ -1,7 +1,7 @@
 //! MCP Server implementation
 //!
 //! This module provides the main MCP server that integrates SSH connection
-//! management with the `exec` and `sudo-exec` tools.
+//! management with the `shell` and `sudo_shell` tools.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -339,14 +339,14 @@ impl SshMcpServer {
         })
     }
 
-    /// Execute a command (used by exec tool)
+    /// Execute a command (used by shell tool)
     async fn execute_command_with_timeout(
         &self,
         command: &str,
         timeout: Duration,
     ) -> std::result::Result<CallToolResult, McpError> {
         debug!(
-            "exec tool called: cmd_len={}, background=false, sudo=false, timeout_ms={}",
+            "shell tool called: cmd_len={}, background=false, sudo=false, timeout_ms={}",
             command.len(),
             timeout.as_millis()
         );
@@ -422,14 +422,14 @@ impl SshMcpServer {
             .await
     }
 
-    /// Execute a command with sudo (used by sudo-exec tool)
+    /// Execute a command with sudo (used by sudo_shell tool)
     async fn execute_sudo_command_with_timeout(
         &self,
         command: &str,
         timeout: Duration,
     ) -> std::result::Result<CallToolResult, McpError> {
         debug!(
-            "sudo-exec tool called: cmd_len={}, background=false, sudo=true, timeout_ms={}",
+            "sudo_shell tool called: cmd_len={}, background=false, sudo=true, timeout_ms={}",
             command.len(),
             timeout.as_millis()
         );
@@ -537,14 +537,14 @@ impl SshMcpServer {
         }
     }
 
-    /// Build exec tool definition (compact)
-    fn exec_tool() -> Tool {
-        tools::exec_tool()
+    /// Build shell tool definition (compact)
+    fn shell_tool() -> Tool {
+        tools::shell_tool()
     }
 
-    /// Build sudo-exec tool definition (compact)
-    fn sudo_exec_tool() -> Tool {
-        tools::sudo_exec_tool()
+    /// Build sudo_shell tool definition (compact)
+    fn sudo_shell_tool() -> Tool {
+        tools::sudo_shell_tool()
     }
 
     /// Build transfer tool definition (compact)
@@ -552,12 +552,12 @@ impl SshMcpServer {
         tools::transfer_tool()
     }
 
-    /// Build check-process tool definition
+    /// Build check_process tool definition
     fn check_process_tool() -> Tool {
         tools::check_process_tool()
     }
 
-    /// Build read-file tool definition
+    /// Build read tool definition
     fn read_file_tool() -> Tool {
         tools::read_file_tool()
     }
@@ -662,11 +662,11 @@ impl ServerHandler for SshMcpServer {
     ) -> std::result::Result<ListToolsResult, McpError> {
         debug!("list_tools called");
 
-        let mut tools = vec![Self::exec_tool()];
+        let mut tools = vec![Self::shell_tool()];
 
-        // Docs/expected order: exec, (optional) sudo-exec, check-process, transfer, read-file, apply_patch.
+        // Docs/expected order: shell, (optional) sudo_shell, check_process, transfer, read, apply_patch.
         if !self.config.disable_sudo {
-            tools.push(Self::sudo_exec_tool());
+            tools.push(Self::sudo_shell_tool());
         }
         tools.push(Self::check_process_tool());
         tools.push(Self::transfer_tool());
@@ -693,7 +693,7 @@ impl ServerHandler for SshMcpServer {
 
         // Route to the appropriate tool
         match tool_name {
-            "exec" => {
+            "shell" => {
                 let parsed = self.parse_common_tool_args(&args)?;
                 let timeout = self.resolve_timeout(parsed.timeout_ms);
 
@@ -705,9 +705,12 @@ impl ServerHandler for SshMcpServer {
                         .await
                 }
             }
-            "sudo_exec" | "sudo-exec" => {
+            "sudo_shell" => {
                 if self.config.disable_sudo {
-                    return Err(McpError::invalid_params("sudo-exec tool is disabled", None));
+                    return Err(McpError::invalid_params(
+                        "sudo_shell tool is disabled",
+                        None,
+                    ));
                 }
 
                 let parsed = self.parse_common_tool_args(&args)?;
@@ -729,12 +732,12 @@ impl ServerHandler for SshMcpServer {
                 let verbose = params.verbose;
                 self.execute_transfer(params, verbose).await
             }
-            "check-process" | "check_process" => {
-                let params: CheckProcessParams = self.parse_tool_params(args, "check-process")?;
+            "check_process" => {
+                let params: CheckProcessParams = self.parse_tool_params(args, "check_process")?;
                 self.execute_check_process(params).await
             }
-            "read-file" | "read_file" => {
-                let params: ReadFileParams = self.parse_tool_params(args, "read-file")?;
+            "read" => {
+                let params: ReadFileParams = self.parse_tool_params(args, "read")?;
                 self.execute_read_file(params).await
             }
             "apply_patch" => {
@@ -782,23 +785,23 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_tool_definition() {
-        let tool = SshMcpServer::exec_tool();
-        assert_eq!(tool.name.as_ref(), "exec");
+    fn test_shell_tool_definition() {
+        let tool = SshMcpServer::shell_tool();
+        assert_eq!(tool.name.as_ref(), "shell");
         assert!(tool.description.is_some());
     }
 
     #[test]
-    fn test_sudo_exec_tool_definition() {
-        let tool = SshMcpServer::sudo_exec_tool();
-        assert_eq!(tool.name.as_ref(), "sudo-exec");
+    fn test_sudo_shell_tool_definition() {
+        let tool = SshMcpServer::sudo_shell_tool();
+        assert_eq!(tool.name.as_ref(), "sudo_shell");
         assert!(tool.description.is_some());
     }
 
     #[test]
     fn test_read_file_tool_definition() {
         let tool = SshMcpServer::read_file_tool();
-        assert_eq!(tool.name.as_ref(), "read-file");
+        assert_eq!(tool.name.as_ref(), "read");
         assert!(tool.description.is_some());
     }
 
@@ -994,8 +997,8 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("expected hint when truncated");
         assert!(
-            hint.contains("check-process") && hint.contains("job_id=job-1"),
-            "hint should point to check-process job_id; got: '{hint}'"
+            hint.contains("check_process") && hint.contains("job_id=job-1"),
+            "hint should point to check_process job_id; got: '{hint}'"
         );
 
         let error_snippet = value
@@ -1072,10 +1075,10 @@ mod tests {
             hint.contains("job_id=job-42"),
             "hint should contain the actual job_id value; got: '{hint}'"
         );
-        // Hint should mention the check-process tool
+        // Hint should mention the check_process tool
         assert!(
-            hint.contains("check-process"),
-            "hint should mention check-process tool; got: '{hint}'"
+            hint.contains("check_process"),
+            "hint should mention check_process tool; got: '{hint}'"
         );
         // Hint should warn against restarting
         assert!(
@@ -1101,10 +1104,10 @@ mod tests {
     #[test]
     fn test_tool_documentation_available() {
         // Verify that extended documentation is available for all tools
-        assert!(SshMcpServer::get_tool_documentation("exec").is_some());
-        assert!(SshMcpServer::get_tool_documentation("sudo-exec").is_some());
+        assert!(SshMcpServer::get_tool_documentation("shell").is_some());
+        assert!(SshMcpServer::get_tool_documentation("sudo_shell").is_some());
         assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
-        assert!(SshMcpServer::get_tool_documentation("read-file").is_some());
+        assert!(SshMcpServer::get_tool_documentation("read").is_some());
         assert!(SshMcpServer::get_tool_documentation("apply_patch").is_some());
         assert!(SshMcpServer::get_tool_documentation("write-file").is_none());
         assert!(SshMcpServer::get_tool_documentation("replace-in-file").is_none());
@@ -1112,9 +1115,9 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("exec").unwrap();
-        assert!(docs.contains("EXEC TOOL"));
+    fn test_shell_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("shell").unwrap();
+        assert!(docs.contains("SHELL TOOL"));
         assert!(docs.contains("PARAMETERS:"));
         assert!(docs.contains("BACKGROUND MODE:"));
         assert!(docs.contains("command"));
@@ -1123,9 +1126,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sudo_exec_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("sudo-exec").unwrap();
-        assert!(docs.contains("SUDO-EXEC TOOL"));
+    fn test_sudo_shell_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("sudo_shell").unwrap();
+        assert!(docs.contains("SUDO_SHELL TOOL"));
         assert!(docs.contains("sudo"));
     }
 
@@ -1140,8 +1143,8 @@ mod tests {
 
     #[test]
     fn test_read_file_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("read-file").unwrap();
-        assert!(docs.contains("READ-FILE TOOL"));
+        let docs = SshMcpServer::get_tool_documentation("read").unwrap();
+        assert!(docs.contains("READ TOOL"));
         assert!(docs.contains("remote_path"));
         assert!(docs.contains("mode"));
         assert!(docs.contains("UTF-8"));
@@ -1158,24 +1161,24 @@ mod tests {
     #[test]
     fn test_compact_tool_descriptions() {
         // Verify that tool descriptions are compact (not verbose)
-        let exec = SshMcpServer::exec_tool();
-        let sudo_exec = SshMcpServer::sudo_exec_tool();
+        let shell = SshMcpServer::shell_tool();
+        let sudo_shell = SshMcpServer::sudo_shell_tool();
         let transfer = SshMcpServer::transfer_tool();
         let read_file = SshMcpServer::read_file_tool();
         let apply_patch = SshMcpServer::apply_patch_tool();
 
         // Descriptions should be present but concise (under 100 chars)
-        if let Some(desc) = exec.description {
+        if let Some(desc) = shell.description {
             assert!(
                 desc.len() < 100,
-                "exec description too long: {} chars",
+                "shell description too long: {} chars",
                 desc.len()
             );
         }
-        if let Some(desc) = sudo_exec.description {
+        if let Some(desc) = sudo_shell.description {
             assert!(
                 desc.len() < 100,
-                "sudo-exec description too long: {} chars",
+                "sudo_shell description too long: {} chars",
                 desc.len()
             );
         }
@@ -1189,7 +1192,7 @@ mod tests {
         if let Some(desc) = read_file.description {
             assert!(
                 desc.len() < 100,
-                "read-file description too long: {} chars",
+                "read description too long: {} chars",
                 desc.len()
             );
         }

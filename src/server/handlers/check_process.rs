@@ -6,12 +6,12 @@ use crate::server::SshMcpServer;
 use crate::tools::CheckProcessParams;
 
 impl SshMcpServer {
-    /// Execute check-process tool
+    /// Execute check_process tool
     pub(in crate::server) async fn execute_check_process(
         &self,
         params: CheckProcessParams,
     ) -> std::result::Result<CallToolResult, McpError> {
-        debug!(job_id = ?params.job_id, "check-process tool called");
+        debug!(job_id = ?params.job_id, "check_process tool called");
 
         match self
             .connection
@@ -41,7 +41,7 @@ impl SshMcpServer {
                 )]))
             }
             Err(e) => {
-                error!(job_id = ?params.job_id, error = ?e, "check-process failed");
+                error!(job_id = ?params.job_id, error = ?e, "check_process failed");
                 Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error checking process: {}",
                     e

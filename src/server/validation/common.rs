@@ -55,7 +55,7 @@ pub(crate) fn validate_read_file_path(remote_path: &str) -> std::result::Result<
     Ok(())
 }
 
-/// Parses a read-file error marker from stderr.
+/// Parses a read error marker from stderr.
 pub(crate) fn parse_read_file_error_marker(stderr: &str) -> Option<&str> {
     stderr.lines().find_map(|line| {
         line.trim()

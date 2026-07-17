@@ -310,7 +310,7 @@ async fn wait_for_ssh(max_wait: Duration) -> anyhow::Result<()> {
 async fn call_background_exec(client: &McpClient, command: &str) -> String {
     match client
         .call_tool(
-            "exec",
+            "shell",
             json!({
                 "command": command,
                 "background": true,
@@ -327,7 +327,7 @@ async fn call_background_exec(client: &McpClient, command: &str) -> String {
 async fn call_foreground_exec(client: &McpClient, command: &str) -> String {
     match client
         .call_tool(
-            "exec",
+            "shell",
             json!({
                 "command": command,
                 "timeout_ms": 5000,

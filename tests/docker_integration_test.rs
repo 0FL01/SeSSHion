@@ -16,7 +16,7 @@ pub use docker_integration::common::*;
 /// 2. Waits for SSH to be ready
 /// 3. Creates an SshMcpServer instance
 /// 4. Tests the 'exec' tool via test helper (whoami -> "test")
-/// 5. Tests the 'sudo-exec' tool via test helper (whoami -> "root")
+/// 5. Tests the `sudo_shell` behavior via test helper (whoami -> "root")
 /// 6. Cleans up the container and server
 #[tokio::test]
 async fn test_mcp_tools_with_docker() {
@@ -93,9 +93,9 @@ async fn test_mcp_tools_with_docker() {
         "exec 'whoami' should return 'test', got: '{}'",
         exec_output
     );
-    tracing::info!("exec tool verified: whoami returned 'test'");
+    tracing::info!("shell behavior verified: whoami returned 'test'");
 
-    // 4a. Test read-file tool via dedicated test helper.
+    // 4a. Test read behavior via dedicated test helper.
     server
         .test_execute_command("printf 'read-file smoke\\n' > /tmp/ssh-mcp-read-file.txt")
         .await
@@ -117,7 +117,7 @@ async fn test_mcp_tools_with_docker() {
         read_file_json.get("content").and_then(|v| v.as_str()),
         Some("read-file smoke\n")
     );
-    tracing::info!("read-file tool verified: content returned as JSON");
+    tracing::info!("read behavior verified: content returned as JSON");
 
     // 4a-1. Missing file should return a deterministic error.
     let missing_file_result = server
@@ -165,7 +165,7 @@ async fn test_mcp_tools_with_docker() {
     let oversized_text = extract_text_from_result(&oversized_result);
     assert!(
         oversized_text.contains(
-            "Error: remote file exceeds read-file size limit (48000 bytes). Use transfer for large files"
+            "Error: remote file exceeds read size limit (48000 bytes). Use transfer for large files"
         ),
         "unexpected oversized-file error: {oversized_text}"
     );
@@ -193,7 +193,7 @@ async fn test_mcp_tools_with_docker() {
         "unexpected non-UTF8 error: {non_utf8_text}"
     );
 
-    // 4a-5. Mode semantics: preview/head/tail/full in single read-file tool.
+    // 4a-5. Mode semantics: preview/head/tail/full in the read tool.
     let long_read_path = "/tmp/ssh-mcp-read-file-long.txt";
     server
         .test_execute_command(
@@ -434,7 +434,7 @@ async fn test_mcp_tools_with_docker() {
         "full read of oversized file should error"
     );
     assert!(
-        huge_full_text.contains("exceeds read-file size limit"),
+        huge_full_text.contains("exceeds read size limit"),
         "oversized full read should mention size limit: {huge_full_text}"
     );
 
@@ -582,7 +582,7 @@ async fn test_mcp_tools_with_docker() {
         tokio::time::sleep(poll_interval).await;
     }
 
-    // 5. Test 'sudo-exec' tool using test helper
+    // 5. Test sudo_shell behavior using test helper
     let sudo_result = server
         .test_execute_sudo_command("whoami")
         .await
@@ -592,9 +592,9 @@ async fn test_mcp_tools_with_docker() {
     let sudo_output = extract_text_from_result(&sudo_result);
     let sudo_output = sudo_output.trim();
 
-    // The sudo-exec tool should run as root
+    // sudo_shell should run as root
     if sudo_output.contains("root") {
-        tracing::info!("sudo-exec tool verified: whoami returned 'root'");
+        tracing::info!("sudo_shell behavior verified: whoami returned 'root'");
     } else {
         // NOTE: If sudo fails in the container, document why
         // Common reasons:
@@ -602,7 +602,7 @@ async fn test_mcp_tools_with_docker() {
         // 2. Sudo requires TTY (no tty when running via SSH)
         // 3. The sudo password is wrong or not being passed correctly
         tracing::warn!(
-            "sudo-exec 'whoami' did not return 'root', got: '{}'",
+            "sudo_shell 'whoami' did not return 'root', got: '{}'",
             sudo_output
         );
         tracing::warn!("This may be due to container sudo configuration limitations");

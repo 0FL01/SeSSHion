@@ -346,11 +346,11 @@ async fn test_check_process_not_exists() {
     let check_result = server
         .test_check_process(job_id, 50)
         .await
-        .expect("Failed to call check-process");
+        .expect("Failed to call check_process");
 
     assert!(
         check_result.is_error.unwrap_or(false),
-        "expected check-process to error"
+        "expected check_process to error"
     );
     let text = extract_text_from_result(&check_result);
     assert!(
@@ -726,7 +726,7 @@ async fn test_check_process_background_exec_workflow() {
         .await
         .expect("Failed to create SshMcpServer");
 
-    // Start a background process using background=true via the exec tool
+    // Start a background process using background=true via shell
     // We need to use the tool call interface to get the JSON response with PID
     let result = server
         .test_execute_command_with_timeout_ms("echo 'Starting background' && sleep 20", 500)

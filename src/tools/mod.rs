@@ -4,10 +4,10 @@
 //! Now, tools are implemented directly in the SshMcpServer via ServerHandler trait.
 //!
 //! Available tools:
-//! - `exec` - Execute shell commands on the remote SSH server
-//! - `sudo-exec` - Execute shell commands with sudo privileges
-//! - `check-process` - Check if a process is still running and read its log
-//! - `read-file` - Read UTF-8 text files from the remote SSH server
+//! - `shell` - Execute shell commands on the remote SSH server
+//! - `sudo_shell` - Execute shell commands with sudo privileges
+//! - `check_process` - Check if a process is still running and read its log
+//! - `read` - Read UTF-8 text files from the remote SSH server
 //! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
 //!
 //! See `server.rs` for the implementation.
@@ -25,7 +25,7 @@ fn default_read_file_mode() -> ReadFileMode {
     ReadFileMode::Preview
 }
 
-/// Parameters for the exec tool
+/// Parameters for the shell tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ExecParams {
     /// Shell command to execute on the remote SSH server
@@ -49,7 +49,7 @@ pub struct ExecParams {
     pub log_path: Option<String>,
 }
 
-/// Parameters for the sudo-exec tool
+/// Parameters for the sudo_shell tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SudoExecParams {
     /// Shell command to execute with sudo on the remote SSH server
@@ -73,14 +73,14 @@ pub struct SudoExecParams {
     pub log_path: Option<String>,
 }
 
-/// Parameters for the check-process tool
+/// Parameters for the check_process tool
 ///
 /// # Migration from old API
 /// Previously required `pid` and `log_path`. Now uses `job_id` only.
-/// The job_id is returned by exec/sudo-exec when background=true.
+/// The job_id is returned by shell/sudo_shell when background=true.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CheckProcessParams {
-    /// Job ID returned by exec/sudo-exec background execution
+    /// Job ID returned by shell/sudo_shell background execution
     pub job_id: String,
 
     /// Number of last lines to read from log (default: 50)
@@ -88,7 +88,7 @@ pub struct CheckProcessParams {
     pub tail_lines: usize,
 }
 
-/// Parameters for the read-file tool
+/// Parameters for the read tool
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReadFileMode {

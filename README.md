@@ -12,7 +12,7 @@ A high-performance implementation of the SSH Model Context Protocol (MCP) server
 - **Persistent Connections**: Maintains a single SSH session across multiple tool calls for maximum speed.
 - **Auto-Reconnect**: Automatically restores the connection if it drops.
 - **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.
-- **Sudo Integration**: Provides a `sudo-exec` tool with password wrapping.
+- **Sudo Integration**: Provides a `sudo_shell` tool with password wrapping.
 - **File Operations**: Read, edit, and transfer files with atomic operations and optimistic locking.
 - **Smart File Reading**: Preview mode prevents context overflow with token estimates and pagination.
 - **Atomic File Editing**: Exact one-file patches for create, update, and delete with conflict detection.
@@ -100,8 +100,8 @@ The server is configured via CLI arguments or environment variables.
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` pipes |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
 | `--maxChars` | `SSH_MCP_MAX_CHARS` | Command length limit (default: 64000, "none" to disable) |
-| `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo-exec` tool |
-| `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Output token limit for exec/read-file (default: 16000, ~64KB; "none" to disable) |
+| `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` tool |
+| `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Output token limit for shell/read (default: 16000, ~64KB; "none" to disable) |
 | `--log-level` | `SSH_MCP_LOG_LEVEL` | Log level: trace, debug, info, warn, error (default: info) |
 | `--log-file` | `SSH_MCP_LOG_FILE` | Log file path (base name; daily/hourly adds date suffix) |
 | `--log-format` | `SSH_MCP_LOG_FORMAT` | Log file format: text, json (default: text) |
@@ -249,7 +249,7 @@ For strict production use, set `--strict-host-key-checking=yes` and point it at 
 
 The server exposes the following MCP tools:
 
-### `exec`
+### `shell`
 Execute a command as the connected user via POSIX-compatible `sh`.
 - **Arguments**:
   - `command` (string, required): Command string evaluated by POSIX-compatible `sh`; use portable shell syntax.
@@ -261,23 +261,23 @@ Execute a command as the connected user via POSIX-compatible `sh`.
   - `log_path` (string): Local log path on the MCP server (e.g. `/tmp/ssh-mcp/<job_id>.log`).
   - `remote_log_path` (string, deprecated): Compatibility field for backward compatibility. Does NOT represent an actual remote log file in the current architecture. Output is streamed locally; use `log_path` for local log access.
 
-### `sudo-exec`
+### `sudo_shell`
 Execute a command with root privileges using `sudo` via POSIX-compatible `sh`.
 - **Arguments**:
   - `command` (string, required): Command string evaluated by POSIX-compatible `sh` under sudo; use portable shell syntax.
-  - `background` (boolean, default: false): Same behavior as `exec` - return immediately and stream output to a local log.
+  - `background` (boolean, default: false): Same behavior as `shell` - return immediately and stream output to a local log.
   - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. If the foreground command exceeds this timeout on a detach-capable target, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`. When `background=true`, `timeout_ms` is ignored and NOT validated.
   - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. When `background=false`, `log_path` is ignored and NOT validated.
 - **Note**: This tool uses the `--sudo-password` provided at startup. For long-running sudo tasks, prefer `background=true`; foreground timeouts also auto-detach on supported targets.
 
-### `check-process`
+### `check_process`
 Check if a background job is still running and read the tail of its local log (stored on the MCP server).
 
 - **Arguments**:
-  - `job_id` (string, required): Job ID returned by `exec`/`sudo-exec` when `background=true`, or by `exec` foreground timeout auto-detach.
+  - `job_id` (string, required): Job ID returned by `shell`/`sudo_shell` when `background=true`, or by `shell` foreground timeout auto-detach.
   - `tail_lines` (integer, default: 50): Number of last lines to read from the local log.
 
-### `read-file`
+### `read`
 Read a remote file with smart preview to prevent context overflow.
 
 - **Arguments**:
@@ -337,7 +337,7 @@ Create, update, or delete one remote UTF-8 text file using an exact patch.
   - Add lines begin with `+`. Update hunks begin with `@@` and use exact context (` `), removal (`-`), and addition (`+`) lines.
   - Missing or ambiguous update context is an error; fuzzy matching, moves, and multi-file patches are not supported.
   - Files must be UTF-8, resulting content is limited to 1 MiB, and the parent directory must already exist.
-  - No prior `read-file` call or caller-managed state is required. The tool reads the current file and rejects concurrent changes before commit.
+  - No prior `read` call or caller-managed state is required. The tool reads the current file and rejects concurrent changes before commit.
   - Per-call snapshot and staging files live under the MCP server's `/tmp/ssh-mcp` spool and are removed after the operation.
   - Add and Update finalize atomically on the remote host.
 
@@ -443,7 +443,7 @@ Example response:
 ```
 - **Recommended approach**: Sleep between checks instead of tight polling.
   - Start with 2-5s intervals, then use 10-30s for longer-running jobs.
-- To check the status/output of a background job, use the `check-process` tool with the `job_id`:
+- To check the status/output of a background job, use the `check_process` tool with the `job_id`:
   ```json
   {"job_id": "abc123", "tail_lines": 50}
   ```
@@ -464,9 +464,9 @@ Example response:
 **Agent workflow:**
 1. Start command with `background=true` or let it auto-detach on timeout
 2. Get `{job_id, pid, log_path}` immediately
-3. Sleep 2-5s, then check status/output with `check-process` using `job_id`
+3. Sleep 2-5s, then check status/output with `check_process` using `job_id`
 4. For long jobs, increase interval to 10-30s
-   5. Confirm completion when `check-process` reports `running=false` and an `exit_code`
+   5. Confirm completion when `check_process` reports `running=false` and an `exit_code`
 
 When using `--log-rotation=daily`, log files are suffixed with the date: `<log_file>.YYYY-MM-DD` (in the same directory as `--log-file`).
 

@@ -442,7 +442,7 @@ impl SshConnectionManager {
     ///
     /// In practice, condition 3 is near-impossible: nohup (coreutils) and
     /// setsid (util-linux) are present on virtually every Linux system. When
-    /// detach mode is Full or Portable, the exec tool uses
+    /// detach mode is Full or Portable, the shell tool uses
     /// `execute_detachable_foreground_impl` which runs commands through a
     /// background wrapper (`sh -lc`), never touching the su PTY channel.
     ///

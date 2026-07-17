@@ -42,15 +42,15 @@ pub(crate) fn background_json_timeout(
 ) -> CallToolResult {
     let hint = if snapshot.still_running {
         format!(
-            "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check-process tool with job_id={job_id} to retrieve output."
+            "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check_process tool with job_id={job_id} to retrieve output."
         )
     } else if snapshot.state == "state_lost" {
         format!(
-            "TIMEOUT_RECOVERY: Background job state is lost after handoff. Inspect log_path/log_tail and use check-process with job_id={job_id} before deciding whether to retry."
+            "TIMEOUT_RECOVERY: Background job state is lost after handoff. Inspect log_path/log_tail and use check_process with job_id={job_id} before deciding whether to retry."
         )
     } else {
         format!(
-            "TIMEOUT_RECOVERY: Foreground timeout elapsed after handoff, but the background job is no longer running. Inspect exit_code/log_tail or use check-process tool with job_id={job_id} before retrying."
+            "TIMEOUT_RECOVERY: Foreground timeout elapsed after handoff, but the background job is no longer running. Inspect exit_code/log_tail or use check_process tool with job_id={job_id} before retrying."
         )
     };
     let body = serde_json::json!({
@@ -120,7 +120,7 @@ pub(crate) fn background_json_err(
         obj.insert(
             "hint".to_string(),
             serde_json::Value::String(format!(
-                "Response fields were truncated to {} chars. Hint: inspect full output using log_path or check-process with job_id={job_id}.",
+                "Response fields were truncated to {} chars. Hint: inspect full output using log_path or check_process with job_id={job_id}.",
                 BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
             )),
         );

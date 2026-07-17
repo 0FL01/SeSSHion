@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     );
 
     if config.disable_sudo {
-        info!("sudo-exec tool is disabled");
+        info!("sudo_shell tool is disabled");
     }
 
     // Create MCP server

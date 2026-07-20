@@ -5,137 +5,69 @@
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
 [![crates.io](https://img.shields.io/crates/v/ssh-mcp-rs.svg)](https://crates.io/crates/ssh-mcp-rs)
 
-A high-performance implementation of the SSH Model Context Protocol (MCP) server, optimized for DevOps workflows. This tool allows AI models to securely interact with remote Linux systems over SSH, providing tools for command execution, file operations, and administrative tasks.
+Capability-bound SSH MCP for autonomous DevOps agents: six composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
 
-## ✨ Features
+`ssh-mcp` is a Rust [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session. It exposes exactly six tools — nothing more — and is built to keep agent context small and operations deterministic.
 
-- **Persistent Connections**: Maintains a single SSH session across multiple tool calls for maximum speed.
-- **Auto-Reconnect**: Automatically restores the connection if it drops.
-- **Interactive Elevation**: Supports `su` elevation with PTY shell for full root access.
-- **Sudo Integration**: Provides a `sudo_shell` tool with password wrapping.
-- **File Operations**: Read, edit, and transfer files with atomic operations and optimistic locking.
-- **Smart File Reading**: Preview mode prevents context overflow with token estimates and pagination.
-- **Atomic File Editing**: Exact one-file patches for create, update, and delete with conflict detection.
-- **Command Sanitization**: Built-in safety checks for command inputs.
-- **Output Control**: Configurable output length limits to prevent token overflow.
-- **Cross-Platform**: Compiled binary runs on any system with SSH access.
+## Why
 
-## 🛠 Installation
+- **Capability-bound surface.** Six composable primitives, no open-ended remote API. The agent can only run commands, read files, patch one file, transfer files, and inspect background jobs.
+- **Deterministic long-running jobs.** `background=true` (or a foreground timeout auto-detach) returns `{job_id, pid, log_path}` immediately; output streams to a local log you poll with `check_process`. No client RPC timeouts on long work.
+- **Bounded context.** `read` defaults to a safe preview with token estimates; shell output is capped by `--max-output-tokens`. Large files cannot bomb the agent's context window.
+- **Atomic remote edits.** `apply_patch` applies one exact Add/Update/Delete patch with conflict detection and atomic commit — no fuzzy matching, no silent overwrites.
 
-### Pre-built Binaries (Recommended)
+## The six primitives
 
-Download the latest rolling release for your platform from the [Releases page](https://github.com/0FL01/ssh-mcp-rs/releases/tag/rolling).
+| Tool | Purpose |
+|------|---------|
+| `shell` | Run a command via POSIX `sh` as the connected user; `background=true` for long tasks. |
+| `sudo_shell` | Same, under `sudo` (uses `--sudo-password`); can be disabled with `--disable-sudo`. |
+| `check_process` | Poll a background job by `job_id` and read the tail of its local log. |
+| `read` | Read a remote UTF-8 file with `preview` / `head` / `tail` / `full` modes and token estimates. |
+| `apply_patch` | Create, update, or delete one remote UTF-8 file with an exact patch (atomic, conflict-checked). |
+| `transfer` | Move files/directories (`put`/`get`) via `auto` → `rsync` → `sftp` → `scp` → `exec-raw`. |
 
-| Platform | Download Link |
-|----------|---------------|
-| **Linux x86_64** | [ssh-mcp-linux-x86_64](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-linux-x86_64) |
-| **Windows x86_64** | [ssh-mcp-windows-x86_64.exe](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-windows-x86_64.exe) |
-| **macOS ARM64** | [ssh-mcp-macos-aarch64](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-macos-aarch64) |
+Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
-**Quick install (Linux/macOS):**
+## Installation
+
+### Pre-built binaries (recommended)
+
+Download the latest rolling release from the [Releases page](https://github.com/0FL01/ssh-mcp-rs/releases/tag/rolling):
+
+| Platform | Download |
+|----------|----------|
+| Linux x86_64 | [ssh-mcp-linux-x86_64](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-linux-x86_64) |
+| Windows x86_64 | [ssh-mcp-windows-x86_64.exe](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-windows-x86_64.exe) |
+| macOS ARM64 | [ssh-mcp-macos-aarch64](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-macos-aarch64) |
+
 ```bash
-# Download and install
 curl -L https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-linux-x86_64 -o ssh-mcp
-chmod +x ssh-mcp
-sudo mv ssh-mcp /usr/local/bin/
-
-# Verify installation
+chmod +x ssh-mcp && sudo mv ssh-mcp /usr/local/bin/
 ssh-mcp --version
-```
-
-**Quick install (Windows PowerShell):**
-```powershell
-# Download
-Invoke-WebRequest -Uri "https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-windows-x86_64.exe" -OutFile "ssh-mcp.exe"
-
-# Add to PATH (choose a directory in your PATH or add current directory)
-# Verify installation
-.\ssh-mcp.exe --version
 ```
 
 ### Cargo (crates.io)
 
-The crate is published on [crates.io](https://crates.io/crates/ssh-mcp-rs). Install the `ssh-mcp` binary with a single command (requires a [Rust toolchain](https://rustup.rs/)):
-
 ```bash
-cargo install ssh-mcp-rs
+cargo install ssh-mcp-rs   # installs the `ssh-mcp` binary to ~/.cargo/bin
 ```
 
-This downloads, compiles, and installs the `ssh-mcp` binary to `~/.cargo/bin/` (ensure that directory is on your `PATH`). Verify the installation:
+### Build from source
+
+Requires the [Rust toolchain](https://rustup.rs/) plus `pkg-config` and OpenSSL headers (`libssl-dev` on Debian/Ubuntu).
 
 ```bash
-ssh-mcp --version
-```
-
-### Build from Source
-
-#### Prerequisites
-
-- [Rust toolchain](https://rustup.rs/) (cargo, rustc)
-- `pkg-config` and OpenSSL headers (usually `libssl-dev` on Ubuntu/Debian)
-
-#### Build
-
-```bash
-git clone https://github.com/0FL01/ssh-mcp-rs.git
-cd ssh-mcp-rs
+git clone https://github.com/0FL01/ssh-mcp-rs.git && cd ssh-mcp-rs
 cargo build --release
 ```
 
-## ⚙️ Configuration
-
-<details>
-<summary><b>CLI arguments & environment variables</b></summary>
-
-The server is configured via CLI arguments or environment variables.
-
-| Argument | Environment Variable | Description |
-|----------|----------------------|-------------|
-| `--host` | `SSH_MCP_HOST` | SSH host (required) |
-| `--user` | `SSH_MCP_USER` | SSH username (required) |
-| `--port` | `SSH_MCP_PORT` | SSH port (default: 22) |
-| `--password` | `SSH_MCP_PASSWORD` | SSH password (alt to key) |
-| `--key` | `SSH_MCP_KEY` | Path to private key file |
-| `--su-password` | `SSH_MCP_SU_PASSWORD` | Password for `su` elevation |
-| `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` pipes |
-| `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
-| `--maxChars` | `SSH_MCP_MAX_CHARS` | Command length limit (default: 64000, "none" to disable) |
-| `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` tool |
-| `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Output token limit for shell/read (default: 16000, ~64KB; "none" to disable) |
-| `--log-level` | `SSH_MCP_LOG_LEVEL` | Log level: trace, debug, info, warn, error (default: info) |
-| `--log-file` | `SSH_MCP_LOG_FILE` | Log file path (base name; daily/hourly adds date suffix) |
-| `--log-format` | `SSH_MCP_LOG_FORMAT` | Log file format: text, json (default: text) |
-| `--log-rotation` | `SSH_MCP_LOG_ROTATION` | Log rotation: daily, hourly, never (default: daily) |
-| `--strict-host-key-checking` | `SSH_MCP_STRICT_HOST_KEY_CHECKING` | Host key policy: `accept-new` (default), `yes`, or `no` |
-| `--known-hosts` | `SSH_MCP_KNOWN_HOSTS` | Custom `known_hosts` file path |
-| `--keepalive-interval` | `SSH_MCP_KEEPALIVE_INTERVAL` | Keepalive packet interval in seconds (default: 30) |
-| `--keepalive-max` | `SSH_MCP_KEEPALIVE_MAX` | Max keepalive failures before disconnect (default: 3) |
-| `--reconnect-retries` | `SSH_MCP_RECONNECT_RETRIES` | Reconnect retries after initial attempt (default: 3) |
-| `--reconnect-backoff-ms` | `SSH_MCP_RECONNECT_BACKOFF_MS` | Base reconnect backoff in ms (default: 250) |
-| `--health-probe-timeout-ms` | `SSH_MCP_HEALTH_PROBE_TIMEOUT_MS` | Health probe timeout in ms (default: 1500) |
-
-Note: with `--log-rotation=daily`, the actual file will be `/var/log/ssh-mcp/app.log.YYYY-MM-DD`.
-Use `--log-rotation=never` to write exactly to `/var/log/ssh-mcp/app.log`.
-
-</details>
-
-### SSH Host Key Verification
-
-`ssh-mcp` verifies the SSH server host key before authentication. This prevents silent man-in-the-middle replacement after a host key has been trusted.
-
-- `accept-new` (default): trust and record an unknown host key on first connection; reject later key changes.
-- `yes`: require the host key to already exist in `known_hosts`; reject unknown or changed keys.
-- `no`: disable host key verification; use only for local test containers or other disposable environments.
-
-A strict-production example using `--strict-host-key-checking=yes` with a pre-populated `known_hosts` file is shown in the Strict production configuration below.
-
-## 🚀 Adding to MCP Clients
+## Adding to MCP clients
 
 ### OpenCode
 
-Add this to your `opencode.jsonc`:
+Add to `opencode.jsonc` (SSH key recommended; password auth uses the `exec-raw` transfer transport):
 
-**With SSH key (recommended for best transfer performance):**
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
@@ -155,32 +87,13 @@ Add this to your `opencode.jsonc`:
 }
 ```
 
-**With password (file transfer uses exec-raw transport):**
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "ssh-remote": {
-      "type": "local",
-      "command": [
-        "/absolute/path/to/ssh-mcp",
-        "--host=192.168.1.10",
-        "--port=22",
-        "--user=agent-nc",
-        "--password=your-password"
-      ],
-      "enabled": true
-    }
-  }
-}
-```
+Use `--password=your-password` instead of `--key=...` for password authentication.
 
 <details>
 <summary><b>Claude Code</b> — .mcp.json or ~/.claude.json</summary>
 
-Add this to your project's `.mcp.json` (shared via git) or to `~/.claude.json` under the top-level `mcpServers` key (user scope):
+Add to your project's `.mcp.json` (shared via git) or to `~/.claude.json` under the top-level `mcpServers` key:
 
-**With SSH key (recommended for best transfer performance):**
 ```json
 {
   "mcpServers": {
@@ -192,24 +105,6 @@ Add this to your project's `.mcp.json` (shared via git) or to `~/.claude.json` u
         "--port=22",
         "--user=agent-nc",
         "--key=/path/to/private/key"
-      ]
-    }
-  }
-}
-```
-
-**With password (file transfer uses exec-raw transport):**
-```json
-{
-  "mcpServers": {
-    "ssh-remote": {
-      "type": "stdio",
-      "command": "/absolute/path/to/ssh-mcp",
-      "args": [
-        "--host=192.168.1.10",
-        "--port=22",
-        "--user=agent-nc",
-        "--password=your-password"
       ]
     }
   }
@@ -221,7 +116,7 @@ Add this to your project's `.mcp.json` (shared via git) or to `~/.claude.json` u
 <details>
 <summary><b>Strict production</b> — verified host key</summary>
 
-For strict production use, set `--strict-host-key-checking=yes` and point it at a pre-populated `known_hosts` file. The same flags work in any client config above; the OpenCode example is shown below:
+Set `--strict-host-key-checking=yes` and point at a pre-populated `known_hosts` file (works in any client config):
 
 ```jsonc
 {
@@ -245,259 +140,60 @@ For strict production use, set `--strict-host-key-checking=yes` and point it at 
 
 </details>
 
-## 🛠 Tools
+## Configuration
 
-The server exposes the following MCP tools:
+Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--user`, and one of `--password` / `--key`.
 
-### `shell`
-Execute a command as the connected user via POSIX-compatible `sh`.
-- **Arguments**:
-  - `command` (string, required): Command string evaluated by POSIX-compatible `sh`; use portable shell syntax.
-  - `background` (boolean, default: false): If true, return immediately and continue streaming output to a local log on the MCP server. The job is tracked via `job_id` in an in-memory registry and the response includes `{job_id, pid, log_path}`. Recommended for long-running operations to avoid client timeouts.
-  - `timeout_ms` (integer, optional): Override the default command timeout (ms) for foreground runs. If the foreground command exceeds this timeout, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`. When `background=true`, `timeout_ms` is ignored and NOT validated.
-  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. Defaults to `/tmp/ssh-mcp/<job_id>.log`. When `background=false`, `log_path` is ignored and NOT validated.
+| Argument | Env | Description |
+|----------|-----|-------------|
+| `--host` | `SSH_MCP_HOST` | SSH host (required) |
+| `--user` | `SSH_MCP_USER` | SSH username (required) |
+| `--port` | `SSH_MCP_PORT` | SSH port (default: 22) |
+| `--password` | `SSH_MCP_PASSWORD` | SSH password (alternative to key) |
+| `--key` | `SSH_MCP_KEY` | Path to private key file |
+| `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
+| `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
+| `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell/read output token limit (default: 16000 ≈ 64KB; `none` to disable) |
+| `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` tool |
 
-- **Background response fields**:
-  - `log_path` (string): Local log path on the MCP server (e.g. `/tmp/ssh-mcp/<job_id>.log`).
-  - `remote_log_path` (string, deprecated): Compatibility field for backward compatibility. Does NOT represent an actual remote log file in the current architecture. Output is streamed locally; use `log_path` for local log access.
+Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key options).
 
-### `sudo_shell`
-Execute a command with root privileges using `sudo` via POSIX-compatible `sh`.
-- **Arguments**:
-  - `command` (string, required): Command string evaluated by POSIX-compatible `sh` under sudo; use portable shell syntax.
-  - `background` (boolean, default: false): Same behavior as `shell` - return immediately and stream output to a local log.
-  - `timeout_ms` (integer, optional): Override timeout (ms) for foreground runs. If the foreground command exceeds this timeout on a detach-capable target, it auto-detaches to background and returns `{ok:false, timeout:true, background:true, job_id, pid, log_path}`. When `background=true`, `timeout_ms` is ignored and NOT validated.
-  - `log_path` (string, optional): Custom local log path on the MCP server for background mode output. When `background=false`, `log_path` is ignored and NOT validated.
-- **Note**: This tool uses the `--sudo-password` provided at startup. For long-running sudo tasks, prefer `background=true`; foreground timeouts also auto-detach on supported targets.
+### SSH host key verification
 
-### `check_process`
-Check if a background job is still running and read the tail of its local log (stored on the MCP server).
+`ssh-mcp` verifies the server host key before authentication to prevent silent man-in-the-middle replacement:
 
-- **Arguments**:
-  - `job_id` (string, required): Job ID returned by `shell`/`sudo_shell` when `background=true`, or by `shell` foreground timeout auto-detach.
-  - `tail_lines` (integer, default: 50): Number of last lines to read from the local log.
+- `accept-new` (default): trust and record an unknown key on first connection; reject later changes.
+- `yes`: require the key to already exist in `known_hosts`; reject unknown or changed keys.
+- `no`: disable verification; only for disposable test environments.
 
-### `read`
-Read a remote file with smart preview to prevent context overflow.
+## Long-running jobs
 
-- **Arguments**:
-  - `remote_path` (string, required): Absolute path to the remote file.
-  - `mode` (string, optional): Read mode - `"preview"`, `"head"`, `"tail"`, or `"full"`. Default: `"preview"`.
-  - `lines` (integer, optional): Number of lines for preview/head/tail modes. Default: 800, Max: 10000.
-  - `timeout_ms` (integer, optional): Override timeout in milliseconds.
-
-- **Modes**:
-  - `preview` (default): Returns first N lines (default 800) with token estimates and truncation hint. Prevents context bomb from large files.
-  - `head`: Returns first N lines from the beginning of the file.
-  - `tail`: Returns last N lines from the end of the file.
-  - `full`: Returns the entire file content (subject to 1MB size limit).
-
-- **Response**:
-  ```json
-  {
-    "path": "/etc/config.conf",
-    "content": "# First 800 lines...",
-    "mode": "preview",
-    "returned_lines": 800,
-    "truncated": true,
-    "approx_tokens_returned": 2048,
-    "approx_tokens_total_estimate": 8192,
-    "hint": "File has 2400 lines total. Use mode=\"full\" to read entire file."
-  }
-  ```
-
-- **Safety Features**:
-  - Returns error for files larger than 1MB (use `transfer` for large files)
-  - Rejects binary/non-UTF8 files with clear error
-  - Shows approximate token counts to help agents manage context budget
-
-**Example - Preview first 800 lines:**
-```json
-{"remote_path": "/var/log/app.log"}
-```
-
-**Example - Get last 50 lines:**
-```json
-{"remote_path": "/var/log/app.log", "mode": "tail", "lines": 50}
-```
-
-**Example - Read entire file:**
-```json
-{"remote_path": "/etc/nginx/nginx.conf", "mode": "full"}
-```
-
-### `apply_patch`
-Create, update, or delete one remote UTF-8 text file using an exact patch.
-
-- **Arguments**:
-  - `patch` (string, required): A `*** Begin Patch` / `*** End Patch` envelope containing exactly one `*** Add File`, `*** Update File`, or `*** Delete File` section with an absolute remote path.
-
-- **Behavior**:
-  - Add requires a missing path; Update and Delete require an existing regular file.
-  - Add lines begin with `+`. Update hunks begin with `@@` and use exact context (` `), removal (`-`), and addition (`+`) lines.
-  - Missing or ambiguous update context is an error; fuzzy matching, moves, and multi-file patches are not supported.
-  - Files must be UTF-8, resulting content is limited to 1 MiB, and the parent directory must already exist.
-  - No prior `read` call or caller-managed state is required. The tool reads the current file and rejects concurrent changes before commit.
-  - Per-call snapshot and staging files live under the MCP server's `/tmp/ssh-mcp` spool and are removed after the operation.
-  - Add and Update finalize atomically on the remote host.
-
-- **Response**:
-  ```json
-  {
-    "ok": true,
-    "path": "/etc/app.conf",
-    "operation": "update"
-  }
-  ```
-
-**Example - Exact update:**
-```json
-{
-  "patch": "*** Begin Patch\n*** Update File: /etc/app.conf\n@@\n-key=old\n+key=new\n*** End Patch"
-}
-```
-
-For creation use `*** Add File: /absolute/path` with `+`-prefixed content lines. For deletion use `*** Delete File: /absolute/path` with no body.
-
-### `transfer`
-Transfer a file or directory over SSH.
-
-- **Authentication**: Supports both SSH key and password authentication. When using password auth, the `exec-raw` transport is used automatically.
-- **Local root**: `local_path` can be relative to `local_root` (the server's current working directory at startup) or an absolute path within `local_root`. Paths outside `local_root`, `..` components, and paths that normalize to `.` are rejected.
-- **Remote path validation**: `remote_path` must be non-empty, must not contain control characters, must not have leading/trailing whitespace, must not contain NUL, and must not start with `-`.
-- **Transport**:
-  - `transport=auto`: attempts rsync (most efficient), then sftp, then scp, then falls back to exec-raw deterministically.
-  - `transport=sftp` / `transport=scp`: use local OpenSSH client binaries (`sftp` / `scp`).
-  - `transport=exec-raw`: uses streaming stdin/stdout over the existing SSH session (tar streaming for directories).
-  - `transport=rsync`: uses local rsync binary with SSH transport for efficient delta-sync transfers (requires --key).
-  - **Note**: `sftp`/`scp` transports require the server to be started with a private key path (`--key=/path/to/key`). When using password authentication, the `exec-raw` transport is used automatically (streaming over the existing SSH session).
-
-**Directory transfer (tar)**
-
-- Directory transfers use a streamed POSIX `ustar` archive.
-- Each tar header is validated (ustar magic/version + checksum). Invalid archives are rejected.
-- Entry path rules:
-  - must be relative
-  - must be non-empty and must not normalize to `.`
-  - must not contain `..`
-- Supported entry types: regular files and directories only. Symlinks, device nodes, hardlinks, FIFOs, etc. are rejected.
-- Remote requirements: the remote host must provide `tar` (or `busybox tar`) in `PATH`.
-
-**Overwrite semantics**
-
-- `overwrite=false` (default - safer)
-  - `put file`: requires sibling staging and installs the final file via a hard-link (`ln`) to avoid replacement. This requires hard-link support on the remote filesystem; if unavailable the tool fails with an error suggesting to use `overwrite=true`.
-  - `get file`: installs the final file via a local hard-link (`fs::hard_link`). This requires hard-link support on the local filesystem; if unavailable the tool fails with an error suggesting to use `overwrite=true`.
-  - `put dir`: fails if the destination exists with a clear error message; use `overwrite=true` to replace existing directories.
-  - `get dir`: fails if the destination exists with a clear error message; use `overwrite=true` to replace existing directories.
-
-- `overwrite=true` (explicit opt-in for replacement)
-  - `put file`: stream to a staging file and `mv` into place.
-  - `get file`: stream to a local staging file and `rename` into place (best-effort replacement on platforms where rename does not replace).
-  - `put dir`: extract a streamed tar into a staging directory, then `mv` into place; if the destination existed it may be moved to a backup path during the swap.
-  - `get dir`: extract a streamed tar into a local staging directory, then swap into place via rename; if the destination existed it is first renamed to a sibling backup path.
-
-**Staging behavior (no /tmp)**
-
-- Remote staging prefers a sibling path under the destination parent for better atomicity.
-- If that location is not writable, `overwrite=true` operations fall back to `$HOME/.ssh-mcp/staging/<id>/...` and then move into place.
-- For `overwrite=false` file transfers, fallback staging is not allowed because the finalize step requires a sibling hard-link install; the tool fails if sibling staging is not writable.
-
-**Rsync Options**
-
-When using `transport=rsync`, you can customize behavior via `rsync_options`:
-- `checksum` (boolean, default: true): Use checksums instead of file times/sizes for file comparison
-- `compress` (boolean, default: false): Compress data during transfer
-- `delete` (boolean, default: false): Delete files on destination that don't exist on source
-- `inplace` (boolean, default: true): Update files in-place instead of creating new files
-- `partial` (boolean, default: true): Keep partially transferred files for resume
-- `bwlimit` (integer, optional): Bandwidth limit in KB/s
-
-### Monitoring Background Jobs
-When using `background=true` or when a command auto-detaches on timeout:
-- The response includes `{job_id, pid, log_path}` and a `hint` field with monitoring guidance.
-  - `log_path` is local to the MCP server (default: `/tmp/ssh-mcp/<job_id>.log`).
-  - `remote_log_path` may still be present for backward compatibility but is deprecated; it is compat-only and does not represent a remote log file.
-
-### Log Path Restrictions
-
-When providing a custom `log_path`:
-- Must be an absolute path
-- Must be directly under `/tmp/ssh-mcp/` (no subdirectories)
-- Invalid custom paths return a tool JSON error rather than an MCP protocol error
-- Must have `.log` extension
-- Cannot contain `.` or `..` components
-- Must not have leading/trailing whitespace
-- Must not start with `-`
-- Must not contain control characters (including `\n` / `\r`)
-- Example: `/tmp/ssh-mcp/my-job.log`
-
-Example response:
-```json
-{
-  "job_id": "abc123",
-  "pid": 12345,
-  "log_path": "/tmp/ssh-mcp/abc123.log",
-  "remote_log_path": "/tmp/.ssh-mcp-job-abc123.log"
-}
-```
-- **Recommended approach**: Sleep between checks instead of tight polling.
-  - Start with 2-5s intervals, then use 10-30s for longer-running jobs.
-- To check the status/output of a background job, use the `check_process` tool with the `job_id`:
-  ```json
-  {"job_id": "abc123", "tail_lines": 50}
-  ```
-  Or, if you want to run commands on the target host:
-  ```bash
-  ps -p <pid> -o pid,etime,cmd
-  ```
-
-### When to Use Background Mode
-
-**Typical long-running tasks:**
-- Database exports/imports (`mysqldump`, `pg_dump`, `pg_restore`)
-- Large file transfers (`rsync`, `scp`)
-- Build processes (`cargo build`, `make`, `npm install`)
-- Container operations (`docker build`, `docker compose up`)
-- System maintenance (`apt update`, `yum update`, log rotation)
-
-**Agent workflow:**
-1. Start command with `background=true` or let it auto-detach on timeout
-2. Get `{job_id, pid, log_path}` immediately
-3. Sleep 2-5s, then check status/output with `check_process` using `job_id`
-4. For long jobs, increase interval to 10-30s
-   5. Confirm completion when `check_process` reports `running=false` and an `exit_code`
-
-When using `--log-rotation=daily`, log files are suffixed with the date: `<log_file>.YYYY-MM-DD` (in the same directory as `--log-file`).
-
-## 📝 JSON Log Format
-
-When `--log-file` is specified with `--log-format=json`, logs are written in structured JSON format:
+Start with `background=true` (or let a foreground command auto-detach on timeout). You immediately get `{job_id, pid, log_path}`, where `log_path` is a local log on the MCP server (default `/tmp/ssh-mcp/<job_id>.log`). Poll with `check_process`:
 
 ```json
-{"timestamp":"2024-01-24T10:15:23.456789Z","level":"INFO","message":"SSH MCP Server v2.1.0 starting...","target":"ssh_mcp"}
-{"timestamp":"2024-01-24T10:15:23.458Z","level":"INFO","message":"Connecting to admin@prod-server:22","target":"ssh_mcp"}
-{"timestamp":"2024-01-24T10:15:24.123Z","level":"ERROR","message":"Command timeout after 300000ms","target":"ssh_mcp::command"}
+{"job_id": "abc123", "tail_lines": 50}
 ```
 
-Use `jq` for pretty printing:
-```bash
-# Daily rotation writes to a date-suffixed filename
-tail -f "/var/log/ssh-mcp/app.log.$(date +%Y-%m-%d)" | jq
+`check_process` returns a strict state — `running`, `completed`, `failed`, or `state_lost` — plus the log tail. Sleep between checks (2–5s, then 10–30s for long jobs) rather than tight-polling; a job is done when the state is terminal and an `exit_code` is present.
 
-# Or disable rotation for a stable filename
-# tail -f /var/log/ssh-mcp/app.log | jq
-```
-   
-## 🔒 Security
+## Safety
 
-- **Stdio Transport**: Communicates using JSON-RPC over stdin/stdout, ensuring no exposed ports.
-- **Credential Storage**: Passwords and keys are only kept in memory and never logged.
-- **Logging**: All internal logs are sent to `stderr` to avoid interfering with the MCP protocol.
-- **File Editing Safety**: Atomic staging with automatic cleanup, lock directories prevent concurrent edits, conflict detection prevents silent overwrites.
-- **Path Validation**: All paths validated for control characters, traversal attempts (`..`), and shell injection.
-- **Binary File Protection**: Text-based tools reject non-UTF8 content to prevent data corruption.
+- **Stdio transport.** JSON-RPC over stdin/stdout — no exposed network ports.
+- **Credentials in memory only.** Passwords and keys are never logged.
+- **Logs to stderr.** Internal logging stays off the MCP protocol channel.
+- **Path validation.** Rejects control characters, traversal (`..`), and shell-injection shapes.
+- **Binary protection.** Text tools reject non-UTF-8 content to prevent corruption.
+- **Atomic edits.** Staging with automatic cleanup and conflict detection; no silent overwrites.
 
-## 📄 License
+## Documentation
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Deeper references live in [`Docs/`](Docs/):
+
+- [`ssh-remote-file-editing-reference.md`](Docs/ssh-remote-file-editing-reference.md) — the SSH file-editing workflow.
+- [`diff-generation-reference.md`](Docs/diff-generation-reference.md) — diff generation for file operations.
+- [`backup-manager-reference.md`](Docs/backup-manager-reference.md) — backup manager implementation.
+- [`rmcp-sdk.md`](Docs/rmcp-sdk.md) / [`russh-library.md`](Docs/russh-library.md) — SDK and SSH library notes.
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.

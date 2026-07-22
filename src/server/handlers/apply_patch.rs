@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use crate::patch::FilePatch;
 use crate::server::SshMcpServer;
 use crate::server::handlers::file_edit_common::{
-    FileCommitAction, FileCommitRequest, FileEditError, FileEditFaultInjection, FileExpectedState,
-    RemoteTextFileState,
+    FileCommitAction, FileCommitRequest, FileEditError, FileEditFaultInjection, FileEditPrivilege,
+    FileExpectedState, RemoteTextFileState,
 };
 use crate::server::validation::file_edit::FILE_EDIT_HARD_MAX_BYTES;
 use crate::tools::ApplyPatchParams;
@@ -15,6 +15,7 @@ impl SshMcpServer {
         &self,
         params: ApplyPatchParams,
         fault_injection: FileEditFaultInjection,
+        privilege: FileEditPrivilege,
     ) -> Result<CallToolResult, McpError> {
         let patch = match FilePatch::parse(&params.patch) {
             Ok(patch) => patch,
@@ -25,7 +26,10 @@ impl SshMcpServer {
         let path = patch.path().to_owned();
         let timeout = self.resolve_timeout(None);
 
-        let snapshot = match self.load_remote_text_file_state(&path, timeout).await {
+        let snapshot = match self
+            .load_remote_text_file_state(&path, timeout, privilege)
+            .await
+        {
             Ok(snapshot) => snapshot,
             Err(error) => return Ok(file_edit_error_result(error)),
         };
@@ -61,7 +65,7 @@ impl SshMcpServer {
         }
 
         if let Err(error) = self
-            .apply_file_edit_fault_injection(&path, timeout, fault_injection)
+            .apply_file_edit_fault_injection(&path, timeout, fault_injection, privilege)
             .await
         {
             return Ok(file_edit_error_result(error));
@@ -77,6 +81,7 @@ impl SshMcpServer {
                 action,
                 expected: expected_state,
                 timeout,
+                privilege,
             })
             .await
         {

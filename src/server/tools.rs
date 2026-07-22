@@ -94,7 +94,7 @@ EXAMPLE:
 {"remote_path": "/etc/nginx/nginx.conf", "mode": "preview"}"#;
 
     pub const APPLY_PATCH: &str = r#"APPLY_PATCH TOOL
-Create, update, or delete one remote UTF-8 text file with an exact patch.
+Create, update, or delete one remote UTF-8 text file as the SSH user with an exact patch.
 
 PARAMETERS:
 - patch (string, required): One-file patch envelope using an absolute remote path
@@ -110,10 +110,26 @@ BEHAVIOR:
 - Add requires a missing path; Update and Delete require an existing UTF-8 regular file
 - Resulting content is limited to 1048576 bytes and the parent directory must exist
 - The tool reads the current file itself and rejects concurrent changes before commit
+- Never elevates privileges; use sudo_apply_patch only when explicitly authorized
 - Patch planning and remote commit failures return structured tool errors
 
 EXAMPLE:
 {"patch":"*** Begin Patch\n*** Delete File: /tmp/old.conf\n*** End Patch"}"#;
+
+    pub const SUDO_APPLY_PATCH: &str = r#"SUDO_APPLY_PATCH TOOL
+Apply the same exact, conflict-checked one-file patch as apply_patch, but read and commit under sudo.
+
+PARAMETERS:
+- patch (string, required): One-file Add/Update/Delete patch using an absolute remote path
+
+BEHAVIOR:
+- Uses the same parser, snapshot SHA check, lock, staging, and atomic commit as apply_patch
+- Privilege elevation is explicit and never used as an automatic fallback
+- Requires passwordless sudo or a configured sudo password
+- Disabled together with sudo_shell by --disable-sudo
+
+EXAMPLE:
+{"patch":"*** Begin Patch\n*** Update File: /etc/example.conf\n@@\n-old\n+new\n*** End Patch"}"#;
 }
 
 fn command_tool(
@@ -273,6 +289,20 @@ pub(super) fn read_file_tool() -> Tool {
 }
 
 pub(super) fn apply_patch_tool() -> Tool {
+    patch_tool(
+        "apply_patch",
+        "Apply one exact patch as the SSH user; never elevates privileges.",
+    )
+}
+
+pub(super) fn sudo_apply_patch_tool() -> Tool {
+    patch_tool(
+        "sudo_apply_patch",
+        "Apply one exact, conflict-checked remote file patch under sudo.",
+    )
+}
+
+fn patch_tool(name: &'static str, description: &'static str) -> Tool {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -286,11 +316,7 @@ pub(super) fn apply_patch_tool() -> Tool {
     });
 
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
-    Tool::new(
-        "apply_patch",
-        "Apply one exact Add/Update/Delete patch to a remote UTF-8 text file.",
-        Arc::new(schema_obj),
-    )
+    Tool::new(name, description, Arc::new(schema_obj))
 }
 
 pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
@@ -300,6 +326,7 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         "transfer" => Some(tool_docs::TRANSFER),
         "read" => Some(tool_docs::READ),
         "apply_patch" => Some(tool_docs::APPLY_PATCH),
+        "sudo_apply_patch" => Some(tool_docs::SUDO_APPLY_PATCH),
         _ => None,
     }
 }

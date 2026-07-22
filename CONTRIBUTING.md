@@ -38,7 +38,7 @@ cargo test --test docker_integration_test
 **What the integration tests verify:**
 - SSH connection establishment with the remote server
 - The `shell` tool runs commands as the authenticated user
-- The `sudo_shell` tool runs commands with elevated privileges
+- The `sudo_shell` and `sudo_apply_patch` tools run with explicitly requested elevated privileges
 - Proper MCP protocol handling and response formatting
 
 Note: The integration test is designed to be resilient. Even if `sudo` fails due to container configuration, the test will pass as long as the MCP protocol handling is working correctly.

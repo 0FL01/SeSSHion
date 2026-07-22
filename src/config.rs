@@ -84,7 +84,7 @@ pub struct Args {
     #[arg(long = "maxChars", env = "SSH_MCP_MAX_CHARS")]
     pub max_chars: Option<String>,
 
-    /// Disable the sudo_shell tool
+    /// Disable the sudo_shell and sudo_apply_patch tools
     #[arg(long, default_value = "false", env = "SSH_MCP_DISABLE_SUDO")]
     pub disable_sudo: bool,
 
@@ -180,7 +180,7 @@ pub struct Config {
     /// Maximum output tokens for command execution (None = unlimited)
     pub max_output_tokens: Option<usize>,
 
-    /// Whether sudo_shell tool is disabled
+    /// Whether sudo_shell and sudo_apply_patch tools are disabled
     pub disable_sudo: bool,
 
     /// Keepalive interval in seconds

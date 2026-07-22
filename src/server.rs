@@ -24,6 +24,7 @@ use crate::config::Config;
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
+use crate::server::handlers::file_edit_common::{FileEditFaultInjection, FileEditPrivilege};
 #[cfg(test)]
 use crate::server::validation::read_file::{
     READ_FILE_BYTES_PER_TOKEN, READ_FILE_DEFAULT_PREVIEW_LINES, READ_FILE_HARD_MAX_BYTES,
@@ -465,6 +466,11 @@ impl SshMcpServer {
         tools::apply_patch_tool()
     }
 
+    /// Build sudo_apply_patch tool definition
+    fn sudo_apply_patch_tool() -> Tool {
+        tools::sudo_apply_patch_tool()
+    }
+
     /// Get extended documentation for a tool by name
     ///
     /// Returns the full documentation text that was removed from compact tool definitions
@@ -562,9 +568,10 @@ impl ServerHandler for SshMcpServer {
 
         let mut tools = vec![Self::shell_tool()];
 
-        // Docs/expected order: shell, (optional) sudo_shell, check_process, transfer, read, apply_patch.
+        // Docs/expected order: shell, optional sudo tools, check_process, transfer, read, apply_patch.
         if !self.config.disable_sudo {
             tools.push(Self::sudo_shell_tool());
+            tools.push(Self::sudo_apply_patch_tool());
         }
         tools.push(Self::check_process_tool());
         tools.push(Self::transfer_tool());
@@ -642,7 +649,24 @@ impl ServerHandler for SshMcpServer {
                 let params: ApplyPatchParams = self.parse_tool_params(args, "apply_patch")?;
                 self.execute_apply_patch(
                     params,
-                    crate::server::handlers::file_edit_common::FileEditFaultInjection::None,
+                    FileEditFaultInjection::None,
+                    FileEditPrivilege::User,
+                )
+                .await
+            }
+            "sudo_apply_patch" => {
+                if self.config.disable_sudo {
+                    return Err(McpError::invalid_params(
+                        "sudo_apply_patch tool is disabled",
+                        None,
+                    ));
+                }
+
+                let params: ApplyPatchParams = self.parse_tool_params(args, "sudo_apply_patch")?;
+                self.execute_apply_patch(
+                    params,
+                    FileEditFaultInjection::None,
+                    FileEditPrivilege::Sudo,
                 )
                 .await
             }
@@ -707,6 +731,13 @@ mod tests {
     fn test_apply_patch_tool_definition() {
         let tool = SshMcpServer::apply_patch_tool();
         assert_eq!(tool.name.as_ref(), "apply_patch");
+        assert!(tool.description.is_some());
+    }
+
+    #[test]
+    fn test_sudo_apply_patch_tool_definition() {
+        let tool = SshMcpServer::sudo_apply_patch_tool();
+        assert_eq!(tool.name.as_ref(), "sudo_apply_patch");
         assert!(tool.description.is_some());
     }
 
@@ -986,6 +1017,7 @@ mod tests {
         assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
         assert!(SshMcpServer::get_tool_documentation("read").is_some());
         assert!(SshMcpServer::get_tool_documentation("apply_patch").is_some());
+        assert!(SshMcpServer::get_tool_documentation("sudo_apply_patch").is_some());
         assert!(SshMcpServer::get_tool_documentation("write-file").is_none());
         assert!(SshMcpServer::get_tool_documentation("replace-in-file").is_none());
         assert!(SshMcpServer::get_tool_documentation("unknown").is_none());
@@ -1036,6 +1068,13 @@ mod tests {
     }
 
     #[test]
+    fn test_sudo_apply_patch_documentation_content() {
+        let docs = SshMcpServer::get_tool_documentation("sudo_apply_patch").unwrap();
+        assert!(docs.contains("SUDO_APPLY_PATCH TOOL"));
+        assert!(docs.contains("sudo"));
+    }
+
+    #[test]
     fn test_compact_tool_descriptions() {
         // Verify that tool descriptions are compact (not verbose)
         let shell = SshMcpServer::shell_tool();
@@ -1043,6 +1082,7 @@ mod tests {
         let transfer = SshMcpServer::transfer_tool();
         let read_file = SshMcpServer::read_file_tool();
         let apply_patch = SshMcpServer::apply_patch_tool();
+        let sudo_apply_patch = SshMcpServer::sudo_apply_patch_tool();
 
         // Descriptions should be present but concise (under 100 chars)
         if let Some(desc) = shell.description {
@@ -1077,6 +1117,13 @@ mod tests {
             assert!(
                 desc.len() < 100,
                 "apply_patch description too long: {} chars",
+                desc.len()
+            );
+        }
+        if let Some(desc) = sudo_apply_patch.description {
+            assert!(
+                desc.len() < 100,
+                "sudo_apply_patch description too long: {} chars",
                 desc.len()
             );
         }

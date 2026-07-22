@@ -28,7 +28,7 @@
 ///
 /// // Sudo with password
 /// let cmd = wrap_sudo_command("apt update", Some("mypassword"));
-/// assert_eq!(cmd, "printf '%s\\n' 'mypassword' | sudo -S sh -c 'apt update'");
+/// assert_eq!(cmd, "printf '%s\\n' 'mypassword' | sudo -S -p '' sh -c 'apt update'");
 /// ```
 pub fn wrap_sudo_command(command: &str, password: Option<&str>) -> String {
     let escaped_command = escape_for_shell(command);
@@ -43,7 +43,7 @@ pub fn wrap_sudo_command(command: &str, password: Option<&str>) -> String {
             // PTY/stdin handling on the SSH channel and is simpler and more reliable.
             let escaped_pwd = escape_for_shell(pwd);
             format!(
-                "printf '%s\\n' '{}' | sudo -S sh -c '{}'",
+                "printf '%s\\n' '{}' | sudo -S -p '' sh -c '{}'",
                 escaped_pwd, escaped_command
             )
         }
@@ -119,7 +119,7 @@ mod tests {
         let result = wrap_sudo_command("apt update", Some("secret123"));
         assert_eq!(
             result,
-            "printf '%s\\n' 'secret123' | sudo -S sh -c 'apt update'"
+            "printf '%s\\n' 'secret123' | sudo -S -p '' sh -c 'apt update'"
         );
     }
 
@@ -134,7 +134,7 @@ mod tests {
         let result = wrap_sudo_command("apt update", Some("pass'word"));
         assert_eq!(
             result,
-            "printf '%s\\n' 'pass'\"'\"'word' | sudo -S sh -c 'apt update'"
+            "printf '%s\\n' 'pass'\"'\"'word' | sudo -S -p '' sh -c 'apt update'"
         );
     }
 
@@ -143,7 +143,7 @@ mod tests {
         let result = wrap_sudo_command("cat /etc/shadow | grep root", Some("admin123"));
         assert_eq!(
             result,
-            "printf '%s\\n' 'admin123' | sudo -S sh -c 'cat /etc/shadow | grep root'"
+            "printf '%s\\n' 'admin123' | sudo -S -p '' sh -c 'cat /etc/shadow | grep root'"
         );
     }
 

@@ -9,6 +9,7 @@
 //! - `check_process` - Check if a process is still running and read its log
 //! - `read` - Read UTF-8 text files from the remote SSH server
 //! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
+//! - `sudo_apply_patch` - Apply the same exact patch under sudo
 //!
 //! See `server.rs` for the implementation.
 

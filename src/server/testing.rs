@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rmcp::{ErrorData as McpError, model::CallToolResult};
 
-use crate::server::handlers::file_edit_common::FileEditFaultInjection;
+use crate::server::handlers::file_edit_common::{FileEditFaultInjection, FileEditPrivilege};
 use crate::server::{ReadFileMode, SshMcpServer};
 use crate::tools::{ApplyPatchParams, CheckProcessParams, ReadFileParams};
 
@@ -90,8 +90,25 @@ impl SshMcpServer {
         &self,
         patch: &str,
     ) -> std::result::Result<CallToolResult, McpError> {
-        self.test_apply_patch_with_fault(patch, FileEditFaultInjection::None)
-            .await
+        self.test_apply_patch_with_fault(
+            patch,
+            FileEditFaultInjection::None,
+            FileEditPrivilege::User,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_sudo_apply_patch(
+        &self,
+        patch: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.test_apply_patch_with_fault(
+            patch,
+            FileEditFaultInjection::None,
+            FileEditPrivilege::Sudo,
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -99,20 +116,39 @@ impl SshMcpServer {
         &self,
         patch: &str,
     ) -> std::result::Result<CallToolResult, McpError> {
-        self.test_apply_patch_with_fault(patch, FileEditFaultInjection::PartialMutateBeforeWrite)
-            .await
+        self.test_apply_patch_with_fault(
+            patch,
+            FileEditFaultInjection::PartialMutateBeforeWrite,
+            FileEditPrivilege::User,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_sudo_apply_patch_mutate_before_commit(
+        &self,
+        patch: &str,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.test_apply_patch_with_fault(
+            patch,
+            FileEditFaultInjection::PartialMutateBeforeWrite,
+            FileEditPrivilege::Sudo,
+        )
+        .await
     }
 
     async fn test_apply_patch_with_fault(
         &self,
         patch: &str,
         fault: FileEditFaultInjection,
+        privilege: FileEditPrivilege,
     ) -> std::result::Result<CallToolResult, McpError> {
         self.execute_apply_patch(
             ApplyPatchParams {
                 patch: patch.to_owned(),
             },
             fault,
+            privilege,
         )
         .await
     }

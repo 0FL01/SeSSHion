@@ -5,18 +5,18 @@
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
 [![crates.io](https://img.shields.io/crates/v/ssh-mcp-rs.svg)](https://crates.io/crates/ssh-mcp-rs)
 
-Capability-bound SSH MCP for autonomous DevOps agents: six composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
+Capability-bound SSH MCP for autonomous DevOps agents: composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
 
-`ssh-mcp` is a Rust [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session. It exposes exactly six tools — nothing more — and is built to keep agent context small and operations deterministic.
+`ssh-mcp` is a Rust [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session. It exposes five base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
 
 ## Why
 
-- **Capability-bound surface.** Six composable primitives, no open-ended remote API. The agent can only run commands, read files, patch one file, transfer files, and inspect background jobs.
+- **Capability-bound surface.** Five base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, read files, patch one file, transfer files, and inspect background jobs.
 - **Deterministic long-running jobs.** `background=true` returns `{job_id, pid, log_path}` immediately; output streams to a local log you poll with `check_process`, avoiding client RPC deadlines.
 - **Bounded context.** `read` defaults to a safe preview with token estimates; shell output is capped by `--max-output-tokens`. Large files cannot bomb the agent's context window.
-- **Atomic remote edits.** `apply_patch` applies one exact Add/Update/Delete patch with conflict detection and atomic commit — no fuzzy matching, no silent overwrites.
+- **Atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo.
 
-## The six primitives
+## Tools
 
 | Tool | Purpose |
 |------|---------|
@@ -25,6 +25,7 @@ Capability-bound SSH MCP for autonomous DevOps agents: six composable primitives
 | `check_process` | Poll a background job by `job_id` and read the tail of its local log. |
 | `read` | Read a remote UTF-8 file with `preview` / `head` / `tail` / `full` modes and token estimates. |
 | `apply_patch` | Create, update, or delete one remote UTF-8 file with an exact patch (atomic, conflict-checked). |
+| `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
 | `transfer` | Move files/directories (`put`/`get`) via `auto` → `rsync` → `sftp` → `scp` → `exec-raw`. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
@@ -154,7 +155,7 @@ Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
 | `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell/read output token limit (default: 16000 ≈ 64KB; `none` to disable) |
-| `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` tool |
+| `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` and `sudo_apply_patch` tools |
 
 Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key options).
 
@@ -186,6 +187,7 @@ Background tracking requires the MCP server and its SSH session to remain alive;
 - **Path validation.** Rejects control characters, traversal (`..`), and shell-injection shapes.
 - **Binary protection.** Text tools reject non-UTF-8 content to prevent corruption.
 - **Atomic edits.** Staging with automatic cleanup and conflict detection; no silent overwrites.
+- **Explicit elevation.** `apply_patch` never retries under sudo; privileged edits require an explicit `sudo_apply_patch` call.
 
 ## Documentation
 

@@ -10,11 +10,40 @@ use crate::server::make_job_id;
 use crate::server::validation::file_edit::*;
 use crate::server::validation::read_file::sanitize_read_file_stderr_snippet;
 use crate::shell_escape::escape_for_shell;
+use crate::ssh::wrap_sudo_command;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(in crate::server) enum FileEditFaultInjection {
     None,
     PartialMutateBeforeWrite,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(in crate::server) enum FileEditPrivilege {
+    User,
+    Sudo,
+}
+
+impl FileEditPrivilege {
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::User => "apply_patch",
+            Self::Sudo => "sudo_apply_patch",
+        }
+    }
+
+    fn permission_error(self, operation: &str) -> FileEditError {
+        let suffix = match self {
+            Self::User => {
+                "; apply_patch does not elevate privileges; use sudo_apply_patch only when explicitly authorized"
+            }
+            Self::Sudo => " while running sudo_apply_patch",
+        };
+        FileEditError::remote(
+            "permission_denied",
+            format!("current remote identity cannot {operation}{suffix}"),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -39,6 +68,12 @@ pub(in crate::server) struct FileCommitRequest<'a> {
     pub action: FileCommitAction<'a>,
     pub expected: FileExpectedState,
     pub timeout: Duration,
+    pub privilege: FileEditPrivilege,
+}
+
+struct RemoteSudoPayload {
+    dir: String,
+    path: String,
 }
 
 #[derive(Debug)]
@@ -84,6 +119,7 @@ impl SshMcpServer {
         &self,
         remote_path: &str,
         timeout: Duration,
+        privilege: FileEditPrivilege,
     ) -> Result<RemoteTextFileState, FileEditError> {
         if let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
@@ -108,8 +144,9 @@ impl SshMcpServer {
 
         let escaped_path = escape_for_shell(remote_path);
         let read_cmd = format!(
-            r#"sh -c 'set -eu; p=$1; max=$2; if [ ! -e "$p" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}not_found" >&2; exit 1; fi; if [ ! -f "$p" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}not_regular_file" >&2; exit 1; fi; size=$(stat -c %s "$p" 2>/dev/null || stat -f %z "$p" 2>/dev/null || printf 0); if [ "$size" -gt "$max" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}too_large" >&2; exit 1; fi; head -c "$((max + 1))" < "$p"' sh '{escaped_path}' '{FILE_EDIT_HARD_MAX_BYTES}'"#,
+            r#"sh -c 'set -eu; p=$1; max=$2; if [ ! -e "$p" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}not_found" >&2; exit 1; fi; if [ ! -f "$p" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}not_regular_file" >&2; exit 1; fi; if [ ! -r "$p" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}permission_denied" >&2; exit 1; fi; size=$(stat -c %s "$p" 2>/dev/null || stat -f %z "$p" 2>/dev/null || printf 0); if [ "$size" -gt "$max" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}too_large" >&2; exit 1; fi; head -c "$((max + 1))" < "$p"' sh '{escaped_path}' '{FILE_EDIT_HARD_MAX_BYTES}'"#,
         );
+        let read_cmd = self.file_edit_command(&read_cmd, privilege);
 
         let mut empty_stdin = tokio::io::empty();
         let exec_result = self
@@ -150,6 +187,7 @@ impl SshMcpServer {
                     "not_regular_file",
                     "remote path is not a regular file",
                 )),
+                "permission_denied" => Err(privilege.permission_error("read the remote file")),
                 "too_large" => Err(FileEditError::remote(
                     "limit_exceeded",
                     format!(
@@ -206,6 +244,7 @@ impl SshMcpServer {
         remote_path: &str,
         timeout: Duration,
         fault_injection: FileEditFaultInjection,
+        privilege: FileEditPrivilege,
     ) -> Result<(), FileEditError> {
         let injected_cmd = match fault_injection {
             FileEditFaultInjection::PartialMutateBeforeWrite => {
@@ -220,6 +259,7 @@ impl SshMcpServer {
         let Some(injected_cmd) = injected_cmd else {
             return Ok(());
         };
+        let injected_cmd = self.file_edit_command(&injected_cmd, privilege);
         let out = self
             .connection
             .exec_command(&injected_cmd, timeout)
@@ -249,6 +289,7 @@ impl SshMcpServer {
             action,
             expected,
             timeout,
+            privilege,
         } = request;
 
         let new_content = match action {
@@ -283,22 +324,55 @@ impl SshMcpServer {
         let new_sha256 = new_content.map(local_text_sha256_hex);
         let remote_lock_dir = format!("{remote_path}.ssh-mcp-lock");
         let remote_stage_path = format!("{remote_path}.ssh-mcp-stage-{}", make_job_id());
+        let local_tmp_path = if let Some(content) = new_content {
+            Some(self.write_local_stage(content).await?)
+        } else {
+            None
+        };
+        let remote_payload = if privilege == FileEditPrivilege::Sudo {
+            match (local_tmp_path.as_ref(), new_sha256.as_deref()) {
+                (Some(path), Some(expected_new)) => {
+                    match self
+                        .upload_remote_sudo_payload(path, expected_new, timeout)
+                        .await
+                    {
+                        Ok(payload) => Some(payload),
+                        Err(error) => {
+                            let _ = tokio::fs::remove_file(path).await;
+                            return Err(error);
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let remote_payload_path = remote_payload
+            .as_ref()
+            .map(|payload| payload.path.as_str())
+            .unwrap_or("-");
+        let remote_payload_dir = remote_payload
+            .as_ref()
+            .map(|payload| payload.dir.as_str())
+            .unwrap_or("-");
         let apply_cmd = format!(
-            r#"sh -c 'set -eu; dst=$1; expected=$2; operation=$3; expected_new=$4; lock_dir=$5; stage=$6; missing_sha=$7; stale_after_secs=$8; \
+            r#"sh -c 'set -eu; dst=$1; expected=$2; operation=$3; expected_new=$4; lock_dir=$5; stage=$6; missing_sha=$7; stale_after_secs=$8; source=$9; source_dir=${{10}}; tool_name=${{11}}; \
               sha256_file() {{ file=$1; if command -v sha256sum >/dev/null 2>&1; then set -- $(sha256sum -- "$file"); printf "%s\n" "$1"; return 0; fi; if command -v shasum >/dev/null 2>&1; then set -- $(shasum -a 256 -- "$file"); printf "%s\n" "$1"; return 0; fi; return 1; }}; \
               reclaim_stale_lock() {{ now_epoch=$1; lock_started_path=$lock_dir/started_at; lock_operation_path=$lock_dir/operation; if [ ! -f "$lock_started_path" ]; then return 1; fi; if ! IFS= read -r lock_started_at < "$lock_started_path"; then return 1; fi; case "$lock_started_at" in ""|*[!0-9]*) return 1 ;; esac; if [ "$lock_started_at" -gt "$now_epoch" ]; then return 1; fi; lock_age=$((now_epoch - lock_started_at)); if [ "$lock_age" -lt "$stale_after_secs" ]; then return 1; fi; rm -f -- "$lock_started_path" "$lock_operation_path" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null; }}; \
-              lock_started_path=$lock_dir/started_at; lock_operation_path=$lock_dir/operation; cleanup() {{ rm -f -- "$stage" "$lock_started_path" "$lock_operation_path" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null || true; }}; trap cleanup EXIT INT TERM; \
+              lock_started_path=$lock_dir/started_at; lock_operation_path=$lock_dir/operation; cleanup() {{ rm -f -- "$stage" "$lock_started_path" "$lock_operation_path" 2>/dev/null || true; rmdir -- "$lock_dir" 2>/dev/null || true; if [ "$source" != "-" ]; then rm -f -- "$source" 2>/dev/null || true; rmdir -- "$source_dir" 2>/dev/null || true; fi; }}; trap cleanup EXIT INT TERM; \
               parent=${{dst%/*}}; if [ -z "$parent" ]; then parent=/; fi; if [ ! -d "$parent" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}parent_not_found" >&2; exit 1; fi; \
+              if [ ! -w "$parent" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}permission_denied" >&2; exit 1; fi; \
               if ! sha256_file /dev/null >/dev/null 2>&1; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; \
-              if [ "$operation" = "write" ]; then if ! : > "$stage" 2>/dev/null; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}staging_unwritable" >&2; exit 1; fi; if ! cat > "$stage"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}stage_write_failed" >&2; exit 1; fi; if ! stage_hash=$(sha256_file "$stage"); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; if [ "$stage_hash" != "$expected_new" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}stage_hash_mismatch" >&2; exit 1; fi; fi; \
+              if [ "$operation" = "write" ]; then if ! ( : > "$stage" ); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}staging_unwritable" >&2; exit 1; fi; if [ "$source" = "-" ]; then if ! cat > "$stage"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}stage_write_failed" >&2; exit 1; fi; elif ! cat -- "$source" > "$stage"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}stage_write_failed" >&2; exit 1; fi; if ! stage_hash=$(sha256_file "$stage"); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; if [ "$stage_hash" != "$expected_new" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}stage_hash_mismatch" >&2; exit 1; fi; fi; \
               lock_spins=0; while ! mkdir -- "$lock_dir" 2>/dev/null; do if [ -d "$lock_dir" ]; then if now_epoch=$(date +%s 2>/dev/null); then if reclaim_stale_lock "$now_epoch"; then continue; fi; fi; lock_spins=$((lock_spins + 1)); if [ "$lock_spins" -ge {FILE_EDIT_LOCK_MAX_SPINS} ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}lock_busy" >&2; exit 1; fi; sleep 1; continue; fi; printf "%s\n" "{FILE_EDIT_ERROR_MARKER}lock_acquire_failed" >&2; exit 1; done; \
-              if now_epoch=$(date +%s 2>/dev/null); then printf "%s\n" "$now_epoch" > "$lock_started_path" 2>/dev/null || true; fi; printf "%s\n" "apply_patch" > "$lock_operation_path" 2>/dev/null || true; \
+              if now_epoch=$(date +%s 2>/dev/null); then printf "%s\n" "$now_epoch" > "$lock_started_path" 2>/dev/null || true; fi; printf "%s\n" "$tool_name" > "$lock_operation_path" 2>/dev/null || true; \
               if [ -e "$dst" ]; then if [ ! -f "$dst" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}not_regular_file" >&2; exit 1; fi; if ! current_hash=$(sha256_file "$dst"); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; else current_hash=$missing_sha; fi; \
               if [ "$current_hash" != "$expected" ]; then printf "%s\n" "{FILE_EDIT_CONFLICT_MARKER}" >&2; exit 3; fi; \
               if [ "$operation" = "delete" ]; then if ! rm -- "$dst"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; \
-              elif [ "$expected" = "$missing_sha" ]; then if ! ln -- "$stage" "$dst" 2>/dev/null; then if [ -e "$dst" ]; then printf "%s\n" "{FILE_EDIT_CONFLICT_MARKER}" >&2; exit 3; fi; printf "%s\n" "{FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; rm -f -- "$stage"; \
+              elif [ "$expected" = "$missing_sha" ]; then if ! ln -- "$stage" "$dst"; then if [ -e "$dst" ]; then printf "%s\n" "{FILE_EDIT_CONFLICT_MARKER}" >&2; exit 3; fi; printf "%s\n" "{FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; rm -f -- "$stage"; \
               else if ! mv -- "$stage" "$dst"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}finalize_failed" >&2; exit 1; fi; fi; \
-              trap - EXIT INT TERM; cleanup' sh '{}' '{}' '{}' '{}' '{}' '{}' '{}' '{}'"#,
+              trap - EXIT INT TERM; cleanup' sh '{}' '{}' '{}' '{}' '{}' '{}' '{}' '{}' '{}' '{}' '{}'"#,
             escape_for_shell(remote_path),
             escape_for_shell(&expected_sha256),
             escape_for_shell(operation),
@@ -307,15 +381,15 @@ impl SshMcpServer {
             escape_for_shell(&remote_stage_path),
             escape_for_shell(FILE_EDIT_MISSING_SHA256),
             escape_for_shell(&FILE_EDIT_LOCK_STALE_AFTER_SECS.to_string()),
+            escape_for_shell(remote_payload_path),
+            escape_for_shell(remote_payload_dir),
+            escape_for_shell(privilege.tool_name()),
         );
-
-        let local_tmp_path = if let Some(content) = new_content {
-            Some(self.write_local_stage(content).await?)
-        } else {
-            None
-        };
+        let apply_cmd = self.file_edit_command(&apply_cmd, privilege);
         let mut sink = tokio::io::sink();
-        let out = if let Some(path) = local_tmp_path.as_ref() {
+        let out = if privilege == FileEditPrivilege::User
+            && let Some(path) = local_tmp_path.as_ref()
+        {
             let mut input = tokio::fs::File::open(path).await.map_err(|e| {
                 FileEditError::remote(
                     "local_io",
@@ -334,8 +408,14 @@ impl SshMcpServer {
         if let Some(path) = local_tmp_path {
             let _ = tokio::fs::remove_file(path).await;
         }
+        if let Some(payload) = remote_payload.as_ref() {
+            self.cleanup_remote_sudo_payload(payload, timeout).await;
+        }
         let out = out.map_err(|e| {
-            FileEditError::remote("remote_commit_failed", format!("apply_patch failed: {e}"))
+            FileEditError::remote(
+                "remote_commit_failed",
+                format!("{} failed: {e}", privilege.tool_name()),
+            )
         })?;
 
         if has_file_edit_conflict_marker(&out.stderr) {
@@ -349,6 +429,9 @@ impl SshMcpServer {
                     "parent_not_found",
                     "remote parent directory does not exist",
                 ),
+                "permission_denied" => {
+                    privilege.permission_error("write in the remote parent directory")
+                }
                 "not_regular_file" => {
                     FileEditError::remote("not_regular_file", "remote path is not a regular file")
                 }
@@ -360,26 +443,135 @@ impl SshMcpServer {
                     "stage_hash_mismatch",
                     "uploaded staging file SHA-256 did not match planned content",
                 ),
-                "lock_acquire_failed" => {
-                    FileEditError::remote("lock_failed", "failed to acquire remote edit lock")
-                }
-                "staging_unwritable" | "stage_write_failed" => {
-                    FileEditError::remote("stage_failed", "failed to write remote staging file")
-                }
-                "finalize_failed" => {
-                    FileEditError::remote("finalize_failed", "failed to finalize remote edit")
-                }
-                _ => FileEditError::remote("remote_commit_failed", "apply_patch failed remotely"),
+                "lock_acquire_failed" => remote_error_with_stderr(
+                    "lock_failed",
+                    "failed to create the remote edit lock; check parent-directory permissions and filesystem state",
+                    &out.stderr,
+                ),
+                "staging_unwritable" | "stage_write_failed" => remote_error_with_stderr(
+                    "stage_failed",
+                    "failed to write the remote staging file next to the target; check parent-directory permissions, free space, and filesystem state",
+                    &out.stderr,
+                ),
+                "finalize_failed" => remote_error_with_stderr(
+                    "finalize_failed",
+                    "failed to replace or delete the remote path; check ownership, parent-directory permissions, sticky bit, and read-only filesystem state",
+                    &out.stderr,
+                ),
+                _ => FileEditError::remote(
+                    "remote_commit_failed",
+                    format!("{} failed remotely", privilege.tool_name()),
+                ),
             });
         }
         if out.exit_code != Some(0) {
             return Err(FileEditError::remote(
                 "remote_commit_failed",
-                remote_failure_message("apply patch", out.exit_code, &out.stderr),
+                remote_failure_message(privilege.tool_name(), out.exit_code, &out.stderr),
             ));
         }
 
         Ok(())
+    }
+
+    fn file_edit_command(&self, command: &str, privilege: FileEditPrivilege) -> String {
+        match privilege {
+            FileEditPrivilege::User => command.to_owned(),
+            FileEditPrivilege::Sudo => {
+                wrap_sudo_command(command, self.connection.get_sudo_password())
+            }
+        }
+    }
+
+    async fn upload_remote_sudo_payload(
+        &self,
+        local_path: &std::path::Path,
+        expected_sha256: &str,
+        timeout: Duration,
+    ) -> Result<RemoteSudoPayload, FileEditError> {
+        let remote_dir = format!("/tmp/.ssh-mcp-sudo-patch-{}", make_job_id());
+        let remote_path = format!("{remote_dir}/payload");
+        let command = format!(
+            r#"sh -c 'set -eu; dir=$1; payload=$2; expected=$3; sha256_file() {{ file=$1; if command -v sha256sum >/dev/null 2>&1; then set -- $(sha256sum -- "$file"); printf "%s\n" "$1"; return 0; fi; if command -v shasum >/dev/null 2>&1; then set -- $(shasum -a 256 -- "$file"); printf "%s\n" "$1"; return 0; fi; return 1; }}; umask 077; if ! mkdir -- "$dir" 2>/dev/null; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sudo_payload_create_failed" >&2; exit 1; fi; cleanup() {{ rm -f -- "$payload" 2>/dev/null || true; rmdir -- "$dir" 2>/dev/null || true; }}; trap cleanup EXIT INT TERM; if ! cat > "$payload"; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sudo_payload_write_failed" >&2; exit 1; fi; if ! actual=$(sha256_file "$payload"); then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}sha256_unavailable" >&2; exit 1; fi; if [ "$actual" != "$expected" ]; then printf "%s\n" "{FILE_EDIT_ERROR_MARKER}stage_hash_mismatch" >&2; exit 1; fi; trap - EXIT INT TERM' sh '{}' '{}' '{}'"#,
+            escape_for_shell(&remote_dir),
+            escape_for_shell(&remote_path),
+            escape_for_shell(expected_sha256),
+        );
+        let mut input = tokio::fs::File::open(local_path).await.map_err(|e| {
+            FileEditError::remote(
+                "local_io",
+                format!("failed to open local sudo staging file: {e}"),
+            )
+        })?;
+        let mut sink = tokio::io::sink();
+        let out = self
+            .connection
+            .exec_raw_streaming(&command, Some(&mut input), Some(&mut sink), timeout)
+            .await
+            .map_err(|e| {
+                FileEditError::remote(
+                    "stage_failed",
+                    format!("failed to upload private sudo_apply_patch payload: {e}"),
+                )
+            })?;
+
+        if let Some(marker) = parse_file_edit_error_marker(&out.stderr) {
+            return Err(match marker {
+                "sudo_payload_create_failed" | "sudo_payload_write_failed" => {
+                    remote_error_with_stderr(
+                        "stage_failed",
+                        "failed to create a private sudo_apply_patch payload under /tmp",
+                        &out.stderr,
+                    )
+                }
+                "sha256_unavailable" => FileEditError::remote(
+                    "sha256_unavailable",
+                    "remote host does not provide SHA-256 utilities",
+                ),
+                "stage_hash_mismatch" => FileEditError::remote(
+                    "stage_hash_mismatch",
+                    "uploaded sudo_apply_patch payload SHA-256 did not match planned content",
+                ),
+                _ => FileEditError::remote(
+                    "stage_failed",
+                    "failed to upload private sudo_apply_patch payload",
+                ),
+            });
+        }
+        if out.exit_code != Some(0) {
+            return Err(FileEditError::remote(
+                "stage_failed",
+                remote_failure_message(
+                    "upload sudo_apply_patch payload",
+                    out.exit_code,
+                    &out.stderr,
+                ),
+            ));
+        }
+
+        Ok(RemoteSudoPayload {
+            dir: remote_dir,
+            path: remote_path,
+        })
+    }
+
+    async fn cleanup_remote_sudo_payload(&self, payload: &RemoteSudoPayload, timeout: Duration) {
+        let command = format!(
+            "sh -c 'rm -f -- \"$1\" 2>/dev/null || true; rmdir -- \"$2\" 2>/dev/null || true' sh '{}' '{}'",
+            escape_for_shell(&payload.path),
+            escape_for_shell(&payload.dir),
+        );
+        let mut empty = tokio::io::empty();
+        let mut sink = tokio::io::sink();
+        let _ = self
+            .connection
+            .exec_raw_streaming(
+                &command,
+                Some(&mut empty),
+                Some(&mut sink),
+                timeout.min(Duration::from_secs(5)),
+            )
+            .await;
     }
 
     async fn write_local_stage(&self, content: &str) -> Result<std::path::PathBuf, FileEditError> {
@@ -414,6 +606,21 @@ impl SshMcpServer {
         }
         Ok(local_tmp_path)
     }
+}
+
+fn remote_error_with_stderr(kind: &'static str, message: &str, stderr: &str) -> FileEditError {
+    let details = stderr
+        .lines()
+        .filter(|line| {
+            !line.contains(FILE_EDIT_ERROR_MARKER) && !line.contains(FILE_EDIT_CONFLICT_MARKER)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let message = match sanitize_read_file_stderr_snippet(&details) {
+        Some(snippet) => format!("{message}; stderr={snippet}"),
+        None => message.to_owned(),
+    };
+    FileEditError::remote(kind, message)
 }
 
 fn remote_failure_message(operation: &str, exit_code: Option<u32>, stderr: &str) -> String {

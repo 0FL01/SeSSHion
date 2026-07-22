@@ -4,6 +4,31 @@
 
 Главное архитектурное изменение: **MCP-handler не должен вызывать другой MCP-handler и разбирать его JSON**. Нужны отдельные типизированные компоненты: parser → planner → remote snapshot store → transaction committer. Ticket сейчас смешивает workflow-проверку «сначала прочитай» и optimistic locking, причём обе задачи решает ненадёжно.
 
+## Дополнение 2026-07-22: права и sudo
+
+Status: implemented; focused unit and Docker validation completed on 2026-07-22.
+
+Текущий `apply_patch` всегда выполняет snapshot и commit от имени обычного SSH-пользователя через `exec_raw_streaming`. Он не использует `sudo`, не переходит на интерактивный `su`-канал и не наследует возможности отдельного `sudo_shell`. Поэтому readable, но недоступный для атомарной замены файл заканчивается ошибкой staging, lock или finalize.
+
+Это должна быть явная privilege boundary:
+
+* обычный `apply_patch` никогда не повышает права автоматически и не повторяет операцию через sudo;
+* отказ из-за недоступного parent/staging/finalize должен возвращать стабильную actionable-ошибку, объясняющую, что `apply_patch` не повышает права;
+* агент не должен молча переходить на `sudo_shell`: ручной `sed`/`cat` обходит parser, snapshot SHA, lock и atomic commit;
+* простой вызов `wrap_sudo_command(apply_cmd, password)` недопустим: patch-контент уже передаётся через stdin, а password-based `sudo -S` использует тот же stdin для пароля и может поглотить payload.
+
+План разделяется на две границы scope:
+
+1. Сначала сделать непривилегированный путь правдивым: распознавать недоступный для записи parent, не терять sanitized stderr при stage/lock/finalize, возвращать `permission_denied` там, где отсутствие доступа подтверждено, и гарантировать отсутствие частичной мутации.
+2. Для привилегированного edit добавлен явно разрешаемый `sudo_apply_patch`, а не fallback внутри `apply_patch`. Отдельное имя позволяет harness независимо разрешать privileged tool и соответствует паре `shell`/`sudo_shell`.
+3. `sudo_apply_patch` переиспользует тот же parser/planner/CAS/lock/atomic-commit flow, выполняет snapshot и commit в одной privilege-модели, а patch payload передаёт через отдельный private remote stage, не конфликтующий с `sudo -S`.
+
+Минимальные regressions для этой границы:
+
+* Update/Add/Delete в root-owned parent через обычный `apply_patch` дают понятный permission error и не меняют target;
+* наличие настроенного sudo не вызывает неявного повышения прав;
+* `sudo_apply_patch` отдельно проходит passwordless и password-based sudo, conflict detection и проверку неизменности target при ошибке.
+
 ---
 
 # Что сейчас происходит в проекте
@@ -1241,4 +1266,3 @@ apply_patch:
 [3]: https://aider.chat/docs/unified-diffs.html "Unified diffs make GPT-4 Turbo 3X less lazy | aider"
 [4]: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool "Text editor tool - Claude Platform Docs"
 [5]: https://github.com/modelcontextprotocol/servers/blob/main/src/filesystem/README.md "servers/src/filesystem/README.md at main · modelcontextprotocol/servers · GitHub"
-

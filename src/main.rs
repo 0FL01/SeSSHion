@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     );
 
     if config.disable_sudo {
-        info!("sudo_shell tool is disabled");
+        info!("sudo_shell and sudo_apply_patch tools are disabled");
     }
 
     // Create MCP server

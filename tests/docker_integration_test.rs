@@ -73,7 +73,7 @@ async fn test_mcp_tools_with_docker() {
     };
 
     // 3. Create SshMcpServer instance
-    let server = SshMcpServer::new(config)
+    let server = SshMcpServer::new(config.clone())
         .await
         .expect("Failed to create SshMcpServer");
 
@@ -467,7 +467,11 @@ async fn test_mcp_tools_with_docker() {
         .test_apply_patch(&add_patch)
         .await
         .expect("apply_patch Add call failed");
-    assert!(!add_result.is_error.unwrap_or(false));
+    assert!(
+        !add_result.is_error.unwrap_or(false),
+        "apply_patch Add failed: {}",
+        extract_text_from_result(&add_result)
+    );
     let add_json: serde_json::Value =
         serde_json::from_str(extract_text_from_result(&add_result).trim())
             .expect("Add response should be valid JSON");
@@ -519,6 +523,139 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to verify deleted file");
     assert_eq!(extract_text_from_result(&delete_probe), "deleted");
+
+    // 4a-7. apply_patch stays unprivileged; sudo_apply_patch preserves the same edit flow.
+    let privileged_dir = "/tmp/ssh-mcp-sudo-apply-patch";
+    let privileged_update = "/tmp/ssh-mcp-sudo-apply-patch/update.txt";
+    let privileged_delete = "/tmp/ssh-mcp-sudo-apply-patch/delete.txt";
+    let privileged_add = "/tmp/ssh-mcp-sudo-apply-patch/add.txt";
+    server
+        .test_execute_sudo_command(&format!(
+            r#"rm -rf -- {dir}; mkdir -- {dir}; printf 'before\n' > {update}; printf 'delete me\n' > {delete}; chmod 0755 -- {dir}; chown -R root:root -- {dir}"#,
+            dir = ssh_mcp::escape_for_shell(privileged_dir),
+            update = ssh_mcp::escape_for_shell(privileged_update),
+            delete = ssh_mcp::escape_for_shell(privileged_delete),
+        ))
+        .await
+        .expect("failed to prepare privileged apply_patch fixtures");
+
+    let privileged_update_patch = format!(
+        "*** Begin Patch\n*** Update File: {privileged_update}\n@@\n-before\n+after\n*** End Patch"
+    );
+    let privileged_add_patch =
+        format!("*** Begin Patch\n*** Add File: {privileged_add}\n+added\n*** End Patch");
+    let privileged_delete_patch =
+        format!("*** Begin Patch\n*** Delete File: {privileged_delete}\n*** End Patch");
+
+    for patch in [
+        &privileged_update_patch,
+        &privileged_add_patch,
+        &privileged_delete_patch,
+    ] {
+        let result = server
+            .test_apply_patch(patch)
+            .await
+            .expect("unprivileged apply_patch call failed");
+        let body: serde_json::Value =
+            serde_json::from_str(extract_text_from_result(&result).trim())
+                .expect("permission response should be valid JSON");
+        assert!(result.is_error.unwrap_or(false));
+        assert_eq!(
+            body.get("error").and_then(|value| value.as_str()),
+            Some("permission_denied")
+        );
+        assert!(
+            body.get("message")
+                .and_then(|value| value.as_str())
+                .is_some_and(|message| message.contains("does not elevate privileges"))
+        );
+    }
+    let unchanged = server
+        .test_execute_command(&format!(
+            "cat -- {} {}; test ! -e {}",
+            ssh_mcp::escape_for_shell(privileged_update),
+            ssh_mcp::escape_for_shell(privileged_delete),
+            ssh_mcp::escape_for_shell(privileged_add),
+        ))
+        .await
+        .expect("failed to verify protected fixtures");
+    assert_eq!(extract_text_from_result(&unchanged), "before\ndelete me\n");
+
+    // Exercise the passwordless sudo wrapper first.
+    let mut passwordless_config = config.clone();
+    passwordless_config.sudo_password = None;
+    let passwordless_server = SshMcpServer::new(passwordless_config)
+        .await
+        .expect("failed to create passwordless sudo server");
+    let passwordless_result = passwordless_server
+        .test_sudo_apply_patch(&privileged_update_patch)
+        .await
+        .expect("passwordless sudo_apply_patch failed");
+    assert!(!passwordless_result.is_error.unwrap_or(false));
+
+    let privileged_conflict_patch = format!(
+        "*** Begin Patch\n*** Update File: {privileged_update}\n@@\n-after\n+should-not-commit\n*** End Patch"
+    );
+    let privileged_conflict = passwordless_server
+        .test_sudo_apply_patch_mutate_before_commit(&privileged_conflict_patch)
+        .await
+        .expect("sudo_apply_patch conflict call failed");
+    let privileged_conflict_body: serde_json::Value =
+        serde_json::from_str(extract_text_from_result(&privileged_conflict).trim())
+            .expect("sudo conflict response should be valid JSON");
+    assert_eq!(
+        privileged_conflict_body
+            .get("error")
+            .and_then(|value| value.as_str()),
+        Some("conflict")
+    );
+    passwordless_server.shutdown().await;
+
+    // Require a password, reset the fixture, and exercise the sudo -S path. The patch
+    // payload must not share stdin with sudo's password prompt.
+    server
+        .test_execute_sudo_command(&format!(
+            r#"printf 'before\n' > {update}; printf 'test ALL=(ALL) ALL\n' > /etc/sudoers.d/test; chmod 0440 /etc/sudoers.d/test"#,
+            update = ssh_mcp::escape_for_shell(privileged_update),
+        ))
+        .await
+        .expect("failed to enable password-required sudo");
+
+    for patch in [
+        &privileged_update_patch,
+        &privileged_add_patch,
+        &privileged_delete_patch,
+    ] {
+        let result = server
+            .test_sudo_apply_patch(patch)
+            .await
+            .expect("password-based sudo_apply_patch failed");
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "sudo_apply_patch returned an error: {}",
+            extract_text_from_result(&result)
+        );
+    }
+    let privileged_state = server
+        .test_execute_command(&format!(
+            "cat -- {} {}; test ! -e {}",
+            ssh_mcp::escape_for_shell(privileged_update),
+            ssh_mcp::escape_for_shell(privileged_add),
+            ssh_mcp::escape_for_shell(privileged_delete),
+        ))
+        .await
+        .expect("failed to inspect privileged edit results");
+    assert_eq!(
+        extract_text_from_result(&privileged_state),
+        "after\nadded\n"
+    );
+    server
+        .test_execute_sudo_command(&format!(
+            "rm -rf -- {}",
+            ssh_mcp::escape_for_shell(privileged_dir)
+        ))
+        .await
+        .expect("failed to clean up privileged apply_patch fixtures");
 
     // 4b. Foreground timeout should auto-detach without killing remote command.
     // We use a small timeout (>= 1s) to force the detach path.

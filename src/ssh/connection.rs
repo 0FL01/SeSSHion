@@ -31,6 +31,18 @@ const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
 const MIN_HEALTH_PROBE_TTL_MS: u64 = 250;
 const MAX_HEALTH_PROBE_TTL_MS: u64 = 5_000;
 
+struct ConnectAttemptGuard<'a> {
+    is_connecting: &'a AtomicBool,
+    connect_notify: &'a Notify,
+}
+
+impl Drop for ConnectAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.is_connecting.store(false, Ordering::SeqCst);
+        self.connect_notify.notify_waiters();
+    }
+}
+
 /// SSH Connection Manager
 ///
 /// Manages a persistent SSH connection with the following features:
@@ -117,6 +129,11 @@ impl SshConnectionManager {
             return Ok(());
         }
 
+        // Register before inspecting the flag so completion cannot race the waiter.
+        let notified = self.connect_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         // Prevent concurrent connection attempts
         if self
             .is_connecting
@@ -125,11 +142,8 @@ impl SshConnectionManager {
         {
             debug!("Another connection attempt in progress, waiting...");
             // Wait for the other connection attempt to complete using Notify
-            let wait_result = timeout(
-                Duration::from_secs(CONNECT_WAIT_TIMEOUT_SECS),
-                self.connect_notify.notified(),
-            )
-            .await;
+            let wait_result =
+                timeout(Duration::from_secs(CONNECT_WAIT_TIMEOUT_SECS), notified).await;
             if wait_result.is_err() {
                 warn!(
                     "Timed out waiting for in-flight connection attempt after {}s",
@@ -147,14 +161,13 @@ impl SshConnectionManager {
             };
         }
 
-        // Perform connection with timeout
-        let result = self.do_connect().await;
+        // Cancellation must release the owner flag and wake waiters.
+        let _attempt_guard = ConnectAttemptGuard {
+            is_connecting: &self.is_connecting,
+            connect_notify: self.connect_notify.as_ref(),
+        };
 
-        // Reset connecting flag and notify all waiters
-        self.is_connecting.store(false, Ordering::SeqCst);
-        self.connect_notify.notify_waiters();
-
-        result
+        self.do_connect().await
     }
 
     /// Internal connection logic
@@ -1027,5 +1040,30 @@ mod tests {
         // Should return error when trying to open channel without connecting
         let result = manager.open_channel().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_connect_releases_owner_flag() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("test listener address").port();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept test connection");
+            std::future::pending::<()>().await;
+        });
+        let config = SshConfig::new("127.0.0.1", "testuser")
+            .with_port(port)
+            .with_password("testpass");
+        let manager = SshConnectionManager::new(config).await;
+
+        let result = timeout(Duration::from_millis(100), manager.connect()).await;
+        assert!(result.is_err(), "silent peer should keep connect in flight");
+        assert!(
+            !manager.is_connecting.load(Ordering::SeqCst),
+            "cancelling connect must release the owner flag"
+        );
+
+        accept_task.abort();
     }
 }

@@ -435,22 +435,9 @@ impl SshConnectionManager {
 
     /// Collect output from su channel until root prompt or error
     ///
-    /// NOTE: This method is only reachable when ALL of the following hold:
-    /// 1. `--su-password` is configured
-    /// 2. `ensure_elevated()` succeeded (su PTY channel is open)
-    /// 3. `detach_mode == DirectOnly` (neither nohup nor setsid available on remote)
-    ///
-    /// In practice, condition 3 is near-impossible: nohup (coreutils) and
-    /// setsid (util-linux) are present on virtually every Linux system. When
-    /// detach mode is Full or Portable, the shell tool uses
-    /// `execute_detachable_foreground_impl` which runs commands through a
-    /// background wrapper (`sh -lc`), never touching the su PTY channel.
-    ///
-    /// Empirical testing with `--su-password` on a real deployment confirmed
-    /// the su PTY path is not activated — commands run as the SSH user, not
-    /// root, because detach mode resolves to Full. The `#`-sentinel and
-    /// hardcoded `exit_code: Some(0)` below are therefore not exercised in
-    /// normal operation.
+    /// This path is used by direct `exec_command` callers while a persistent
+    /// `su` PTY channel is active. Shell tools use their dedicated streaming
+    /// wrapper instead.
     async fn collect_su_output(
         &self,
         channel: &mut russh::Channel<russh::client::Msg>,
@@ -484,10 +471,8 @@ impl SshConnectionManager {
 
                             // Check for root prompt - indicates command complete.
                             // The `#` sentinel is inherently fragile (any `#` in
-                            // command output would match), but this path is only
-                            // reachable when detach_mode == DirectOnly — see the
-                            // method-level NOTE above. In normal deployments with
-                            // nohup/setsid available, this code is never executed.
+                            // command output would match). This is limited to the
+                            // direct persistent `su` PTY path described above.
                             if buffer.contains('#') {
                                 // Extract output: remove the command echo and final prompt
                                 let lines: Vec<&str> = buffer.lines().collect();

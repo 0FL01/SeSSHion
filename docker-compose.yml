@@ -1,11 +1,8 @@
 services:
   ssh:
-    image: lscr.io/linuxserver/openssh-server:latest
-    environment:
-      - USER_NAME=test
-      - PASSWORD_ACCESS=true
-      - USER_PASSWORD=secret
-      - SUDO_ACCESS=true
+    build:
+      context: tests/fixtures/debian-sshd
+    image: ssh-mcp-debian-sshd:latest
     ports:
       - "127.0.0.1:2222:2222"
     logging:

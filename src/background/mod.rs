@@ -8,7 +8,6 @@
 //! - [`JobRegistry`]: thread-safe registry for active + recently completed jobs
 //! - [`LocalLogSpooler`]: local `system temp directory / ssh-mcp subdirectory` directory management
 
-pub(crate) mod detach;
 pub mod job;
 pub(crate) mod marker;
 pub mod registry;

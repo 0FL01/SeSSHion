@@ -8,12 +8,11 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, error, warn};
 
 use crate::background::OutputStreamer;
-use crate::background::detach::DetachMode;
 use crate::background::marker::read_background_markers_from_channel;
 use crate::background::response::{
     BackgroundTimeoutSnapshot, background_json_err, background_json_ok, background_json_timeout,
 };
-use crate::background::wrapper::remote_job_log_path;
+use crate::background::wrapper::{build_background_wrapper_script, remote_job_log_path};
 use crate::ssh::command::read_local_log_tail;
 use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{CommandOutput, sanitize_command, wrap_sudo_command};
@@ -41,7 +40,6 @@ struct TimeoutRecoverySnapshot {
 impl SshMcpServer {
     pub(super) async fn execute_detachable_foreground_impl(
         &self,
-        detach_mode: DetachMode,
         command_for_exec: &str,
         command_for_registry: &str,
         timeout: Duration,
@@ -63,12 +61,7 @@ impl SshMcpServer {
         }
 
         let remote_log_path = remote_job_log_path(&job_id);
-        let wrapper = super::build_background_wrapper_script(
-            detach_mode,
-            &job_id,
-            command_for_exec,
-            &remote_log_path,
-        );
+        let wrapper = build_background_wrapper_script(&job_id, command_for_exec, &remote_log_path);
 
         let permit = match self.connection.acquire_command_slot_raw().await {
             Ok(p) => p,
@@ -462,7 +455,7 @@ impl SshMcpServer {
             None => match self.default_local_log_path(&job_id) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Ok(background_json_err(&job_id, "", &e, ""));
+                    return Ok(background_json_err(&e, ""));
                 }
             },
         };
@@ -470,38 +463,23 @@ impl SshMcpServer {
         if let Some(p) = log_path
             && let Err(e) = validate_background_log_path(self.spooler.base_dir(), p)
         {
-            return Ok(background_json_err(&job_id, &final_log_path, &e, ""));
+            return Ok(background_json_err(&e, ""));
         }
 
         if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                &e.to_string(),
-                "",
-            ));
+            return Ok(background_json_err(&e.to_string(), ""));
         }
 
         let sanitized = match sanitize_command(command, self.max_chars) {
             Ok(cmd) => cmd,
             Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    &e.to_string(),
-                    "",
-                ));
+                return Ok(background_json_err(&e.to_string(), ""));
             }
         };
 
         // Ensure connection is established
         if let Err(e) = self.connection.ensure_connected().await {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                &e.to_string(),
-                "",
-            ));
+            return Ok(background_json_err(&e.to_string(), ""));
         }
 
         let (command_for_exec, command_for_registry, attempt_su_elevation, log_msg) =
@@ -534,39 +512,12 @@ impl SshMcpServer {
             debug!(error = ?e, "Elevation failed, will run as normal user");
         }
 
-        let detach_mode = match self.determine_detach_mode().await {
-            Ok(mode) => mode,
-            Err(e) => {
-                return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
-                    &format!("Failed to determine background detach support: {e}"),
-                    "",
-                ));
-            }
-        };
-        if detach_mode == DetachMode::DirectOnly {
-            return Ok(background_json_err(
-                &job_id,
-                &final_log_path,
-                "Background detach is not supported on this target; run with background=false.",
-                "",
-            ));
-        }
-
-        let wrapper = super::build_background_wrapper_script(
-            detach_mode,
-            &job_id,
-            &command_for_exec,
-            &remote_log_path,
-        );
+        let wrapper = build_background_wrapper_script(&job_id, &command_for_exec, &remote_log_path);
 
         let permit = match self.connection.acquire_command_slot_raw().await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(background_json_err(
-                    &job_id,
-                    &final_log_path,
                     &format!("Failed to acquire command slot: {e}"),
                     "",
                 ));
@@ -580,7 +531,7 @@ impl SshMcpServer {
         {
             Ok(ch) => ch,
             Err(e) => {
-                return Ok(background_json_err(&job_id, &final_log_path, &e, ""));
+                return Ok(background_json_err(&e, ""));
             }
         };
 
@@ -594,7 +545,7 @@ impl SshMcpServer {
         {
             Ok(v) => v,
             Err(e) => {
-                return Ok(background_json_err(&job_id, &final_log_path, &e, ""));
+                return Ok(background_json_err(&e, ""));
             }
         };
 

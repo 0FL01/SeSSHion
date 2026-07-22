@@ -90,7 +90,6 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
  │   │   ├── registry.rs         # Job registry (in-memory tracking)
  │   │   ├── spooler.rs          # Local log file spooling
  │   │   ├── stream.rs           # Output streaming for background jobs
- │   │   ├── detach.rs           # Detach mode detection and caching (Full/Portable/DirectOnly)
  │   │   ├── marker.rs           # Background marker parsing (stdout marker extraction)
  │   │   ├── response.rs         # JSON response formatting for background tools
  │   │   └── wrapper.rs          # Background wrapper script generation

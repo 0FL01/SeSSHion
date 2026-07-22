@@ -12,7 +12,7 @@ Capability-bound SSH MCP for autonomous DevOps agents: six composable primitives
 ## Why
 
 - **Capability-bound surface.** Six composable primitives, no open-ended remote API. The agent can only run commands, read files, patch one file, transfer files, and inspect background jobs.
-- **Deterministic long-running jobs.** `background=true` (or a foreground timeout auto-detach) returns `{job_id, pid, log_path}` immediately; output streams to a local log you poll with `check_process`. No client RPC timeouts on long work.
+- **Deterministic long-running jobs.** `background=true` returns `{job_id, pid, log_path}` immediately; output streams to a local log you poll with `check_process`, avoiding client RPC deadlines.
 - **Bounded context.** `read` defaults to a safe preview with token estimates; shell output is capped by `--max-output-tokens`. Large files cannot bomb the agent's context window.
 - **Atomic remote edits.** `apply_patch` applies one exact Add/Update/Delete patch with conflict detection and atomic commit — no fuzzy matching, no silent overwrites.
 
@@ -168,13 +168,15 @@ Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key 
 
 ## Long-running jobs
 
-Start with `background=true` (or let a foreground command auto-detach on timeout). You immediately get `{job_id, pid, log_path}`, where `log_path` is a local log on the MCP server (default `/tmp/ssh-mcp/<job_id>.log`). Poll with `check_process`:
+Start potentially long commands with `background=true`. A foreground `timeout_ms` controls SSH execution only and cannot extend the MCP client's own deadline. You immediately get `{job_id, pid, log_path}`, where `log_path` is a local log on the MCP server (default `/tmp/ssh-mcp/<job_id>.log`). Poll with `check_process`:
 
 ```json
 {"job_id": "abc123", "tail_lines": 50}
 ```
 
 `check_process` returns a strict state — `running`, `completed`, `failed`, or `state_lost` — plus the log tail. Sleep between checks (2–5s, then 10–30s for long jobs) rather than tight-polling; a job is done when the state is terminal and an `exit_code` is present.
+
+Background tracking requires the MCP server and its SSH session to remain alive; jobs are not guaranteed to survive an MCP server restart.
 
 ## Safety
 

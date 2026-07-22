@@ -10,7 +10,7 @@ PARAMETERS:
 - command (string, required): Command string executed by POSIX-compatible sh (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path,log_exists}.
   Output is streamed to local log file on MCP server. Monitor via check_process using job_id.
-- timeout_ms (integer): Foreground-only. If timeout is reached on a target that supports detach handoff, shell auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail}. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Foreground SSH timeout only; it does not extend the MCP client deadline. If reached, shell hands off the running command and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail}. Ignored when background=true (not validated in that mode).
 - log_path (string): Advanced background-only override. Omit normally. If provided, must be a .log file directly under the local spool directory (e.g., /tmp/ssh-mcp/name.log on Unix, %TEMP%\ssh-mcp\name.log on Windows). Invalid custom paths return a tool JSON error.
 
 BACKGROUND MODE:
@@ -38,14 +38,14 @@ PARAMETERS:
 - command (string, required): Command string executed by POSIX-compatible sh under sudo (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path,log_exists}.
   Output is streamed to local log file on MCP server. Monitor via check_process using job_id.
-- timeout_ms (integer): Foreground-only. If timeout is reached in foreground, sudo_shell auto-detaches and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail, log_path}. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Foreground SSH timeout only; it does not extend the MCP client deadline. If reached, sudo_shell hands off the running command and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail, log_path}. Ignored when background=true (not validated in that mode).
 - log_path (string): Advanced background-only override. Omit normally. If provided, must be a .log file directly under the local spool directory (e.g., /tmp/ssh-mcp/name.log on Unix, %TEMP%\ssh-mcp\name.log on Windows). Invalid custom paths return a tool JSON error.
 
 NOTE:
 - check_process returns strict states: `running`, `completed`, `failed`, or `state_lost`.
 - If `state_lost`, the MCP server no longer has a trustworthy terminal outcome; inspect `log_path` / `log_tail` before retrying.
 - Commands are evaluated by POSIX-compatible sh on the remote host. Prefer portable shell syntax over shell-specific extensions.
-- Long-running sudo commands can be started explicitly with background=true, or they will auto-detach if a foreground timeout is reached on supported targets.
+- Start long-running sudo commands explicitly with background=true so the initial response is not limited by the MCP client deadline.
 
 EXAMPLE:
 {"command": "systemctl restart nginx", "background": false}"#;
@@ -130,10 +130,12 @@ fn command_tool(
             },
             "background": {
                 "type": "boolean",
-                "default": false
+                "default": false,
+                "description": "Run asynchronously and return a job_id immediately. Use for commands that may exceed the MCP client tool-call timeout."
             },
             "timeout_ms": {
-                "type": "integer"
+                "type": "integer",
+                "description": "Foreground SSH execution timeout only; does not extend the MCP client tool-call deadline."
             },
             "log_path": {
                 "type": "string",
@@ -152,7 +154,7 @@ fn command_tool(
 pub(super) fn shell_tool() -> Tool {
     command_tool(
         "shell",
-        "Execute command via POSIX-compatible sh on remote host. Use background=true for long tasks.",
+        "Run command via POSIX sh. Use background=true beyond client deadlines.",
         "Command string executed by POSIX-compatible sh",
     )
 }
@@ -160,7 +162,7 @@ pub(super) fn shell_tool() -> Tool {
 pub(super) fn sudo_shell_tool() -> Tool {
     command_tool(
         "sudo_shell",
-        "Execute command via POSIX-compatible sh under sudo. Use background=true for long tasks.",
+        "Run command via POSIX sh under sudo. Use background=true beyond client deadlines.",
         "Command string executed by POSIX-compatible sh under sudo",
     )
 }

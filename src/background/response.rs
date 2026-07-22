@@ -75,12 +75,7 @@ pub(crate) fn background_json_timeout(
     CallToolResult::success(vec![Content::text(body)])
 }
 
-pub(crate) fn background_json_err(
-    job_id: &str,
-    local_log_path: &str,
-    error: &str,
-    stderr: &str,
-) -> CallToolResult {
+pub(crate) fn background_json_err(error: &str, stderr: &str) -> CallToolResult {
     // Keep the payload deterministic and single-line. Avoid echoing the original command.
     let (error_snippet, error_truncated) =
         truncate_with_flag(error, BACKGROUND_JSON_SNIPPET_LIMIT_CHARS);
@@ -92,14 +87,6 @@ pub(crate) fn background_json_err(
     let mut obj = serde_json::Map::new();
     obj.insert("ok".to_string(), serde_json::Value::Bool(false));
     obj.insert("background".to_string(), serde_json::Value::Bool(true));
-    obj.insert(
-        "job_id".to_string(),
-        serde_json::Value::String(job_id.to_string()),
-    );
-    obj.insert(
-        "log_path".to_string(),
-        serde_json::Value::String(local_log_path.to_string()),
-    );
     obj.insert(
         "error".to_string(),
         serde_json::Value::String(error_snippet),
@@ -116,16 +103,6 @@ pub(crate) fn background_json_err(
             "stderr": stderr_truncated,
         }),
     );
-    if truncated {
-        obj.insert(
-            "hint".to_string(),
-            serde_json::Value::String(format!(
-                "Response fields were truncated to {} chars. Hint: inspect full output using log_path or check_process with job_id={job_id}.",
-                BACKGROUND_JSON_SNIPPET_LIMIT_CHARS
-            )),
-        );
-    }
-
     let body = serde_json::Value::Object(obj).to_string();
 
     CallToolResult::success(vec![Content::text(body)])

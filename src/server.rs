@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,11 +18,7 @@ use rmcp::{
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::background::detach::{DetachMode, DetachProbeOutput, DetachProbeRequest};
 use crate::background::job::NewRunningJob;
-use crate::background::wrapper::{
-    build_background_wrapper_script_full, build_background_wrapper_script_portable,
-};
 use crate::background::{JobRegistry, JobState, LocalLogSpooler, SharedJobState};
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
@@ -68,25 +64,6 @@ fn make_job_id() -> String {
     format!("{}-{}", epoch_ms, counter)
 }
 
-fn build_background_wrapper_script(
-    mode: DetachMode,
-    job_id: &str,
-    user_command: &str,
-    log_path: &str,
-) -> String {
-    match mode {
-        DetachMode::Full | DetachMode::Unknown => {
-            build_background_wrapper_script_full(job_id, user_command, log_path)
-        }
-        DetachMode::Portable => {
-            build_background_wrapper_script_portable(job_id, user_command, log_path)
-        }
-        DetachMode::DirectOnly => {
-            build_background_wrapper_script_portable(job_id, user_command, log_path)
-        }
-    }
-}
-
 /// SSH MCP Server
 ///
 /// The main server implementation that provides MCP tools for remote SSH
@@ -104,9 +81,6 @@ pub struct SshMcpServer {
 
     /// Maximum command length
     max_chars: Option<usize>,
-
-    detach_mode: Arc<AtomicU8>,
-    detach_mode_lock: Arc<Mutex<()>>,
 
     spooler: Arc<LocalLogSpooler>,
     job_registry: Arc<JobRegistry>,
@@ -186,8 +160,6 @@ impl SshMcpServer {
             connection,
             timeout,
             max_chars,
-            detach_mode: Arc::new(AtomicU8::new(DetachMode::Unknown.as_u8())),
-            detach_mode_lock: Arc::new(Mutex::new(())),
             spooler,
             job_registry,
             transfer: TransferEngine::new(local_root),
@@ -312,33 +284,6 @@ impl SshMcpServer {
         self.connection.close().await;
     }
 
-    async fn determine_detach_mode(&self) -> Result<DetachMode> {
-        let server = self.clone();
-        crate::background::detach::determine_detach_mode(
-            self.detach_mode.as_ref(),
-            self.detach_mode_lock.as_ref(),
-            make_job_id,
-            move |req, timeout| {
-                let server = server.clone();
-                async move { server.exec_detach_probe(req, timeout).await }
-            },
-        )
-        .await
-    }
-
-    async fn exec_detach_probe(
-        &self,
-        req: DetachProbeRequest,
-        timeout: Duration,
-    ) -> Result<DetachProbeOutput> {
-        let output = self.connection.exec_command(&req.wrapper, timeout).await?;
-        Ok(DetachProbeOutput {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            exit_code: output.exit_code,
-        })
-    }
-
     /// Execute a command (used by shell tool)
     async fn execute_command_with_timeout(
         &self,
@@ -374,34 +319,13 @@ impl SshMcpServer {
             }
         }
 
-        let detach_mode = match self.determine_detach_mode().await {
-            Ok(mode) => mode,
-            Err(e) => {
-                debug!(error = ?e, "detach-mode probe failed; falling back to direct foreground exec");
-                DetachMode::DirectOnly
-            }
-        };
-        if detach_mode == DetachMode::DirectOnly {
-            match self.connection.exec_command(&sanitized, timeout).await {
-                Ok(output) => return Ok(Self::calltool_from_command_output(output)),
-                Err(e) => {
-                    error!(error = ?e, "Command execution failed");
-                    let mut msg = format!("Error: {}", e);
-                    if matches!(e, SshMcpError::Timeout(_)) {
-                        msg.push_str("\nHint: background detach is not supported on this target; rerun with background=true or a larger timeout_ms.");
-                    }
-                    return Ok(CallToolResult::error(vec![Content::text(msg)]));
-                }
-            }
-        }
-
         // Ensure connection is established for detached foreground execution path.
         if !requires_elevation && let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
             return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
-        self.execute_detachable_foreground_impl(detach_mode, &sanitized, &sanitized, timeout)
+        self.execute_detachable_foreground_impl(&sanitized, &sanitized, timeout)
             .await
     }
 
@@ -452,38 +376,12 @@ impl SshMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
         }
 
-        let detach_mode = match self.determine_detach_mode().await {
-            Ok(mode) => mode,
-            Err(e) => {
-                debug!(error = ?e, "detach-mode probe failed; falling back to direct sudo foreground exec");
-                DetachMode::DirectOnly
-            }
-        };
-        if detach_mode == DetachMode::DirectOnly {
-            match self
-                .connection
-                .exec_command(&wrapped_command, timeout)
-                .await
-            {
-                Ok(output) => Ok(Self::calltool_from_command_output(output)),
-                Err(e) => {
-                    error!(error = ?e, "Sudo command execution failed");
-                    let mut msg = format!("Error: {}", e);
-                    if matches!(e, SshMcpError::Timeout(_)) {
-                        msg.push_str("\nHint: background detach is not supported on this target; rerun with background=true or a larger timeout_ms.");
-                    }
-                    Ok(CallToolResult::error(vec![Content::text(msg)]))
-                }
-            }
-        } else {
-            self.execute_detachable_foreground_impl(
-                detach_mode,
-                &wrapped_command,
-                &format!("sudo {sanitized}"),
-                timeout,
-            )
-            .await
-        }
+        self.execute_detachable_foreground_impl(
+            &wrapped_command,
+            &format!("sudo {sanitized}"),
+            timeout,
+        )
+        .await
     }
 
     async fn execute_sudo_command(
@@ -762,7 +660,7 @@ mod tests {
     use crate::background::response::{
         BACKGROUND_JSON_SNIPPET_LIMIT_CHARS, background_json_err, background_json_timeout,
     };
-    use crate::background::wrapper::remote_job_log_path;
+    use crate::background::wrapper::{build_background_wrapper_script, remote_job_log_path};
     use crate::server::validation::common::validate_read_file_path;
     use crate::server::validation::read_file::sanitize_read_file_stderr_snippet;
 
@@ -813,17 +711,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_background_wrapper_full_escapes_single_quotes_in_user_command() {
+    fn test_build_background_wrapper_escapes_single_quotes_in_user_command() {
         let remote_log = remote_job_log_path("job-1");
-        let script =
-            build_background_wrapper_script_full("job-1", "echo 'hello world'", &remote_log);
-        assert!(script.contains("exec sh -lc 'set +m; echo '\"'\"'hello world'\"'\"''"));
+        let script = build_background_wrapper_script("job-1", "echo 'hello world'", &remote_log);
+        assert!(script.contains("exec sh -c 'set +m; echo '\"'\"'hello world'\"'\"''"));
     }
 
     #[test]
-    fn test_build_background_wrapper_portable_is_busybox_friendly() {
+    fn test_build_background_wrapper_is_busybox_friendly() {
         let remote_log = remote_job_log_path("job-1");
-        let script = build_background_wrapper_script_portable("job-1", "echo test", &remote_log);
+        let script = build_background_wrapper_script("job-1", "echo test", &remote_log);
         assert!(!script.contains("dirname --"));
         assert!(!script.contains("mkdir -p --"));
         assert!(!script.contains("sh -lc"));
@@ -832,36 +729,23 @@ mod tests {
     }
 
     #[test]
-    fn test_background_wrappers_emit_markers_and_exec() {
+    fn test_background_wrapper_emits_markers_and_exec() {
         let remote_log = remote_job_log_path("job-1");
-
-        let full = build_background_wrapper_script_full("job-1", "echo test", &remote_log);
-        assert!(full.contains("__SSH_MCP_JOB_ID=job-1"));
-        assert!(full.contains("__SSH_MCP_PID=$$"));
-        assert!(full.contains("__SSH_MCP_LOG=$LOG"));
-        assert!(full.contains("exec sh -lc"));
-
-        let portable = build_background_wrapper_script_portable("job-1", "echo test", &remote_log);
-        assert!(portable.contains("__SSH_MCP_JOB_ID=job-1"));
-        assert!(portable.contains("__SSH_MCP_PID=$$"));
-        assert!(portable.contains("__SSH_MCP_LOG=$LOG"));
-        assert!(portable.contains("exec sh -c"));
+        let script = build_background_wrapper_script("job-1", "echo test", &remote_log);
+        assert!(script.contains("__SSH_MCP_JOB_ID=job-1"));
+        assert!(script.contains("__SSH_MCP_PID=$$"));
+        assert!(script.contains("__SSH_MCP_LOG=$LOG"));
+        assert!(script.contains("exec sh -c"));
     }
 
     #[test]
-    fn test_background_wrappers_do_not_redirect_remote_output() {
+    fn test_background_wrapper_does_not_redirect_remote_output() {
         let remote_log = remote_job_log_path("job-1");
-        let full = build_background_wrapper_script_full("job-1", "echo test", &remote_log);
-        assert!(!full.contains(">$LOG"));
-        assert!(!full.contains("2>&1"));
-        assert!(!full.contains("$EXIT"));
-        assert!(!full.contains("nohup"));
-
-        let portable = build_background_wrapper_script_portable("job-1", "echo test", &remote_log);
-        assert!(!portable.contains(">$LOG"));
-        assert!(!portable.contains("2>&1"));
-        assert!(!portable.contains("$EXIT"));
-        assert!(!portable.contains("nohup"));
+        let script = build_background_wrapper_script("job-1", "echo test", &remote_log);
+        assert!(!script.contains(">$LOG"));
+        assert!(!script.contains("2>&1"));
+        assert!(!script.contains("$EXIT"));
+        assert!(!script.contains("nohup"));
     }
 
     #[test]
@@ -968,12 +852,11 @@ mod tests {
     }
 
     #[test]
-    fn test_background_json_err_sets_truncation_flag_and_hint() {
+    fn test_background_json_err_omits_unregistered_job_fields() {
         let long_error = "e".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
         let long_stderr = "s".repeat(BACKGROUND_JSON_SNIPPET_LIMIT_CHARS + 10);
 
-        let result =
-            background_json_err("job-1", "/tmp/ssh-mcp/job-1.log", &long_error, &long_stderr);
+        let result = background_json_err(&long_error, &long_stderr);
         let text = extract_text_from_result(&result);
 
         let value: serde_json::Value =
@@ -985,21 +868,15 @@ mod tests {
             Some(true)
         );
         assert_eq!(value.get("truncated").and_then(|v| v.as_bool()), Some(true));
+        assert!(value.get("job_id").is_none());
+        assert!(value.get("log_path").is_none());
+        assert!(value.get("hint").is_none());
 
         let fields = value
             .get("truncated_fields")
             .expect("expected truncated_fields");
         assert_eq!(fields.get("error").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(fields.get("stderr").and_then(|v| v.as_bool()), Some(true));
-
-        let hint = value
-            .get("hint")
-            .and_then(|v| v.as_str())
-            .expect("expected hint when truncated");
-        assert!(
-            hint.contains("check_process") && hint.contains("job_id=job-1"),
-            "hint should point to check_process job_id; got: '{hint}'"
-        );
 
         let error_snippet = value
             .get("error")

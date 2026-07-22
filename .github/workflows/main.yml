@@ -131,6 +131,8 @@ jobs:
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'rolling')
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -144,6 +146,69 @@ jobs:
             cp "${dir}"* "dist/${dirname}"
           done
           chmod +x dist/*
+      - name: Generate rolling release notes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          PREVIOUS_SHA="$(git rev-parse --verify 'rolling^{commit}' 2>/dev/null || true)"
+          BASE_REF=""
+          PREVIOUS_LABEL=""
+
+          if [ -n "$PREVIOUS_SHA" ] && git merge-base --is-ancestor "$PREVIOUS_SHA" "$GITHUB_SHA"; then
+            BASE_REF="$PREVIOUS_SHA"
+            PREVIOUS_LABEL="rolling@${PREVIOUS_SHA:0:7}"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$ZERO_SHA" ] \
+            && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$BEFORE_SHA" "$GITHUB_SHA"; then
+            BASE_REF="$BEFORE_SHA"
+          fi
+
+          if [ -n "$BASE_REF" ]; then
+            RANGE="${BASE_REF}..${GITHUB_SHA}"
+          else
+            RANGE="$GITHUB_SHA"
+          fi
+          COMMIT_COUNT="$(git rev-list --count "$RANGE")"
+
+          {
+            echo "## SSH MCP Rolling Release"
+            echo
+            if [ -n "$PREVIOUS_LABEL" ]; then
+              echo "**Previous release:** \`${PREVIOUS_LABEL}\`"
+            elif [ -n "$BASE_REF" ]; then
+              echo "**Previous commit:** \`${BASE_REF:0:7}\`"
+            else
+              echo "**Range:** entire commit history"
+            fi
+            echo
+            echo "**New commits:** ${COMMIT_COUNT}"
+            echo
+            echo "### Changes"
+            echo
+            if [ "$COMMIT_COUNT" -eq 0 ]; then
+              echo "- No new commits."
+            else
+              git log --reverse \
+                --format="- [\`%h\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" \
+                "$RANGE"
+            fi
+            echo
+            if [ -n "$BASE_REF" ]; then
+              echo "[Full changelog](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_REF}...${GITHUB_SHA})"
+              echo
+            fi
+            echo "### Artifacts"
+            echo
+            for asset in dist/*; do
+              echo "- \`$(basename "$asset")\`"
+            done
+            echo
+            echo "> [!WARNING]"
+            echo "> This is a pre-release build and may not be stable. Use at your own risk."
+          } > release-notes.md
       - name: Delete existing rolling release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -156,9 +221,7 @@ jobs:
           gh release create rolling \
             --target ${{ github.sha }} \
             --title "Rolling Release (${{ env.SHORT_SHA }})" \
-            --notes "Latest rolling build from commit ${{ env.SHORT_SHA }}. Built from branch \`main\`.
-
-          ⚠️ WARNING: This is a pre-release build and may not be stable. Use at your own risk." \
+            --notes-file release-notes.md \
             --prerelease \
             dist/*
 
@@ -169,6 +232,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'stable'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -218,6 +283,7 @@ jobs:
       - name: Check if release exists
         id: check_release
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ env.VERSION }}
         run: |
           if gh release view "v${VERSION}" >/dev/null 2>&1; then
@@ -225,6 +291,67 @@ jobs:
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: Generate stable release notes
+        if: steps.check_release.outputs.exists == 'false'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          VERSION: ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          PREVIOUS_TAG="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          BASE_REF=""
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            BASE_REF="$PREVIOUS_TAG"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$ZERO_SHA" ] \
+            && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$BEFORE_SHA" "$GITHUB_SHA"; then
+            BASE_REF="$BEFORE_SHA"
+          fi
+
+          if [ -n "$BASE_REF" ]; then
+            RANGE="${BASE_REF}..${GITHUB_SHA}"
+          else
+            RANGE="$GITHUB_SHA"
+          fi
+          COMMIT_COUNT="$(git rev-list --count "$RANGE")"
+
+          {
+            echo "## SSH MCP v${VERSION}"
+            echo
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "**Previous release:** \`${PREVIOUS_TAG}\`"
+            elif [ -n "$BASE_REF" ]; then
+              echo "**Previous commit:** \`${BASE_REF:0:7}\`"
+            else
+              echo "**Range:** entire commit history"
+            fi
+            echo
+            echo "**New commits:** ${COMMIT_COUNT}"
+            echo
+            echo "### Changes"
+            echo
+            if [ "$COMMIT_COUNT" -eq 0 ]; then
+              echo "- No new commits."
+            else
+              git log --reverse \
+                --format="- [\`%h\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" \
+                "$RANGE"
+            fi
+            echo
+            if [ -n "$BASE_REF" ]; then
+              echo "[Full changelog](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_REF}...${GITHUB_SHA})"
+              echo
+            fi
+            echo "### Artifacts"
+            echo
+            for asset in dist/*; do
+              echo "- \`$(basename "$asset")\`"
+            done
+          } > release-notes.md
 
       - name: Create stable release
         if: steps.check_release.outputs.exists == 'false'
@@ -234,6 +361,6 @@ jobs:
         run: |
           gh release create "v${VERSION}" \
             --title "Release v${VERSION}" \
-            --notes "Stable release v${VERSION}. This is a production-ready build." \
+            --notes-file release-notes.md \
             --latest \
             dist/*

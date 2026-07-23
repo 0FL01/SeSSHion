@@ -1003,6 +1003,14 @@ mod tests {
             hint.contains("TIMEOUT_RECOVERY"),
             "hint should start with TIMEOUT_RECOVERY; got: '{hint}'"
         );
+        assert!(
+            hint.contains("MCP client deadlines may be shorter than timeout_ms"),
+            "hint should distinguish the client deadline from timeout_ms; got: '{hint}'"
+        );
+        assert!(
+            hint.contains("background=true"),
+            "hint should recommend explicit background mode; got: '{hint}'"
+        );
         // Hint should NOT contain old placeholders
         assert!(
             !hint.contains("<pid>"),
@@ -1037,6 +1045,8 @@ mod tests {
         assert!(docs.contains("command"));
         assert!(docs.contains("background"));
         assert!(docs.contains("still_running"));
+        assert!(docs.contains("not the full tool-call deadline"));
+        assert!(docs.contains("client may stop waiting earlier"));
     }
 
     #[test]
@@ -1044,6 +1054,7 @@ mod tests {
         let docs = SshMcpServer::get_tool_documentation("sudo_shell").unwrap();
         assert!(docs.contains("SUDO_SHELL TOOL"));
         assert!(docs.contains("sudo"));
+        assert!(docs.contains("not the full tool-call deadline"));
     }
 
     #[test]

@@ -40,17 +40,18 @@ pub(crate) fn background_json_timeout(
     local_log_path: &str,
     snapshot: &BackgroundTimeoutSnapshot<'_>,
 ) -> CallToolResult {
+    let deadline_guidance = "MCP client deadlines may be shorter than timeout_ms; start potentially long commands with background=true.";
     let hint = if snapshot.still_running {
         format!(
-            "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check_process tool with job_id={job_id} to retrieve output."
+            "TIMEOUT_RECOVERY: Process still running in background. DO NOT restart the command! Use check_process tool with job_id={job_id} to retrieve output. {deadline_guidance}"
         )
     } else if snapshot.state == "state_lost" {
         format!(
-            "TIMEOUT_RECOVERY: Background job state is lost after handoff. Inspect log_path/log_tail and use check_process with job_id={job_id} before deciding whether to retry."
+            "TIMEOUT_RECOVERY: Background job state is lost after handoff. Inspect log_path/log_tail and use check_process with job_id={job_id} before deciding whether to retry. {deadline_guidance}"
         )
     } else {
         format!(
-            "TIMEOUT_RECOVERY: Foreground timeout elapsed after handoff, but the background job is no longer running. Inspect exit_code/log_tail or use check_process tool with job_id={job_id} before retrying."
+            "TIMEOUT_RECOVERY: Foreground timeout elapsed after handoff, but the background job is no longer running. Inspect exit_code/log_tail or use check_process tool with job_id={job_id} before retrying. {deadline_guidance}"
         )
     };
     let body = serde_json::json!({

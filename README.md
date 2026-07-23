@@ -169,7 +169,7 @@ Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key 
 
 ## Long-running jobs
 
-Start potentially long commands with `background=true`. A foreground `timeout_ms` controls SSH execution only and cannot extend the MCP client's own deadline. You immediately get `{job_id, pid, log_path}`, where `log_path` is a local log on the MCP server (default `/tmp/ssh-mcp/<job_id>.log`). Poll with `check_process`:
+Start potentially long commands with `background=true`. A foreground `timeout_ms` is only the server-side SSH wait limit, not the full tool-call deadline. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier. The configured default of 300000 ms therefore does not guarantee that an MCP harness will wait that long. In background mode you immediately get `{job_id, pid, log_path}`, where `log_path` is a local log on the MCP server (default `/tmp/ssh-mcp/<job_id>.log`). Poll with `check_process`:
 
 ```json
 {"job_id": "abc123", "tail_lines": 50}

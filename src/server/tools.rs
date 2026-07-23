@@ -10,11 +10,11 @@ PARAMETERS:
 - command (string, required): Command string executed by POSIX-compatible sh (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path,log_exists}.
   Output is streamed to local log file on MCP server. Monitor via check_process using job_id.
-- timeout_ms (integer): Foreground SSH timeout only; it does not extend the MCP client deadline. If reached, shell hands off the running command and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail}. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Server-side foreground SSH wait limit only, not the full tool-call deadline. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier. If reached, shell hands off the running command and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail}. Ignored when background=true (not validated in that mode).
 - log_path (string): Advanced background-only override. Omit normally. If provided, must be a .log file directly under the local spool directory (e.g., /tmp/ssh-mcp/name.log on Unix, %TEMP%\ssh-mcp\name.log on Windows). Invalid custom paths return a tool JSON error.
 
 BACKGROUND MODE:
-For commands longer than RPC timeout, use background=true:
+For potentially long-running commands, use background=true:
 1. Command runs detached on the remote host
 2. Returns immediately with job_id, pid, LOCAL log_path on the MCP server
 3. Monitor: use check_process with job_id (preferred) or ps -p <pid> -o pid,etime,cmd
@@ -38,7 +38,7 @@ PARAMETERS:
 - command (string, required): Command string executed by POSIX-compatible sh under sudo (use portable shell syntax)
 - background (boolean): Run in background. Returns immediately with {job_id,pid,log_path,log_exists}.
   Output is streamed to local log file on MCP server. Monitor via check_process using job_id.
-- timeout_ms (integer): Foreground SSH timeout only; it does not extend the MCP client deadline. If reached, sudo_shell hands off the running command and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail, log_path}. Ignored when background=true (not validated in that mode).
+- timeout_ms (integer): Server-side foreground SSH wait limit only, not the full tool-call deadline. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier. If reached, sudo_shell hands off the running command and returns {ok:false, timeout:true, background:true, job_id, pid, state, still_running, log_exists, log_tail, log_path}. Ignored when background=true (not validated in that mode).
 - log_path (string): Advanced background-only override. Omit normally. If provided, must be a .log file directly under the local spool directory (e.g., /tmp/ssh-mcp/name.log on Unix, %TEMP%\ssh-mcp\name.log on Windows). Invalid custom paths return a tool JSON error.
 
 NOTE:
@@ -60,7 +60,7 @@ PARAMETERS:
 - transport (string): "auto" (default), "sftp", "scp", "rsync", or "exec-raw"
 - kind (string): "file" or "directory" (auto-detected if omitted)
 - overwrite (boolean): Allow overwriting destination (default: false)
-- timeout_ms (integer): Transfer timeout override
+- timeout_ms (integer): Server-side transfer timeout override. It does not extend the MCP client's tool-call deadline, which may expire earlier.
 
 TRANSPORTS:
 - auto: Tries rsync → sftp → scp → exec-raw in order
@@ -81,7 +81,7 @@ PARAMETERS:
 - remote_path (string, required): Absolute remote file path to read
 - mode (string): "preview" (default), "head", "tail", or "full"
 - lines (integer): Line count for preview/head/tail (default: 800, max: 10000)
-- timeout_ms (integer): Optional timeout override in milliseconds
+- timeout_ms (integer): Optional server-side read timeout override. It does not extend the MCP client's tool-call deadline, which may expire earlier.
 
 BEHAVIOR:
 - Uses raw streaming transport (no exec output token truncation)
@@ -147,11 +147,11 @@ fn command_tool(
             "background": {
                 "type": "boolean",
                 "default": false,
-                "description": "Run asynchronously and return a job_id immediately. Use for commands that may exceed the MCP client tool-call timeout."
+                "description": "Run asynchronously and return a job_id immediately. Use for potentially long commands because MCP client deadlines are client-specific and may expire before timeout_ms."
             },
             "timeout_ms": {
                 "type": "integer",
-                "description": "Foreground SSH execution timeout only; does not extend the MCP client tool-call deadline."
+                "description": "Server-side foreground SSH wait limit only, not the full tool-call deadline. The MCP client may stop waiting earlier; use background=true for potentially long-running commands."
             },
             "log_path": {
                 "type": "string",
@@ -170,7 +170,7 @@ fn command_tool(
 pub(super) fn shell_tool() -> Tool {
     command_tool(
         "shell",
-        "Run command via POSIX sh. Use background=true beyond client deadlines.",
+        "Run via POSIX sh; use background=true when the command may outlive the client deadline.",
         "Command string executed by POSIX-compatible sh",
     )
 }
@@ -178,7 +178,7 @@ pub(super) fn shell_tool() -> Tool {
 pub(super) fn sudo_shell_tool() -> Tool {
     command_tool(
         "sudo_shell",
-        "Run command via POSIX sh under sudo. Use background=true beyond client deadlines.",
+        "Run via POSIX sh under sudo; use background=true when the command may outlive the client deadline.",
         "Command string executed by POSIX-compatible sh under sudo",
     )
 }
@@ -212,7 +212,8 @@ pub(super) fn transfer_tool() -> Tool {
                 "default": false
             },
             "timeout_ms": {
-                "type": "integer"
+                "type": "integer",
+                "description": "Server-side transfer timeout only. It does not extend the MCP client tool-call deadline, which may expire earlier."
             }
         },
         "required": ["operation", "local_path", "remote_path"]
@@ -280,7 +281,7 @@ pub(super) fn read_file_tool() -> Tool {
             },
             "timeout_ms": {
                 "type": "integer",
-                "description": "Optional timeout override in milliseconds"
+                "description": "Optional server-side read timeout. It does not extend the MCP client tool-call deadline, which may expire earlier."
             }
         },
         "required": ["remote_path"]
@@ -339,7 +340,7 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_process_tool;
+    use super::{check_process_tool, read_file_tool, shell_tool, sudo_shell_tool, transfer_tool};
 
     #[test]
     fn check_process_schema_exposes_wait_for_seconds() {
@@ -349,5 +350,34 @@ mod tests {
         assert_eq!(wait_for["type"], "integer");
         assert_eq!(wait_for["minimum"], 0);
         assert_eq!(wait_for["default"], 0);
+    }
+
+    #[test]
+    fn command_tools_explain_client_specific_deadlines() {
+        for tool in [shell_tool(), sudo_shell_tool()] {
+            let description = tool.description.as_deref().expect("tool description");
+            let timeout_description = tool.input_schema["properties"]["timeout_ms"]["description"]
+                .as_str()
+                .expect("timeout_ms description");
+
+            assert!(description.contains("background=true"));
+            assert!(timeout_description.contains("not the full tool-call deadline"));
+            assert!(timeout_description.contains("may stop waiting earlier"));
+            assert!(timeout_description.contains("background=true"));
+            assert!(!timeout_description.contains("30s"));
+        }
+    }
+
+    #[test]
+    fn non_background_tools_do_not_promise_client_deadlines() {
+        for tool in [transfer_tool(), read_file_tool()] {
+            let timeout_description = tool.input_schema["properties"]["timeout_ms"]["description"]
+                .as_str()
+                .expect("timeout_ms description");
+
+            assert!(timeout_description.contains("does not extend"));
+            assert!(timeout_description.contains("may expire earlier"));
+            assert!(!timeout_description.contains("30s"));
+        }
     }
 }

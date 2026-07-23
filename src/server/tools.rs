@@ -238,6 +238,12 @@ pub(super) fn check_process_tool() -> Tool {
                 "type": "integer",
                 "default": 50,
                 "description": "Number of lines to read from local log (default 50)"
+            },
+            "wait_for": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "If the initial state is running, wait locally for this many seconds before one final snapshot. Terminal states and errors return immediately. Cancelling the wait sends no stop signal to the remote job."
             }
         },
         "required": ["job_id"]
@@ -246,7 +252,7 @@ pub(super) fn check_process_tool() -> Tool {
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
     Tool::new(
         "check_process",
-        "Check status of a background process started by shell/sudo_shell tools. Useful for monitoring long-running commands and retrieving results after timeout.",
+        "Check status of a background process, optionally after a local passive wait. Cancelling the wait does not stop the remote job.",
         Arc::new(schema_obj),
     )
 }
@@ -328,5 +334,20 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         "apply_patch" => Some(tool_docs::APPLY_PATCH),
         "sudo_apply_patch" => Some(tool_docs::SUDO_APPLY_PATCH),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_process_tool;
+
+    #[test]
+    fn check_process_schema_exposes_wait_for_seconds() {
+        let tool = check_process_tool();
+        let wait_for = &tool.input_schema["properties"]["wait_for"];
+
+        assert_eq!(wait_for["type"], "integer");
+        assert_eq!(wait_for["minimum"], 0);
+        assert_eq!(wait_for["default"], 0);
     }
 }

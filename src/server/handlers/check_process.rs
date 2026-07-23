@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::time::Duration;
+
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
 use tracing::{debug, error};
@@ -10,19 +13,52 @@ impl SshMcpServer {
     pub(in crate::server) async fn execute_check_process(
         &self,
         params: CheckProcessParams,
+        wait_for: u64,
+        cancelled: impl Future<Output = ()>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        debug!(job_id = ?params.job_id, "check_process tool called");
+        debug!(job_id = ?params.job_id, wait_for, "check_process tool called");
 
-        match self
-            .connection
-            .check_process(
-                &params.job_id,
-                params.tail_lines,
-                self.job_registry.as_ref(),
-                &self.spooler,
-            )
-            .await
-        {
+        let status_result = async {
+            let initial = self
+                .connection
+                .check_process(
+                    &params.job_id,
+                    params.tail_lines,
+                    self.job_registry.as_ref(),
+                    &self.spooler,
+                )
+                .await?;
+
+            if wait_for == 0 || !initial.running {
+                return Ok(initial);
+            }
+
+            let delay = tokio::time::sleep(Duration::from_secs(wait_for));
+            tokio::pin!(cancelled);
+            tokio::pin!(delay);
+
+            tokio::select! {
+                biased;
+                _ = &mut cancelled => {
+                    debug!(
+                        job_id = ?params.job_id,
+                        "check_process wait cancelled; remote job was not stopped"
+                    );
+                    Ok(initial)
+                }
+                _ = &mut delay => {
+                    self.connection.check_process(
+                        &params.job_id,
+                        params.tail_lines,
+                        self.job_registry.as_ref(),
+                        &self.spooler,
+                    ).await
+                }
+            }
+        }
+        .await;
+
+        match status_result {
             Ok(status) => {
                 let result = serde_json::json!({
                     "pid": status.pid,

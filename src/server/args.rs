@@ -1,8 +1,10 @@
 use rmcp::ErrorData as McpError;
+use serde::Deserialize;
 
 use serde_json::{Map, Value};
 
 use super::SshMcpServer;
+use crate::tools::CheckProcessParams;
 
 #[derive(Debug, Clone)]
 pub(super) struct CommonToolArgs {
@@ -10,6 +12,14 @@ pub(super) struct CommonToolArgs {
     pub(super) background: bool,
     pub(super) timeout_ms: Option<u64>,
     pub(super) log_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct CheckProcessToolArgs {
+    #[serde(flatten)]
+    pub(super) check: CheckProcessParams,
+    #[serde(default)]
+    pub(super) wait_for: u64,
 }
 
 pub(super) fn parse_common_tool_args(
@@ -98,7 +108,38 @@ mod tests {
     use rmcp::model::ErrorCode;
     use serde_json::json;
 
-    use super::parse_common_tool_args;
+    use super::{CheckProcessToolArgs, parse_common_tool_args};
+
+    #[test]
+    fn check_process_wait_for_defaults_to_zero() {
+        let parsed: CheckProcessToolArgs = serde_json::from_value(json!({
+            "job_id": "job-123",
+            "tail_lines": 10,
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.check.job_id, "job-123");
+        assert_eq!(parsed.check.tail_lines, 10);
+        assert_eq!(parsed.wait_for, 0);
+    }
+
+    #[test]
+    fn check_process_wait_for_accepts_non_negative_seconds() {
+        let parsed: CheckProcessToolArgs = serde_json::from_value(json!({
+            "job_id": "job-123",
+            "wait_for": 600,
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.wait_for, 600);
+        assert!(
+            serde_json::from_value::<CheckProcessToolArgs>(json!({
+                "job_id": "job-123",
+                "wait_for": -1,
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn background_true_ignores_timeout_ms_without_validation() {

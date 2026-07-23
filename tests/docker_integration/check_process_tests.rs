@@ -10,7 +10,7 @@
 use super::common::*;
 use serde::Deserialize;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Response from check_process tool
 #[derive(Debug, Deserialize)]
@@ -178,6 +178,27 @@ async fn test_check_process_running() {
         status.elapsed_time
     );
 
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    cancel_tx.send(()).expect("send wait cancellation");
+    let cancelled_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.test_check_process_with_wait_cancellation(&bg_resp.job_id, 10, 30, cancel_rx),
+    )
+    .await
+    .expect("cancelled wait should return without waiting 30 seconds")
+    .expect("cancelled check_process should return its initial snapshot");
+    let cancelled_status = parse_check_process_response(&cancelled_result);
+    assert_eq!(cancelled_status.state, "running");
+
+    let after_cancel = server
+        .test_check_process(&bg_resp.job_id, 10)
+        .await
+        .expect("Failed to check process after cancelling wait");
+    assert!(
+        parse_check_process_response(&after_cancel).running,
+        "cancelling the local wait must not stop the remote job"
+    );
+
     server.shutdown().await;
     tracing::info!("test_check_process_running passed");
 }
@@ -236,7 +257,7 @@ async fn test_check_process_completed() {
         .expect("Failed to create SshMcpServer");
 
     let bg_result = server
-        .test_execute_background_command("sh -c 'echo done; exit 7'")
+        .test_execute_background_command("sh -c 'sleep 1; echo WAIT_FOR_DONE; exit 7'")
         .await
         .expect("Failed to start background command");
 
@@ -252,23 +273,18 @@ async fn test_check_process_completed() {
         bg_resp.pid
     );
 
-    // Poll until exit code is recorded.
-    let mut last = None;
-    for _ in 0..30 {
-        let check_result = server
-            .test_check_process(&bg_resp.job_id, 50)
-            .await
-            .expect("Failed to check process");
-        let status = parse_check_process_response(&check_result);
-        if status.exit_code == Some(7) {
-            last = Some(status);
-            break;
-        }
-        last = Some(status);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let wait_started = Instant::now();
+    let check_result = server
+        .test_check_process_with_wait(&bg_resp.job_id, 50, 2)
+        .await
+        .expect("Failed to wait before checking process");
+    let waited = wait_started.elapsed();
+    let status = parse_check_process_response(&check_result);
 
-    let status = last.expect("status should be set");
+    assert!(
+        waited >= Duration::from_secs(2),
+        "running job should wait for the full interval; elapsed: {waited:?}"
+    );
     assert!(
         !status.running,
         "Process {} should not be running but got: {:?}",
@@ -280,6 +296,21 @@ async fn test_check_process_completed() {
     assert_eq!(status.state_reason, None);
     assert_eq!(status.log_path, bg_resp.log_path);
     assert!(status.log_exists, "completed job should preserve log path");
+    assert!(status.log_tail.contains("WAIT_FOR_DONE"));
+
+    let terminal_started = Instant::now();
+    let terminal_result = server
+        .test_check_process_with_wait(&bg_resp.job_id, 10, 2)
+        .await
+        .expect("terminal job check should succeed");
+    assert!(
+        terminal_started.elapsed() < Duration::from_secs(2),
+        "terminal job should not wait for wait_for"
+    );
+    assert_eq!(
+        parse_check_process_response(&terminal_result).state,
+        "failed"
+    );
 
     // Command name might be empty for completed processes
     tracing::info!("Completed process status: {:?}", status);
@@ -343,10 +374,15 @@ async fn test_check_process_not_exists() {
 
     let job_id = "job-does-not-exist";
 
+    let check_started = Instant::now();
     let check_result = server
-        .test_check_process(job_id, 50)
+        .test_check_process_with_wait(job_id, 50, 2)
         .await
         .expect("Failed to call check_process");
+    assert!(
+        check_started.elapsed() < Duration::from_secs(2),
+        "unknown job should fail before wait_for"
+    );
 
     assert!(
         check_result.is_error.unwrap_or(false),

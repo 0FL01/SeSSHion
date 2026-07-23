@@ -39,7 +39,7 @@ use crate::server::validation::validate_background_log_path;
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
-use crate::tools::{ApplyPatchParams, CheckProcessParams, ReadFileMode, ReadFileParams};
+use crate::tools::{ApplyPatchParams, ReadFileMode, ReadFileParams};
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 mod args;
@@ -589,7 +589,7 @@ impl ServerHandler for SshMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         let tool_name: &str = request.name.as_ref();
         debug!("call_tool called: {:?}", tool_name);
@@ -638,8 +638,10 @@ impl ServerHandler for SshMcpServer {
                 self.execute_transfer(params, verbose).await
             }
             "check_process" => {
-                let params: CheckProcessParams = self.parse_tool_params(args, "check_process")?;
-                self.execute_check_process(params).await
+                let params: args::CheckProcessToolArgs =
+                    self.parse_tool_params(args, "check_process")?;
+                self.execute_check_process(params.check, params.wait_for, context.ct.cancelled())
+                    .await
             }
             "read" => {
                 let params: ReadFileParams = self.parse_tool_params(args, "read")?;

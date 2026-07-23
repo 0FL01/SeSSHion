@@ -51,10 +51,53 @@ impl SshMcpServer {
         job_id: &str,
         tail_lines: usize,
     ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_check_process(CheckProcessParams {
-            job_id: job_id.to_string(),
-            tail_lines,
-        })
+        self.execute_check_process(
+            CheckProcessParams {
+                job_id: job_id.to_string(),
+                tail_lines,
+            },
+            0,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_check_process_with_wait(
+        &self,
+        job_id: &str,
+        tail_lines: usize,
+        wait_for: u64,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_check_process(
+            CheckProcessParams {
+                job_id: job_id.to_string(),
+                tail_lines,
+            },
+            wait_for,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_check_process_with_wait_cancellation(
+        &self,
+        job_id: &str,
+        tail_lines: usize,
+        wait_for: u64,
+        cancelled: tokio::sync::oneshot::Receiver<()>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        self.execute_check_process(
+            CheckProcessParams {
+                job_id: job_id.to_string(),
+                tail_lines,
+            },
+            wait_for,
+            async move {
+                let _ = cancelled.await;
+            },
+        )
         .await
     }
 

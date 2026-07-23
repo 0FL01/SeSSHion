@@ -175,7 +175,17 @@ Start potentially long commands with `background=true`. A foreground `timeout_ms
 {"job_id": "abc123", "tail_lines": 50}
 ```
 
-`check_process` returns a strict state — `running`, `completed`, `failed`, or `state_lost` — plus the log tail. Sleep between checks (2–5s, then 10–30s for long jobs) rather than tight-polling; a job is done when the state is terminal and an `exit_code` is present.
+For a scheduled one-shot observation, set a local wait in seconds:
+
+```json
+{"job_id": "abc123", "wait_for": 600, "tail_lines": 10}
+```
+
+`check_process` first validates and snapshots the job. Errors and terminal states return immediately. A running job waits locally for the full `wait_for` interval without polling, then returns one fresh snapshot; completion during the interval does not wake the call early. The MCP client deadline must exceed the requested interval and the two SSH probes.
+
+Cancelling the local wait sends no stop signal and does not change the background job. The job may still be running or may have completed naturally, so call `check_process` again for authoritative state. Server shutdown and SSH disconnect remain separate and are not covered by this guarantee.
+
+The returned state is always one of `running`, `completed`, `failed`, or `state_lost`, plus the log tail. `completed` and `failed` include an `exit_code`; `state_lost` means the server no longer has a trustworthy terminal outcome.
 
 Background tracking requires the MCP server and its SSH session to remain alive; jobs are not guaranteed to survive an MCP server restart.
 

@@ -318,10 +318,7 @@ impl SshConnectionManager {
                     .await;
 
                 // Put the channel back (even if collection failed)
-                {
-                    let mut guard = self.su_channel.lock().await;
-                    *guard = Some(channel);
-                }
+                self.restore_su_channel(channel).await;
 
                 // Handle post-send failure: reset su state and invalidate session, no retry
                 if let Err(ref e) = result {
@@ -376,10 +373,7 @@ impl SshConnectionManager {
                     .await;
 
                 // Put the channel back
-                {
-                    let mut guard = self.su_channel.lock().await;
-                    *guard = Some(channel);
-                }
+                self.restore_su_channel(channel).await;
 
                 // Handle post-send failure: reset su state and invalidate session, no retry
                 if let Err(ref e) = result {
@@ -398,6 +392,16 @@ impl SshConnectionManager {
     async fn try_take_su_channel(&self) -> Option<russh::Channel<russh::client::Msg>> {
         let mut guard = self.su_channel.lock().await;
         guard.take()
+    }
+
+    async fn restore_su_channel(&self, channel: russh::Channel<russh::client::Msg>) {
+        let mut guard = self.su_channel.lock().await;
+        if self.is_shutting_down() {
+            drop(guard);
+            let _ = channel.eof().await;
+        } else {
+            *guard = Some(channel);
+        }
     }
 
     /// Reset su state (clear channel and elevation flag)

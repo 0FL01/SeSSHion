@@ -61,6 +61,9 @@ pub struct SshConnectionManager {
     /// Flag to prevent concurrent connection attempts
     is_connecting: AtomicBool,
 
+    /// Terminal gate preventing new SSH work after shutdown begins.
+    shutting_down: AtomicBool,
+
     /// Notification for waiters when connection attempt completes
     connect_notify: Arc<Notify>,
 
@@ -96,6 +99,7 @@ impl SshConnectionManager {
             config,
             session: Arc::new(Mutex::new(None)),
             is_connecting: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             connect_notify: Arc::new(Notify::new()),
             su_channel: Arc::new(Mutex::new(None)),
             is_elevated: AtomicBool::new(false),
@@ -118,11 +122,27 @@ impl SshConnectionManager {
             .map_err(|e| SshMcpError::connection(format!("Failed to acquire command slot: {e}")))
     }
 
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    fn ensure_not_shutting_down(&self) -> Result<()> {
+        if self.is_shutting_down() {
+            Err(SshMcpError::connection(
+                "SSH connection manager is shutting down",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Establish SSH connection
     ///
     /// If already connected, returns immediately. If another task is currently
     /// connecting, waits for that connection attempt to complete.
     pub async fn connect(&self) -> Result<()> {
+        self.ensure_not_shutting_down()?;
+
         // Check if already connected
         if self.is_connected().await {
             debug!("Already connected to SSH server");
@@ -154,7 +174,9 @@ impl SshConnectionManager {
                     CONNECT_WAIT_TIMEOUT_SECS
                 )));
             }
-            return if self.is_connected().await {
+            return if self.is_shutting_down() {
+                self.ensure_not_shutting_down()
+            } else if self.is_connected().await {
                 Ok(())
             } else {
                 Err(SshMcpError::connection("Connection failed by another task"))
@@ -300,10 +322,19 @@ impl SshConnectionManager {
         // Authenticate
         self.authenticate(&mut session).await?;
 
-        // Store session
+        // Do not publish a connection that completed after shutdown began.
+        let mut session = Some(session);
         {
             let mut session_guard = self.session.lock().await;
-            *session_guard = Some(session);
+            if !self.is_shutting_down() {
+                *session_guard = session.take();
+            }
+        }
+        if let Some(session) = session {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+            return self.ensure_not_shutting_down();
         }
         {
             let mut probe_guard = self.last_health_probe_ok_at.lock().await;
@@ -429,6 +460,8 @@ impl SshConnectionManager {
 
     /// Ensure connection is established, reconnecting if necessary
     pub async fn ensure_connected(&self) -> Result<()> {
+        self.ensure_not_shutting_down()?;
+
         if !self.is_connected().await {
             return self
                 .connect_with_retry("no active session found during ensure_connected")
@@ -572,6 +605,7 @@ impl SshConnectionManager {
     where
         F: FnOnce(&Handle<SshHandler>) -> T,
     {
+        self.ensure_not_shutting_down()?;
         let session_guard = self.session.lock().await;
         match session_guard.as_ref() {
             Some(session) => Ok(f(session)),
@@ -581,6 +615,7 @@ impl SshConnectionManager {
 
     /// Open a new session channel
     pub async fn open_channel(&self) -> Result<Channel<client::Msg>> {
+        self.ensure_not_shutting_down()?;
         let session_guard = self.session.lock().await;
         let session = session_guard
             .as_ref()
@@ -710,6 +745,7 @@ impl SshConnectionManager {
         F: FnOnce(&mut Option<Channel<client::Msg>>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.ensure_not_shutting_down()?;
         let mut channel_guard = self.su_channel.lock().await;
         f(&mut channel_guard).await
     }
@@ -719,6 +755,8 @@ impl SshConnectionManager {
     /// This starts an interactive PTY session, runs `su -`, sends the password,
     /// and waits for the root prompt (#).
     pub async fn ensure_elevated(&self) -> Result<()> {
+        self.ensure_not_shutting_down()?;
+
         // Already elevated?
         if self.is_elevated.load(Ordering::SeqCst) {
             let channel_guard = self.su_channel.lock().await;
@@ -777,6 +815,11 @@ impl SshConnectionManager {
             Ok(elevated_channel) => {
                 // Store the elevated channel
                 let mut channel_guard = self.su_channel.lock().await;
+                if self.is_shutting_down() {
+                    drop(channel_guard);
+                    let _ = elevated_channel.eof().await;
+                    return self.ensure_not_shutting_down();
+                }
                 *channel_guard = Some(elevated_channel);
                 self.is_elevated.store(true, Ordering::SeqCst);
                 info!("Successfully elevated to root via su");
@@ -919,23 +962,27 @@ impl SshConnectionManager {
 
     /// Close the SSH connection
     pub async fn close(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+
         // Close su channel if exists
-        {
+        let su_channel = {
             let mut channel_guard = self.su_channel.lock().await;
-            if let Some(ch) = channel_guard.take() {
-                let _ = ch.eof().await;
-            }
+            channel_guard.take()
+        };
+        if let Some(ch) = su_channel {
+            let _ = ch.eof().await;
         }
         self.is_elevated.store(false, Ordering::SeqCst);
 
         // Close main session
-        {
+        let session = {
             let mut session_guard = self.session.lock().await;
-            if let Some(session) = session_guard.take() {
-                let _ = session
-                    .disconnect(russh::Disconnect::ByApplication, "", "")
-                    .await;
-            }
+            session_guard.take()
+        };
+        if let Some(session) = session {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
         }
 
         {
@@ -993,6 +1040,7 @@ impl SshConnectionManager {
     /// connection is required. It clears all session state and performs
     /// a new connection attempt.
     pub async fn reconnect(&self) -> Result<()> {
+        self.ensure_not_shutting_down()?;
         self.invalidate_session("explicit reconnect requested")
             .await;
         self.connect_with_retry("explicit reconnect requested")
@@ -1007,6 +1055,7 @@ impl std::fmt::Debug for SshConnectionManager {
             .field("port", &self.config.port)
             .field("username", &self.config.username)
             .field("is_connecting", &self.is_connecting.load(Ordering::SeqCst))
+            .field("shutting_down", &self.shutting_down.load(Ordering::SeqCst))
             .field("is_elevated", &self.is_elevated.load(Ordering::SeqCst))
             .field(
                 "has_timeout_cmd",
@@ -1040,6 +1089,21 @@ mod tests {
         // Should return error when trying to open channel without connecting
         let result = manager.open_channel().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_close_prevents_new_ssh_work() {
+        let config = SshConfig::new("127.0.0.1", "testuser").with_port(9);
+        let manager = SshConnectionManager::new(config).await;
+
+        manager.close().await;
+        manager.close().await;
+
+        assert!(manager.is_shutting_down());
+        assert!(manager.connect().await.is_err());
+        assert!(manager.ensure_connected().await.is_err());
+        assert!(manager.open_channel().await.is_err());
+        assert!(manager.reconnect().await.is_err());
     }
 
     #[tokio::test]

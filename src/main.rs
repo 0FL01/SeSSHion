@@ -4,8 +4,11 @@
 //! It parses CLI arguments, validates configuration, starts the MCP server
 //! on stdio transport, and handles graceful shutdown.
 
+use std::time::Duration;
+
 use clap::Parser;
 use rmcp::service::ServiceExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use ssh_mcp::config::{Args, Config};
@@ -13,8 +16,18 @@ use ssh_mcp::error::Result;
 use ssh_mcp::logging::init_logging;
 use ssh_mcp::server::SshMcpServer;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(run());
+    // ponytail: Tokio stdin can outlive cancellation; use nonblocking stdio if
+    // shutdown must wait for every runtime task instead of bounding the wait.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn run() -> Result<()> {
     // Parse CLI arguments
     let args = Args::parse();
 
@@ -59,11 +72,13 @@ async fn main() -> Result<()> {
 
     info!("SSH MCP Server running on stdio");
 
-    // Create a clone for the shutdown handler
+    // Keep a clone for cleanup after the MCP service has stopped.
     let server_for_shutdown = server.clone();
+    let lifecycle = CancellationToken::new();
+    let signal_lifecycle = lifecycle.clone();
 
-    // Spawn a task to handle shutdown signals
-    let shutdown_handle = tokio::spawn(async move {
+    // Signals stop MCP ingress first. SSH is closed after the service drains.
+    let signal_handle = tokio::spawn(async move {
         // Wait for Ctrl+C or SIGTERM
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -91,31 +106,43 @@ async fn main() -> Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
-
-        // Cleanup
-        server_for_shutdown.shutdown().await;
+        signal_lifecycle.cancel();
     });
 
     // Start the MCP server on stdio transport
     // Note: rmcp's stdio() returns a transport that connects stdin/stdout for JSON-RPC
-    match server.serve(rmcp::transport::io::stdio()).await {
+    let service_result = match server
+        .serve_with_ct(rmcp::transport::io::stdio(), lifecycle.clone())
+        .await
+    {
         Ok(running_server) => {
             // Wait for the server to finish (it will run until the transport closes)
             info!("MCP server is serving...");
             if let Err(e) = running_server.waiting().await {
                 error!(error = ?e, "Server error");
             }
+            Ok(())
+        }
+        Err(_e) if lifecycle.is_cancelled() => {
+            info!("MCP server initialization cancelled");
+            Ok(())
         }
         Err(e) => {
             error!(error = ?e, "Failed to start MCP server");
-            return Err(ssh_mcp::SshMcpError::connection(e.to_string()));
+            Err(ssh_mcp::SshMcpError::connection(e.to_string()))
         }
-    }
+    };
 
-    // Cancel the shutdown handler if we exit normally
-    shutdown_handle.abort();
+    lifecycle.cancel();
+    signal_handle.abort();
+    if let Err(e) = signal_handle.await
+        && !e.is_cancelled()
+    {
+        error!(error = ?e, "Shutdown signal task failed");
+    }
+    server_for_shutdown.shutdown().await;
 
     info!("SSH MCP Server stopped");
 
-    Ok(())
+    service_result
 }

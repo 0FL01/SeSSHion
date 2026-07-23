@@ -3198,6 +3198,7 @@ version = "3.0.2"
 dependencies = [
  "anyhow",
  "clap",
+ "nix",
  "rmcp",
  "russh",
  "schemars 1.2.0",
@@ -3208,6 +3209,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

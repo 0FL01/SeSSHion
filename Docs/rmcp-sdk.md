@@ -1,4 +1,4 @@
-# rmcp - Official Rust MCP SDK (v0.13.0)
+# rmcp - Official Rust MCP SDK (v2.2.0)
 
 > Source: https://docs.rs/rmcp/latest/rmcp/
 
@@ -41,7 +41,7 @@ impl Counter {
     async fn increment(&self) -> Result<CallToolResult, McpError> {
         let mut counter = self.counter.lock().await;
         *counter += 1;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             counter.to_string(),
         )]))
     }
@@ -90,7 +90,7 @@ async fn calculate(
 | `ServerHandler` | Trait to implement for server types |
 | `ToolRouter<T>` | Router for tool dispatch |
 | `CallToolResult` | Result type for tool calls |
-| `Content::text()` | Create text content response |
+| `ContentBlock::text()` | Create text content response |
 | `ErrorData` | MCP error representation |
 
 ## Modules

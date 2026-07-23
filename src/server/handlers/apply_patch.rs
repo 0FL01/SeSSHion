@@ -120,8 +120,8 @@ fn apply_patch_result(body: Value, is_error: bool) -> CallToolResult {
         "{\"ok\":false,\"error\":\"serialization_error\",\"message\":\"failed to serialize apply_patch response\"}".to_owned()
     });
     if is_error {
-        CallToolResult::error(vec![Content::text(text)])
+        CallToolResult::error(vec![ContentBlock::text(text)])
     } else {
-        CallToolResult::success(vec![Content::text(text)])
+        CallToolResult::success(vec![ContentBlock::text(text)])
     }
 }

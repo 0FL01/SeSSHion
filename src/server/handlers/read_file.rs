@@ -1,5 +1,5 @@
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error};
 
@@ -51,7 +51,9 @@ impl SshMcpServer {
 
         if let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )]));
         }
 
         let capture_path = self
@@ -70,7 +72,7 @@ impl SshMcpServer {
         let mut capture_file = match capture_opts.open(&capture_path).await {
             Ok(file) => file,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: failed to create local read capture file: {e}"
                 ))]));
             }
@@ -121,13 +123,13 @@ impl SshMcpServer {
 
         if let Err(e) = capture_file.flush().await {
             let _ = tokio::fs::remove_file(&capture_path).await;
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error: failed to flush local read capture file: {e}"
             ))]));
         }
         if let Err(e) = capture_file.sync_all().await {
             let _ = tokio::fs::remove_file(&capture_path).await;
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error: failed to sync local read capture file: {e}"
             ))]));
         }
@@ -137,7 +139,7 @@ impl SshMcpServer {
             Ok(out) => out,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&capture_path).await;
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error reading file: {e}"
                 ))]));
             }
@@ -151,21 +153,21 @@ impl SshMcpServer {
                 _ => "Error: read failed on remote host".to_string(),
             };
             let _ = tokio::fs::remove_file(&capture_path).await;
-            return Ok(CallToolResult::error(vec![Content::text(msg)]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]));
         }
 
         match exec_out.exit_code {
             Some(0) => {}
             Some(code) => {
                 let _ = tokio::fs::remove_file(&capture_path).await;
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     build_read_file_remote_failure(Some(code), &exec_out.stderr),
                 )]));
             }
             None => {
                 if !exec_out.stderr.trim().is_empty() {
                     let _ = tokio::fs::remove_file(&capture_path).await;
-                    return Ok(CallToolResult::error(vec![Content::text(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
                         build_read_file_remote_failure(None, &exec_out.stderr),
                     )]));
                 }
@@ -176,7 +178,7 @@ impl SshMcpServer {
             Ok(metadata) => metadata,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&capture_path).await;
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: failed to inspect local capture file: {e}"
                 ))]));
             }
@@ -184,7 +186,7 @@ impl SshMcpServer {
 
         if metadata.len() > max_read_bytes as u64 {
             let _ = tokio::fs::remove_file(&capture_path).await;
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 read_file_too_large_error(max_read_bytes),
             )]));
         }
@@ -193,7 +195,7 @@ impl SshMcpServer {
             Ok(file) => file,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&capture_path).await;
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: failed to open local capture file: {e}"
                 ))]));
             }
@@ -207,7 +209,7 @@ impl SshMcpServer {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&capture_path).await;
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "Error: failed to read local capture file: {e}"
                     ))]));
                 }
@@ -215,7 +217,7 @@ impl SshMcpServer {
 
             if bytes.len().saturating_add(read) > max_read_bytes {
                 let _ = tokio::fs::remove_file(&capture_path).await;
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     read_file_too_large_error(max_read_bytes),
                 )]));
             }
@@ -227,7 +229,7 @@ impl SshMcpServer {
             Ok(text) => text,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&capture_path).await;
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: file is not valid UTF-8 text ({})",
                     e.utf8_error()
                 ))]));
@@ -265,7 +267,7 @@ impl SshMcpServer {
             result["hint"] = serde_json::Value::String(hint);
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             result.to_string(),
         )]))
     }

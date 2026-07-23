@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use tracing::{debug, error};
 
 use crate::server::SshMcpServer;
@@ -72,13 +72,13 @@ impl SshMcpServer {
                     "log_exists": status.log_exists,
                     "log_tail": status.log_tail,
                 });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     result.to_string(),
                 )]))
             }
             Err(e) => {
                 error!(job_id = ?params.job_id, error = ?e, "check_process failed");
-                Ok(CallToolResult::error(vec![Content::text(format!(
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error checking process: {}",
                     e
                 ))]))

@@ -312,7 +312,9 @@ impl SshMcpServer {
         if requires_elevation {
             if let Err(e) = self.connection.ensure_connected().await {
                 error!(error = ?e, "Failed to ensure SSH connection");
-                return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    e.to_string(),
+                )]));
             }
 
             if let Err(e) = self.connection.ensure_elevated().await {
@@ -323,7 +325,9 @@ impl SshMcpServer {
         // Ensure connection is established for detached foreground execution path.
         if !requires_elevation && let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )]));
         }
 
         self.execute_detachable_foreground_impl(&sanitized, &sanitized, timeout)
@@ -374,7 +378,9 @@ impl SshMcpServer {
 
         if let Err(e) = self.connection.ensure_connected().await {
             error!(error = ?e, "Failed to ensure SSH connection");
-            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )]));
         }
 
         self.execute_detachable_foreground_impl(
@@ -412,7 +418,7 @@ impl SshMcpServer {
     fn sanitize_or_tool_error(&self, command: &str) -> std::result::Result<String, CallToolResult> {
         sanitize_command(command, self.max_chars).map_err(|e| {
             error!(error = ?e, "Command sanitization failed");
-            CallToolResult::error(vec![Content::text(format!("Error: {}", e))])
+            CallToolResult::error(vec![ContentBlock::text(format!("Error: {}", e))])
         })
     }
 
@@ -430,9 +436,9 @@ impl SshMcpServer {
         // exit_code=None means the SSH channel was torn down without delivering
         // an exit status or exit signal — treat as error, not success.
         if output.exit_code.map(|code| code != 0).unwrap_or(true) {
-            CallToolResult::error(vec![Content::text(result_text)])
+            CallToolResult::error(vec![ContentBlock::text(result_text)])
         } else {
-            CallToolResult::success(vec![Content::text(result_text)])
+            CallToolResult::success(vec![ContentBlock::text(result_text)])
         }
     }
 
@@ -515,7 +521,7 @@ impl SshMcpServer {
             let body = resp
                 .to_json(verbose)
                 .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization_error\"}".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(body)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(body)]));
         }
 
         let resp = self
@@ -539,7 +545,7 @@ impl SshMcpServer {
         let body = resp
             .to_json(verbose)
             .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization_error\"}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 }
 
@@ -694,13 +700,10 @@ mod tests {
         result
             .content
             .iter()
-            .filter_map(|c| c.raw.as_text().map(|text| text.text.clone()))
+            .filter_map(|c| c.as_text().map(|text| text.text.clone()))
             .collect::<Vec<_>>()
             .join("\n")
     }
-
-    // Note: Real tests would require a mock SSH server or testcontainers
-    // These are placeholder tests
 
     #[test]
     fn test_server_info() {

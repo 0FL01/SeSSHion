@@ -110,13 +110,7 @@ pub fn extract_text_from_result(result: &rmcp::model::CallToolResult) -> String 
     result
         .content
         .iter()
-        .filter_map(|c| {
-            // Content is Annotated<RawContent>, and RawContent has a text() method
-            // Access to raw field to get the underlying RawContent
-            c.raw
-                .as_text()
-                .map(|text_content| text_content.text.clone())
-        })
+        .filter_map(|c| c.as_text().map(|text_content| text_content.text.clone()))
         .collect::<Vec<_>>()
         .join("\n")
 }

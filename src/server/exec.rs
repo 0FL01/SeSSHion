@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, error, warn};
 
@@ -49,13 +49,13 @@ impl SshMcpServer {
         let (final_log_path_buf, final_log_path) = match self.default_local_log_path(&job_id) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: {e}"
                 ))]));
             }
         };
         if let Err(e) = self.ensure_local_log_file(&final_log_path_buf).await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error: {e}"
             ))]));
         }
@@ -66,7 +66,7 @@ impl SshMcpServer {
         let permit = match self.connection.acquire_command_slot_raw().await {
             Ok(p) => p,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: Failed to acquire command slot: {e}"
                 ))]));
             }
@@ -79,7 +79,7 @@ impl SshMcpServer {
         {
             Ok(ch) => ch,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: {e}"
                 ))]));
             }
@@ -95,7 +95,7 @@ impl SshMcpServer {
         {
             Ok(v) => v,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: {e}"
                 ))]));
             }
@@ -131,13 +131,13 @@ impl SshMcpServer {
                 Ok(Ok(code)) => code,
                 Ok(Err(e)) => {
                     error!(job_id = ?job_id, error = ?e, "streaming failed");
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "Error: streaming failed: {e}"
                     ))]));
                 }
                 Err(e) => {
                     error!(job_id = ?job_id, error = ?e, "streaming task join failed");
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "Error: streaming task join failed: {e}"
                     ))]));
                 }
@@ -181,7 +181,7 @@ impl SshMcpServer {
         let mut file = match tokio::fs::File::open(&final_log_path_buf).await {
             Ok(f) => f,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: failed to read local log: {e}"
                 ))]));
             }

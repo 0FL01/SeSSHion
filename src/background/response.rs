@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 pub(crate) const BACKGROUND_JSON_SNIPPET_LIMIT_CHARS: usize = 2048;
 
@@ -31,7 +31,7 @@ pub(crate) fn background_json_ok(job_id: &str, pid: u32, local_log_path: &str) -
     })
     .to_string();
 
-    CallToolResult::success(vec![Content::text(body)])
+    CallToolResult::success(vec![ContentBlock::text(body)])
 }
 
 pub(crate) fn background_json_timeout(
@@ -72,7 +72,7 @@ pub(crate) fn background_json_timeout(
     })
     .to_string();
 
-    CallToolResult::success(vec![Content::text(body)])
+    CallToolResult::success(vec![ContentBlock::text(body)])
 }
 
 pub(crate) fn background_json_err(error: &str, stderr: &str) -> CallToolResult {
@@ -105,5 +105,5 @@ pub(crate) fn background_json_err(error: &str, stderr: &str) -> CallToolResult {
     );
     let body = serde_json::Value::Object(obj).to_string();
 
-    CallToolResult::success(vec![Content::text(body)])
+    CallToolResult::success(vec![ContentBlock::text(body)])
 }

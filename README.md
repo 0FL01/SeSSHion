@@ -183,7 +183,7 @@ For a scheduled one-shot observation, set a local wait in seconds:
 
 `check_process` first validates and snapshots the job. Errors and terminal states return immediately. A running job waits locally for the full `wait_for` interval without polling, then returns one fresh snapshot; completion during the interval does not wake the call early. The MCP client deadline must exceed the requested interval and the two SSH probes.
 
-Cancelling the request stops only the passive local wait after its initial snapshot. It does not interrupt an initial SSH probe or a final probe that has already started, send a stop signal, close SSH, or cancel the background streamer. The job may still be running or may have completed naturally, so call `check_process` again for authoritative state.
+Cancelling the request stops only the passive local wait after its initial snapshot. It does not interrupt an initial SSH probe or a final probe that has already started, send a stop signal, close SSH, or cancel the background streamer. RMCP suppresses the late response to a protocol-cancelled request; call `check_process` again for authoritative state because the job may still be running or may have completed naturally.
 
 On SIGINT or SIGTERM, the server cancels the MCP service and performs its bounded request drain before closing SSH. Shutdown prevents new SSH connections and reconnects, but closing the session may terminate channel-bound remote commands; no explicit remote kill or survival guarantee is made.
 

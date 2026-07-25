@@ -37,7 +37,6 @@ impl McpProcess {
                 "secret",
                 "--strict-host-key-checking",
                 "no",
-                "--disable-sudo",
             ])
             .env("TMPDIR", temp_dir.path())
             .current_dir(temp_dir.path())
@@ -186,7 +185,7 @@ async fn stdin_eof_stops_initialized_server() {
 }
 
 #[tokio::test]
-async fn read_tool_is_not_advertised_or_callable() {
+async fn default_tool_surface_is_exact_and_read_is_unknown() {
     let mut process = McpProcess::spawn("127.0.0.1", 9).await;
     process.initialize().await;
 
@@ -206,7 +205,17 @@ async fn read_tool_is_not_advertised_or_callable() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect::<Vec<_>>();
-    assert_eq!(names, ["shell", "check_process", "transfer", "apply_patch"]);
+    assert_eq!(
+        names,
+        [
+            "shell",
+            "sudo_shell",
+            "sudo_apply_patch",
+            "check_process",
+            "transfer",
+            "apply_patch",
+        ]
+    );
 
     process
         .send(json!({

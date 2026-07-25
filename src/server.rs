@@ -462,14 +462,6 @@ impl SshMcpServer {
         tools::sudo_apply_patch_tool()
     }
 
-    /// Get extended documentation for a tool by name
-    ///
-    /// Returns the full documentation text that was removed from compact tool definitions
-    /// to save tokens in the MCP protocol.
-    pub fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
-        tools::get_tool_documentation(tool_name)
-    }
-
     /// Resolve timeout duration from optional milliseconds, falling back to server default.
     fn resolve_timeout(&self, timeout_ms: Option<u64>) -> Duration {
         timeout_ms
@@ -905,111 +897,5 @@ mod tests {
             !hint.contains("<log_path>"),
             "hint should not contain <log_path> placeholder; got: '{hint}'"
         );
-    }
-
-    #[test]
-    fn test_tool_documentation_available() {
-        // Verify that extended documentation is available for all tools
-        assert!(SshMcpServer::get_tool_documentation("shell").is_some());
-        assert!(SshMcpServer::get_tool_documentation("sudo_shell").is_some());
-        assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
-        assert!(SshMcpServer::get_tool_documentation("read").is_none());
-        assert!(SshMcpServer::get_tool_documentation("apply_patch").is_some());
-        assert!(SshMcpServer::get_tool_documentation("sudo_apply_patch").is_some());
-        assert!(SshMcpServer::get_tool_documentation("write-file").is_none());
-        assert!(SshMcpServer::get_tool_documentation("replace-in-file").is_none());
-        assert!(SshMcpServer::get_tool_documentation("unknown").is_none());
-    }
-
-    #[test]
-    fn test_shell_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("shell").unwrap();
-        assert!(docs.contains("SHELL TOOL"));
-        assert!(docs.contains("PARAMETERS:"));
-        assert!(docs.contains("BACKGROUND MODE:"));
-        assert!(docs.contains("command"));
-        assert!(docs.contains("background"));
-        assert!(docs.contains("still_running"));
-        assert!(docs.contains("not the full tool-call deadline"));
-        assert!(docs.contains("client may stop waiting earlier"));
-    }
-
-    #[test]
-    fn test_sudo_shell_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("sudo_shell").unwrap();
-        assert!(docs.contains("SUDO_SHELL TOOL"));
-        assert!(docs.contains("sudo"));
-        assert!(docs.contains("not the full tool-call deadline"));
-    }
-
-    #[test]
-    fn test_transfer_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("transfer").unwrap();
-        assert!(docs.contains("TRANSFER TOOL"));
-        assert!(docs.contains("put"));
-        assert!(docs.contains("get"));
-        assert!(docs.contains("TRANSPORTS:"));
-    }
-
-    #[test]
-    fn test_apply_patch_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("apply_patch").unwrap();
-        assert!(docs.contains("APPLY_PATCH TOOL"));
-        assert!(docs.contains("Add File"));
-        assert!(docs.contains("Delete File"));
-    }
-
-    #[test]
-    fn test_sudo_apply_patch_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("sudo_apply_patch").unwrap();
-        assert!(docs.contains("SUDO_APPLY_PATCH TOOL"));
-        assert!(docs.contains("sudo"));
-    }
-
-    #[test]
-    fn test_compact_tool_descriptions() {
-        // Verify that tool descriptions are compact (not verbose)
-        let shell = SshMcpServer::shell_tool();
-        let sudo_shell = SshMcpServer::sudo_shell_tool();
-        let transfer = SshMcpServer::transfer_tool();
-        let apply_patch = SshMcpServer::apply_patch_tool();
-        let sudo_apply_patch = SshMcpServer::sudo_apply_patch_tool();
-
-        // Descriptions should be present but concise (under 100 chars)
-        if let Some(desc) = shell.description {
-            assert!(
-                desc.len() < 100,
-                "shell description too long: {} chars",
-                desc.len()
-            );
-        }
-        if let Some(desc) = sudo_shell.description {
-            assert!(
-                desc.len() < 100,
-                "sudo_shell description too long: {} chars",
-                desc.len()
-            );
-        }
-        if let Some(desc) = transfer.description {
-            assert!(
-                desc.len() < 100,
-                "transfer description too long: {} chars",
-                desc.len()
-            );
-        }
-        if let Some(desc) = apply_patch.description {
-            assert!(
-                desc.len() < 100,
-                "apply_patch description too long: {} chars",
-                desc.len()
-            );
-        }
-        if let Some(desc) = sudo_apply_patch.description {
-            assert!(
-                desc.len() < 100,
-                "sudo_apply_patch description too long: {} chars",
-                desc.len()
-            );
-        }
     }
 }

@@ -4,8 +4,6 @@ use std::path::{Component, Path};
 
 use crate::validate::validate_basic_path_str;
 
-const READ_FILE_ERROR_MARKER: &str = "__SSH_MCP_READ_FILE_ERR__";
-
 /// Validates a background job log path.
 ///
 /// Current semantics: log_path is a LOCAL path on the MCP server.
@@ -38,28 +36,4 @@ pub(crate) fn validate_background_log_path(
     }
 
     Ok(())
-}
-
-/// Validates a remote file path for read operations.
-pub(crate) fn validate_read_file_path(remote_path: &str) -> std::result::Result<(), String> {
-    validate_basic_path_str(remote_path, "remote_path")?;
-
-    if !remote_path.starts_with('/') {
-        return Err("remote_path must be an absolute path".to_string());
-    }
-
-    if remote_path.ends_with('/') {
-        return Err("remote_path must not end with '/'".to_string());
-    }
-
-    Ok(())
-}
-
-/// Parses a read error marker from stderr.
-pub(crate) fn parse_read_file_error_marker(stderr: &str) -> Option<&str> {
-    stderr.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(READ_FILE_ERROR_MARKER)
-            .map(str::trim)
-    })
 }

@@ -8,7 +8,6 @@ use crate::platform::O_NOFOLLOW_FLAG;
 use crate::server::SshMcpServer;
 use crate::server::make_job_id;
 use crate::server::validation::file_edit::*;
-use crate::server::validation::read_file::sanitize_read_file_stderr_snippet;
 use crate::shell_escape::escape_for_shell;
 use crate::ssh::wrap_sudo_command;
 
@@ -616,7 +615,7 @@ fn remote_error_with_stderr(kind: &'static str, message: &str, stderr: &str) -> 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let message = match sanitize_read_file_stderr_snippet(&details) {
+    let message = match sanitize_file_edit_stderr_snippet(&details) {
         Some(snippet) => format!("{message}; stderr={snippet}"),
         None => message.to_owned(),
     };
@@ -628,7 +627,7 @@ fn remote_failure_message(operation: &str, exit_code: Option<u32>, stderr: &str)
         Some(code) => format!("failed to {operation}: remote command exited with code {code}"),
         None => format!("failed to {operation}: remote command did not report an exit status"),
     };
-    if let Some(snippet) = sanitize_read_file_stderr_snippet(stderr) {
+    if let Some(snippet) = sanitize_file_edit_stderr_snippet(stderr) {
         message.push_str(&format!("; stderr={snippet}"));
     }
     message

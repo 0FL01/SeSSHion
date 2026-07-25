@@ -24,6 +24,7 @@ NOTE:
 - check_process returns strict states: `running`, `completed`, `failed`, or `state_lost`.
 - If `state_lost`, the MCP server no longer has a trustworthy terminal outcome; inspect `log_path` / `log_tail` before retrying.
 - Commands are evaluated by POSIX-compatible sh on the remote host. Prefer portable shell syntax over shell-specific extensions.
+- Keep file reads bounded with tools such as `head`, `tail`, or `sed`; use transfer with operation=get to retrieve large files.
 
 EXAMPLE:
 {"command": "apt update && apt install -y nginx", "background": true}"#;
@@ -73,25 +74,6 @@ SAFETY:
 
 EXAMPLE:
 {"operation": "put", "local_path": "config.yml", "remote_path": "/etc/app/config.yml"}"#;
-
-    pub const READ: &str = r#"READ TOOL
-Read UTF-8 text file contents from the remote host via deterministic raw SSH streaming.
-
-PARAMETERS:
-- remote_path (string, required): Absolute remote file path to read
-- mode (string): "preview" (default), "head", "tail", or "full"
-- lines (integer): Line count for preview/head/tail (default: 800, max: 10000)
-- timeout_ms (integer): Optional server-side read timeout override. It does not extend the MCP client's tool-call deadline, which may expire earlier.
-
-BEHAVIOR:
-- Uses raw streaming transport (no exec output token truncation)
-- Default preview mode returns the first 800 lines to avoid context bombs
-- Returns JSON with path/content/returned_lines/truncated/token estimates and an optional hint
-- Enforces deterministic size limits (aligned with max_output_tokens, hard-capped)
-- Returns an error for missing path, non-file paths, oversized files, or invalid UTF-8 content
-
-EXAMPLE:
-{"remote_path": "/etc/nginx/nginx.conf", "mode": "preview"}"#;
 
     pub const APPLY_PATCH: &str = r#"APPLY_PATCH TOOL
 Create, update, or delete one remote UTF-8 text file as the SSH user with an exact patch.
@@ -170,7 +152,7 @@ fn command_tool(
 pub(super) fn shell_tool() -> Tool {
     command_tool(
         "shell",
-        "Run via POSIX sh; use background=true when the command may outlive the client deadline.",
+        "Run via POSIX sh; use head/tail/sed for bounded file reads and background=true for long commands.",
         "Command string executed by POSIX-compatible sh",
     )
 }
@@ -178,7 +160,7 @@ pub(super) fn shell_tool() -> Tool {
 pub(super) fn sudo_shell_tool() -> Tool {
     command_tool(
         "sudo_shell",
-        "Run via POSIX sh under sudo; use background=true when the command may outlive the client deadline.",
+        "Run via POSIX sh under sudo; keep file reads bounded and use background=true for long commands.",
         "Command string executed by POSIX-compatible sh under sudo",
     )
 }
@@ -258,43 +240,6 @@ pub(super) fn check_process_tool() -> Tool {
     )
 }
 
-pub(super) fn read_file_tool() -> Tool {
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "remote_path": {
-                "type": "string",
-                "description": "Absolute remote file path to read"
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["preview", "head", "tail", "full"],
-                "default": "preview",
-                "description": "Read mode: safe preview (default), head, tail, or full"
-            },
-            "lines": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 10000,
-                "default": 800,
-                "description": "Line count for preview/head/tail modes"
-            },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Optional server-side read timeout. It does not extend the MCP client tool-call deadline, which may expire earlier."
-            }
-        },
-        "required": ["remote_path"]
-    });
-
-    let schema_obj = schema.as_object().cloned().unwrap_or_default();
-    Tool::new(
-        "read",
-        "Read a remote UTF-8 text file with safe preview/head/tail/full modes.",
-        Arc::new(schema_obj),
-    )
-}
-
 pub(super) fn apply_patch_tool() -> Tool {
     patch_tool(
         "apply_patch",
@@ -331,7 +276,6 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
         "shell" => Some(tool_docs::SHELL),
         "sudo_shell" => Some(tool_docs::SUDO_SHELL),
         "transfer" => Some(tool_docs::TRANSFER),
-        "read" => Some(tool_docs::READ),
         "apply_patch" => Some(tool_docs::APPLY_PATCH),
         "sudo_apply_patch" => Some(tool_docs::SUDO_APPLY_PATCH),
         _ => None,
@@ -340,7 +284,7 @@ pub(super) fn get_tool_documentation(tool_name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_process_tool, read_file_tool, shell_tool, sudo_shell_tool, transfer_tool};
+    use super::{check_process_tool, shell_tool, sudo_shell_tool, transfer_tool};
 
     #[test]
     fn check_process_schema_exposes_wait_for_seconds() {
@@ -370,14 +314,13 @@ mod tests {
 
     #[test]
     fn non_background_tools_do_not_promise_client_deadlines() {
-        for tool in [transfer_tool(), read_file_tool()] {
-            let timeout_description = tool.input_schema["properties"]["timeout_ms"]["description"]
-                .as_str()
-                .expect("timeout_ms description");
+        let tool = transfer_tool();
+        let timeout_description = tool.input_schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .expect("timeout_ms description");
 
-            assert!(timeout_description.contains("does not extend"));
-            assert!(timeout_description.contains("may expire earlier"));
-            assert!(!timeout_description.contains("30s"));
-        }
+        assert!(timeout_description.contains("does not extend"));
+        assert!(timeout_description.contains("may expire earlier"));
+        assert!(!timeout_description.contains("30s"));
     }
 }

@@ -26,20 +26,11 @@ use crate::error::{Result, SshMcpError};
 use crate::platform::O_NOFOLLOW_FLAG;
 use crate::server::handlers::file_edit_common::{FileEditFaultInjection, FileEditPrivilege};
 #[cfg(test)]
-use crate::server::validation::read_file::{
-    READ_FILE_BYTES_PER_TOKEN, READ_FILE_DEFAULT_PREVIEW_LINES, READ_FILE_HARD_MAX_BYTES,
-    READ_FILE_MAX_LINE_WINDOW,
-};
-#[cfg(test)]
-use crate::server::validation::read_file::{
-    estimate_tokens_from_bytes, resolve_read_file_line_limit, resolve_read_file_max_bytes,
-};
-#[cfg(test)]
 use crate::server::validation::validate_background_log_path;
 use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
-use crate::tools::{ApplyPatchParams, ReadFileMode, ReadFileParams};
+use crate::tools::ApplyPatchParams;
 use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
 
 mod args;
@@ -50,7 +41,6 @@ mod tools;
 mod validation;
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(20);
-const READ_FILE_ERROR_MARKER: &str = "__SSH_MCP_READ_FILE_ERR__";
 
 const JOB_COMPLETED_RETENTION: Duration = Duration::from_secs(60 * 60);
 
@@ -462,11 +452,6 @@ impl SshMcpServer {
         tools::check_process_tool()
     }
 
-    /// Build read tool definition
-    fn read_file_tool() -> Tool {
-        tools::read_file_tool()
-    }
-
     /// Build apply_patch tool definition
     fn apply_patch_tool() -> Tool {
         tools::apply_patch_tool()
@@ -574,14 +559,13 @@ impl ServerHandler for SshMcpServer {
 
         let mut tools = vec![Self::shell_tool()];
 
-        // Docs/expected order: shell, optional sudo tools, check_process, transfer, read, apply_patch.
+        // Docs/expected order: shell, optional sudo tools, check_process, transfer, apply_patch.
         if !self.config.disable_sudo {
             tools.push(Self::sudo_shell_tool());
             tools.push(Self::sudo_apply_patch_tool());
         }
         tools.push(Self::check_process_tool());
         tools.push(Self::transfer_tool());
-        tools.push(Self::read_file_tool());
         tools.push(Self::apply_patch_tool());
 
         Ok(ListToolsResult {
@@ -649,10 +633,6 @@ impl ServerHandler for SshMcpServer {
                 self.execute_check_process(params.check, params.wait_for, context.ct.cancelled())
                     .await
             }
-            "read" => {
-                let params: ReadFileParams = self.parse_tool_params(args, "read")?;
-                self.execute_read_file(params).await
-            }
             "apply_patch" => {
                 let params: ApplyPatchParams = self.parse_tool_params(args, "apply_patch")?;
                 self.execute_apply_patch(
@@ -693,8 +673,6 @@ mod tests {
         BACKGROUND_JSON_SNIPPET_LIMIT_CHARS, background_json_err, background_json_timeout,
     };
     use crate::background::wrapper::{build_background_wrapper_script, remote_job_log_path};
-    use crate::server::validation::common::validate_read_file_path;
-    use crate::server::validation::read_file::sanitize_read_file_stderr_snippet;
 
     fn extract_text_from_result(result: &CallToolResult) -> String {
         result
@@ -722,13 +700,6 @@ mod tests {
     fn test_sudo_shell_tool_definition() {
         let tool = SshMcpServer::sudo_shell_tool();
         assert_eq!(tool.name.as_ref(), "sudo_shell");
-        assert!(tool.description.is_some());
-    }
-
-    #[test]
-    fn test_read_file_tool_definition() {
-        let tool = SshMcpServer::read_file_tool();
-        assert_eq!(tool.name.as_ref(), "read");
         assert!(tool.description.is_some());
     }
 
@@ -799,92 +770,6 @@ mod tests {
         assert!(
             validate_background_log_path(Path::new("/tmp/ssh-mcp"), "/tmp/x\rrm -rf /").is_err()
         );
-    }
-
-    #[test]
-    fn test_validate_read_file_path_requires_absolute() {
-        let err = validate_read_file_path("relative/path").unwrap_err();
-        assert!(err.contains("absolute"));
-    }
-
-    #[test]
-    fn test_validate_read_file_path_rejects_trailing_slash() {
-        let err = validate_read_file_path("/etc/").unwrap_err();
-        assert!(err.contains("must not end with '/'"));
-    }
-
-    #[test]
-    fn test_resolve_read_file_max_bytes_uses_token_limit() {
-        assert_eq!(
-            resolve_read_file_max_bytes(Some(12_000)),
-            12_000 * READ_FILE_BYTES_PER_TOKEN
-        );
-    }
-
-    #[test]
-    fn test_resolve_read_file_max_bytes_none_uses_hard_cap() {
-        assert_eq!(resolve_read_file_max_bytes(None), READ_FILE_HARD_MAX_BYTES);
-    }
-
-    #[test]
-    fn test_resolve_read_file_max_bytes_applies_hard_cap() {
-        let very_large_tokens = READ_FILE_HARD_MAX_BYTES;
-        assert_eq!(
-            resolve_read_file_max_bytes(Some(very_large_tokens)),
-            READ_FILE_HARD_MAX_BYTES
-        );
-    }
-
-    #[test]
-    fn test_estimate_tokens_from_bytes_rounds_up() {
-        assert_eq!(estimate_tokens_from_bytes(0), 0);
-        assert_eq!(estimate_tokens_from_bytes(1), 1);
-        assert_eq!(estimate_tokens_from_bytes(4), 1);
-        assert_eq!(estimate_tokens_from_bytes(5), 2);
-    }
-
-    #[test]
-    fn test_resolve_read_file_line_limit_defaults_to_preview_window() {
-        let preview = resolve_read_file_line_limit(ReadFileMode::Preview, None)
-            .expect("preview lines should resolve");
-        assert_eq!(preview, Some(READ_FILE_DEFAULT_PREVIEW_LINES));
-
-        let head = resolve_read_file_line_limit(ReadFileMode::Head, None)
-            .expect("head lines should resolve");
-        assert_eq!(head, Some(READ_FILE_DEFAULT_PREVIEW_LINES));
-
-        let tail = resolve_read_file_line_limit(ReadFileMode::Tail, None)
-            .expect("tail lines should resolve");
-        assert_eq!(tail, Some(READ_FILE_DEFAULT_PREVIEW_LINES));
-    }
-
-    #[test]
-    fn test_resolve_read_file_line_limit_for_full_ignores_lines() {
-        let full = resolve_read_file_line_limit(ReadFileMode::Full, Some(123))
-            .expect("full mode should ignore lines");
-        assert_eq!(full, None);
-    }
-
-    #[test]
-    fn test_resolve_read_file_line_limit_rejects_zero() {
-        let err = resolve_read_file_line_limit(ReadFileMode::Head, Some(0)).unwrap_err();
-        assert!(err.contains("positive"));
-    }
-
-    #[test]
-    fn test_resolve_read_file_line_limit_rejects_too_large() {
-        let err =
-            resolve_read_file_line_limit(ReadFileMode::Tail, Some(READ_FILE_MAX_LINE_WINDOW + 1))
-                .unwrap_err();
-        assert!(err.contains("<="));
-    }
-
-    #[test]
-    fn test_sanitize_read_file_stderr_snippet_normalizes_whitespace_and_controls() {
-        let stderr = "line1\nline2\t\u{0007}bad\rline3";
-        let snippet = sanitize_read_file_stderr_snippet(stderr)
-            .expect("snippet should be present for non-empty stderr");
-        assert_eq!(snippet, "line1 line2 bad line3");
     }
 
     #[test]
@@ -1028,7 +913,7 @@ mod tests {
         assert!(SshMcpServer::get_tool_documentation("shell").is_some());
         assert!(SshMcpServer::get_tool_documentation("sudo_shell").is_some());
         assert!(SshMcpServer::get_tool_documentation("transfer").is_some());
-        assert!(SshMcpServer::get_tool_documentation("read").is_some());
+        assert!(SshMcpServer::get_tool_documentation("read").is_none());
         assert!(SshMcpServer::get_tool_documentation("apply_patch").is_some());
         assert!(SshMcpServer::get_tool_documentation("sudo_apply_patch").is_some());
         assert!(SshMcpServer::get_tool_documentation("write-file").is_none());
@@ -1067,15 +952,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_documentation_content() {
-        let docs = SshMcpServer::get_tool_documentation("read").unwrap();
-        assert!(docs.contains("READ TOOL"));
-        assert!(docs.contains("remote_path"));
-        assert!(docs.contains("mode"));
-        assert!(docs.contains("UTF-8"));
-    }
-
-    #[test]
     fn test_apply_patch_documentation_content() {
         let docs = SshMcpServer::get_tool_documentation("apply_patch").unwrap();
         assert!(docs.contains("APPLY_PATCH TOOL"));
@@ -1096,7 +972,6 @@ mod tests {
         let shell = SshMcpServer::shell_tool();
         let sudo_shell = SshMcpServer::sudo_shell_tool();
         let transfer = SshMcpServer::transfer_tool();
-        let read_file = SshMcpServer::read_file_tool();
         let apply_patch = SshMcpServer::apply_patch_tool();
         let sudo_apply_patch = SshMcpServer::sudo_apply_patch_tool();
 
@@ -1119,13 +994,6 @@ mod tests {
             assert!(
                 desc.len() < 100,
                 "transfer description too long: {} chars",
-                desc.len()
-            );
-        }
-        if let Some(desc) = read_file.description {
-            assert!(
-                desc.len() < 100,
-                "read description too long: {} chars",
                 desc.len()
             );
         }

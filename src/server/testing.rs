@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use rmcp::{ErrorData as McpError, model::CallToolResult};
 
+use crate::server::SshMcpServer;
 use crate::server::handlers::file_edit_common::{FileEditFaultInjection, FileEditPrivilege};
-use crate::server::{ReadFileMode, SshMcpServer};
-use crate::tools::{ApplyPatchParams, CheckProcessParams, ReadFileParams};
+use crate::tools::{ApplyPatchParams, CheckProcessParams};
 
 impl SshMcpServer {
     #[doc(hidden)]
@@ -98,33 +98,6 @@ impl SshMcpServer {
                 let _ = cancelled.await;
             },
         )
-        .await
-    }
-
-    #[doc(hidden)]
-    pub async fn test_read_file(
-        &self,
-        remote_path: &str,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.test_read_file_with_options(remote_path, ReadFileMode::Preview, None, timeout_ms)
-            .await
-    }
-
-    #[doc(hidden)]
-    pub async fn test_read_file_with_options(
-        &self,
-        remote_path: &str,
-        mode: ReadFileMode,
-        lines: Option<usize>,
-        timeout_ms: Option<u64>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_read_file(ReadFileParams {
-            remote_path: remote_path.to_string(),
-            mode,
-            lines,
-            timeout_ms,
-        })
         .await
     }
 

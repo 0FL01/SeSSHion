@@ -7,13 +7,13 @@
 
 Capability-bound SSH MCP for autonomous DevOps agents: composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
 
-`ssh-mcp` is a Rust [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session. It exposes five base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
+`ssh-mcp` is a Rust [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session. It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
 
 ## Why
 
-- **Capability-bound surface.** Five base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, read files, patch one file, transfer files, and inspect background jobs.
+- **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, patch one file, transfer files, and inspect background jobs.
 - **Deterministic long-running jobs.** `background=true` returns `{job_id, pid, log_path}` immediately; output streams to a local log you poll with `check_process`, avoiding client RPC deadlines.
-- **Bounded context.** `read` defaults to a safe preview with token estimates; shell output is capped by `--max-output-tokens`. Large files cannot bomb the agent's context window.
+- **Bounded context.** Foreground shell output is capped by `--max-output-tokens` by default. Use bounded commands when inspecting large remote files.
 - **Atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo.
 
 ## Tools
@@ -23,12 +23,13 @@ Capability-bound SSH MCP for autonomous DevOps agents: composable primitives, de
 | `shell` | Run a command via POSIX `sh` as the connected user; `background=true` for long tasks. |
 | `sudo_shell` | Same, under `sudo` (uses `--sudo-password`); can be disabled with `--disable-sudo`. |
 | `check_process` | Poll a background job by `job_id` and read the tail of its local log. |
-| `read` | Read a remote UTF-8 file with `preview` / `head` / `tail` / `full` modes and token estimates. |
 | `apply_patch` | Create, update, or delete one remote UTF-8 file with an exact patch (atomic, conflict-checked). |
 | `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
 | `transfer` | Move files/directories (`put`/`get`) via `auto` → `rsync` → `sftp` → `scp` → `exec-raw`. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
+
+Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, `tail -n 200 -- /path`, or `sed -n '801,1600p' -- /path`. Use `transfer` with `operation=get` to retrieve files instead of printing large content into the MCP response.
 
 ## Installation
 
@@ -154,7 +155,7 @@ Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--
 | `--key` | `SSH_MCP_KEY` | Path to private key file |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
-| `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell/read output token limit (default: 16000 ≈ 64KB; `none` to disable) |
+| `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell output token limit (default: 16000 ≈ 64KB; `none` to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` and `sudo_apply_patch` tools |
 
 Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key options).
@@ -197,7 +198,7 @@ Background tracking requires the MCP server and its SSH session to remain alive;
 - **Credentials in memory only.** Passwords and keys are never logged.
 - **Logs to stderr.** Internal logging stays off the MCP protocol channel.
 - **Path validation.** Rejects control characters, traversal (`..`), and shell-injection shapes.
-- **Binary protection.** Text tools reject non-UTF-8 content to prevent corruption.
+- **Binary protection.** Patch tools reject non-UTF-8 content to prevent corruption.
 - **Atomic edits.** Staging with automatic cleanup and conflict detection; no silent overwrites.
 - **Explicit elevation.** `apply_patch` never retries under sudo; privileged edits require an explicit `sudo_apply_patch` call.
 

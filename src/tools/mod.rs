@@ -7,7 +7,7 @@
 //! - `shell` - Execute shell commands on the remote SSH server
 //! - `sudo_shell` - Execute shell commands with sudo privileges
 //! - `check_process` - Check if a process is still running and read its log
-//! - `read` - Read UTF-8 text files from the remote SSH server
+//! - `transfer` - Transfer files and directories over SSH
 //! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
 //! - `sudo_apply_patch` - Apply the same exact patch under sudo
 //!
@@ -21,10 +21,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_CHECK_PROCESS_TAIL_LINES: usize = 50;
-
-fn default_read_file_mode() -> ReadFileMode {
-    ReadFileMode::Preview
-}
 
 /// Parameters for the shell tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -89,47 +85,6 @@ pub struct CheckProcessParams {
     pub tail_lines: usize,
 }
 
-/// Parameters for the read tool
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ReadFileMode {
-    /// Safe first-read mode that returns the first chunk of lines
-    Preview,
-    /// Return the first N lines
-    Head,
-    /// Return the last N lines
-    Tail,
-    /// Return the full file (subject to existing size safeguards)
-    Full,
-}
-
-impl ReadFileMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Preview => "preview",
-            Self::Head => "head",
-            Self::Tail => "tail",
-            Self::Full => "full",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct ReadFileParams {
-    /// Absolute remote file path to read
-    pub remote_path: String,
-
-    /// Read mode (default: preview)
-    #[serde(default = "default_read_file_mode")]
-    pub mode: ReadFileMode,
-
-    /// Number of lines for preview/head/tail (default: 800)
-    pub lines: Option<usize>,
-
-    /// Optional timeout override in milliseconds
-    pub timeout_ms: Option<u64>,
-}
-
 /// Parameters for the apply_patch tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -190,42 +145,6 @@ mod tests {
         let params: CheckProcessParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.job_id, "job-123");
         assert_eq!(params.tail_lines, 100);
-    }
-
-    #[test]
-    fn test_read_file_params_deserialize() {
-        let json = r#"{"remote_path": "/etc/hosts"}"#;
-        let params: ReadFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.mode, ReadFileMode::Preview);
-        assert_eq!(params.lines, None);
-        assert!(params.timeout_ms.is_none());
-    }
-
-    #[test]
-    fn test_read_file_params_deserialize_with_timeout() {
-        let json = r#"{"remote_path": "/etc/hosts", "timeout_ms": 2500}"#;
-        let params: ReadFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.mode, ReadFileMode::Preview);
-        assert_eq!(params.lines, None);
-        assert_eq!(params.timeout_ms, Some(2500));
-    }
-
-    #[test]
-    fn test_read_file_params_deserialize_with_mode_and_lines() {
-        let json = r#"{"remote_path":"/etc/hosts","mode":"tail","lines":120}"#;
-        let params: ReadFileParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.remote_path, "/etc/hosts");
-        assert_eq!(params.mode, ReadFileMode::Tail);
-        assert_eq!(params.lines, Some(120));
-        assert!(params.timeout_ms.is_none());
-    }
-
-    #[test]
-    fn test_read_file_mode_serialization_is_lowercase() {
-        let value = serde_json::to_value(ReadFileMode::Full).unwrap();
-        assert_eq!(value, serde_json::json!("full"));
     }
 
     #[test]

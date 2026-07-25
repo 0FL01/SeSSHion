@@ -5,7 +5,6 @@
 
 pub(crate) mod common;
 pub(crate) mod file_edit;
-pub(crate) mod read_file;
 
 // Re-export common items for convenience
 pub(crate) use common::*;

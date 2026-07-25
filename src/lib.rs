@@ -18,7 +18,6 @@
 //! - `sudo_shell` - Execute a command with sudo privileges (can be disabled with `--disable-sudo`)
 //! - `check_process` - Monitor background commands and read their local logs
 //! - `transfer` - Transfer files and directories over SSH
-//! - `read` - Read a remote UTF-8 file with preview/head/tail/full modes
 //! - `apply_patch` - Create, update, or delete one remote UTF-8 text file
 //! - `sudo_apply_patch` - Apply an exact remote file patch under sudo (can be disabled with `--disable-sudo`)
 //!

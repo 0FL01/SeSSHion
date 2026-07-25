@@ -186,6 +186,49 @@ async fn stdin_eof_stops_initialized_server() {
 }
 
 #[tokio::test]
+async fn read_tool_is_not_advertised_or_callable() {
+    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    process.initialize().await;
+
+    process
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await;
+    let response = process.response(2).await;
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list result");
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["shell", "check_process", "transfer", "apply_patch"]);
+
+    process
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "read", "arguments": {}}
+        }))
+        .await;
+    let response = process.response(3).await;
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unknown tool: read")),
+        "unexpected read response: {response}"
+    );
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[tokio::test]
 async fn signal_cancels_scheduled_check_before_ssh_cleanup() {
     init_test_env().expect("Failed to initialize test environment");
     let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")

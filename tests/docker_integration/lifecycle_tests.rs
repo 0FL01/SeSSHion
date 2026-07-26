@@ -3,7 +3,7 @@
 use super::common::*;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ struct McpProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    spool_dir: PathBuf,
     _temp_dir: TempDir,
 }
 
@@ -43,6 +44,7 @@ impl McpProcess {
         auth_args: &[OsString],
     ) -> Self {
         let temp_dir = tempfile::tempdir().expect("create isolated lifecycle temp dir");
+        let spool_dir = temp_dir.path().join("spool");
         let mut command = Command::new(env!("CARGO_BIN_EXE_ssh-mcp"));
         command
             .arg("--host")
@@ -50,7 +52,7 @@ impl McpProcess {
             .arg("--port")
             .arg(port.to_string())
             .args(auth_args)
-            .env("TMPDIR", temp_dir.path())
+            .env("SSH_MCP_SPOOL_DIR", &spool_dir)
             .current_dir(current_dir.unwrap_or_else(|| temp_dir.path()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -68,6 +70,7 @@ impl McpProcess {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            spool_dir,
             _temp_dir: temp_dir,
         }
     }
@@ -132,6 +135,14 @@ impl McpProcess {
         kill(Pid::from_raw(pid as i32), signal).expect("send shutdown signal");
     }
 
+    fn assert_spool_dir_created(&self) {
+        assert!(
+            self.spool_dir.is_dir(),
+            "configured spool directory was not created: {}",
+            self.spool_dir.display()
+        );
+    }
+
     async fn close_stdin(&mut self) {
         self.stdin.take();
     }
@@ -175,6 +186,7 @@ async fn sigterm_stops_server_during_initialization() {
         response.get("error").is_none(),
         "pre-init ping failed: {response}"
     );
+    process.assert_spool_dir_created();
 
     process.signal(Signal::SIGTERM);
     process.assert_successful_exit().await;

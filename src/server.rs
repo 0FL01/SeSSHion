@@ -85,9 +85,14 @@ impl SshMcpServer {
     /// This sets up the SSH connection manager based on the provided configuration.
     /// Connection is not established until a tool is actually used.
     pub async fn new(config: Config) -> Result<Self> {
+        Self::new_with_spool_dir(config, None).await
+    }
+
+    /// Create a new SSH MCP Server with an optional local spool directory.
+    pub async fn new_with_spool_dir(config: Config, spool_dir: Option<PathBuf>) -> Result<Self> {
         let local_root = std::env::current_dir()?;
 
-        let spooler = Arc::new(LocalLogSpooler::new_default());
+        let spooler = Arc::new(resolve_local_spooler(spool_dir)?);
         spooler.ensure_dir().await.map_err(|e| {
             SshMcpError::Config(format!(
                 "failed to initialize local log spool dir {}: {e}",
@@ -526,6 +531,17 @@ impl SshMcpServer {
     }
 }
 
+fn resolve_local_spooler(spool_dir: Option<PathBuf>) -> Result<LocalLogSpooler> {
+    match spool_dir {
+        Some(path) if !path.is_absolute() => Err(SshMcpError::Config(format!(
+            "spool directory must be absolute: {}",
+            path.display()
+        ))),
+        Some(path) => Ok(LocalLogSpooler::new(path)),
+        None => Ok(LocalLogSpooler::new_default()),
+    }
+}
+
 impl ServerHandler for SshMcpServer {
     /// Return server information
     fn get_info(&self) -> ServerInfo {
@@ -679,6 +695,17 @@ mod tests {
     fn test_server_info() {
         // Verify the package version is defined
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
+    }
+
+    #[test]
+    fn test_resolve_local_spooler_rejects_relative_override() {
+        let error = resolve_local_spooler(Some(PathBuf::from("relative/spool")))
+            .expect_err("relative spool directory must be rejected");
+
+        assert!(matches!(
+            error,
+            SshMcpError::Config(message) if message.contains("must be absolute")
+        ));
     }
 
     #[test]

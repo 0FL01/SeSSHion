@@ -3,7 +3,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,11 +16,7 @@ use super::{BackgroundError, Result};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
 
-/// Local-only log spooler.
-///
-/// Phase 1 is responsible for local directory existence and deterministic
-/// path generation. Later phases will stream remote stdout/stderr into these
-/// files and use the registry to serve `check_process`.
+/// Local-only job state and log spooler.
 #[derive(Debug, Clone)]
 pub struct LocalLogSpooler {
     base_dir: PathBuf,
@@ -30,7 +28,16 @@ impl LocalLogSpooler {
     }
 
     pub fn new_default() -> Self {
-        Self::new(env::temp_dir().join("ssh-mcp"))
+        #[cfg(unix)]
+        let base_dir = default_spool_dir(
+            env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            &env::temp_dir(),
+            rustix::process::geteuid().as_raw(),
+        );
+        #[cfg(not(unix))]
+        let base_dir = env::temp_dir().join("ssh-mcp");
+
+        Self::new(base_dir)
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -38,29 +45,40 @@ impl LocalLogSpooler {
     }
 
     pub async fn ensure_dir(&self) -> Result<()> {
-        match fs::symlink_metadata(&self.base_dir).await {
-            Ok(meta) => validate_spool_dir_meta(&meta)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&self.base_dir).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e.into()),
-                }
+        #[cfg(unix)]
+        let expected_uid = Some(rustix::process::geteuid().as_raw());
+        #[cfg(not(unix))]
+        let expected_uid = None;
 
-                // Re-validate after creation to close TOCTOU window.
-                let meta = fs::symlink_metadata(&self.base_dir).await?;
-                validate_spool_dir_meta(&meta)?;
-            }
+        self.ensure_dir_inner(expected_uid).await
+    }
+
+    async fn ensure_dir_inner(&self, expected_uid: Option<u32>) -> Result<()> {
+        let created = match create_spool_dir(&self.base_dir).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(e) => return Err(e.into()),
-        }
+        };
+
+        let meta = fs::symlink_metadata(&self.base_dir).await?;
+        validate_spool_dir_meta(&meta)?;
 
         #[cfg(unix)]
         {
-            let meta = fs::symlink_metadata(&self.base_dir).await?;
-            validate_spool_dir_meta(&meta)?;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            fs::set_permissions(&self.base_dir, perms).await?;
+            let expected_uid = expected_uid.expect("effective UID is available on Unix");
+            validate_spool_dir_owner(&meta, expected_uid)?;
+            if !created && meta.permissions().mode() & 0o022 != 0 {
+                return Err(BackgroundError::InvalidState {
+                    message: "spool directory is group- or world-writable",
+                });
+            }
+            if meta.permissions().mode() & 0o777 != 0o700 {
+                let perms = std::fs::Permissions::from_mode(0o700);
+                fs::set_permissions(&self.base_dir, perms).await?;
+            }
         }
+        #[cfg(not(unix))]
+        let _ = expected_uid;
 
         Ok(())
     }
@@ -210,6 +228,35 @@ impl LocalLogSpooler {
     }
 }
 
+#[cfg(unix)]
+fn default_spool_dir(runtime_dir: Option<&OsStr>, temp_dir: &Path, effective_uid: u32) -> PathBuf {
+    if let Some(runtime_dir) = runtime_dir
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return runtime_dir.join("ssh-mcp");
+    }
+
+    let temp_dir = if temp_dir.is_absolute() {
+        temp_dir
+    } else {
+        Path::new("/tmp")
+    };
+    temp_dir.join(format!("ssh-mcp-{effective_uid}"))
+}
+
+#[cfg(unix)]
+async fn create_spool_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path).await
+}
+
+#[cfg(not(unix))]
+async fn create_spool_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path).await
+}
+
 async fn open_spool_write_no_symlink(path: &Path) -> Result<tokio::fs::File> {
     match fs::symlink_metadata(path).await {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -301,6 +348,16 @@ fn validate_spool_dir_meta(meta: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn validate_spool_dir_owner(meta: &std::fs::Metadata, expected_uid: u32) -> Result<()> {
+    if meta.uid() != expected_uid {
+        return Err(BackgroundError::InvalidState {
+            message: "spool directory is not owned by the effective user",
+        });
+    }
+    Ok(())
+}
+
 fn validate_job_id(job_id: &str) -> Result<()> {
     if job_id.is_empty() || job_id.len() > 128 {
         return Err(BackgroundError::InvalidJobId {
@@ -353,6 +410,9 @@ mod tests {
     use super::*;
     use std::time::{Instant, SystemTime};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
     async fn wait_until_older_than(path: &Path, min_age: Duration) {
         let start = Instant::now();
         loop {
@@ -383,11 +443,124 @@ mod tests {
         spooler.ensure_dir().await.expect("ensure_dir");
         let meta = std::fs::metadata(&base).expect("spool dir metadata");
         assert!(meta.is_dir());
+        #[cfg(unix)]
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 
         let log = spooler.log_path_for("job_123").expect("log_path_for");
         assert_eq!(log, base.join("job_123.log"));
         let state = spooler.state_path_for("job_123").expect("state_path_for");
         assert_eq!(state, base.join("job_123.state"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_default_spool_dir_prefers_xdg_and_isolates_fallback_by_uid() {
+        assert_eq!(
+            default_spool_dir(
+                Some(OsStr::new("/run/user/1000")),
+                Path::new("/var/tmp"),
+                1000,
+            ),
+            PathBuf::from("/run/user/1000/ssh-mcp")
+        );
+        assert_eq!(
+            default_spool_dir(Some(OsStr::new("relative")), Path::new("/var/tmp"), 1000),
+            PathBuf::from("/var/tmp/ssh-mcp-1000")
+        );
+        assert_ne!(
+            default_spool_dir(None, Path::new("/tmp"), 1000),
+            default_spool_dir(None, Path::new("/tmp"), 1001)
+        );
+        assert_eq!(
+            default_spool_dir(None, Path::new("relative"), 1000),
+            PathBuf::from("/tmp/ssh-mcp-1000")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_dir_normalizes_owned_permissions() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp.path().join("spool");
+        std::fs::create_dir(&base).expect("create spool dir");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("set initial permissions");
+
+        LocalLogSpooler::new(base.clone())
+            .ensure_dir()
+            .await
+            .expect("ensure_dir");
+
+        let mode = std::fs::metadata(base)
+            .expect("spool dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_dir_rejects_symlink() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let base = tmp.path().join("spool");
+        std::fs::create_dir(&target).expect("create target dir");
+        symlink(target, &base).expect("create spool symlink");
+
+        let error = LocalLogSpooler::new(base)
+            .ensure_dir()
+            .await
+            .expect_err("symlink must be rejected");
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_dir_rejects_wrong_owner_without_chmod() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp.path().join("spool");
+        std::fs::create_dir(&base).expect("create spool dir");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("set initial permissions");
+        let actual_uid = std::fs::metadata(&base).expect("metadata").uid();
+        let spooler = LocalLogSpooler::new(base.clone());
+
+        let error = spooler
+            .ensure_dir_inner(Some(actual_uid ^ 1))
+            .await
+            .expect_err("wrong owner must be rejected");
+
+        assert!(error.to_string().contains("not owned"));
+        let mode = std::fs::metadata(base)
+            .expect("spool dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_dir_rejects_writable_existing_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp.path().join("spool");
+        std::fs::create_dir(&base).expect("create spool dir");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770))
+            .expect("set initial permissions");
+
+        let error = LocalLogSpooler::new(base.clone())
+            .ensure_dir()
+            .await
+            .expect_err("writable spool dir must be rejected");
+
+        assert!(error.to_string().contains("writable"));
+        let mode = std::fs::metadata(base)
+            .expect("spool dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o770);
     }
 
     #[test]

@@ -154,12 +154,15 @@ Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--
 | `--port` | `SSH_MCP_PORT` | SSH port (default: 22) |
 | `--password` | `SSH_MCP_PASSWORD` | SSH password (alternative to key) |
 | `--key` | `SSH_MCP_KEY` | Path to private key file (leading `~/` uses local `HOME`) |
+| `--spool-dir` | `SSH_MCP_SPOOL_DIR` | Absolute local directory for background job logs and state |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
 | `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell output token limit (default: 16000 ≈ 64KB; `none` to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` and `sudo_apply_patch` tools |
 
 Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key options).
+
+The explicit spool path must be absolute. Without it, Unix uses `$XDG_RUNTIME_DIR/ssh-mcp` when `XDG_RUNTIME_DIR` is absolute, then falls back to `${TMPDIR:-/tmp}/ssh-mcp-$EUID`. Windows uses `%TEMP%\ssh-mcp`. On Unix, the spool directory must be owned by the server user and is kept at mode `0700`.
 
 ### SSH host key verification
 
@@ -171,7 +174,7 @@ Run `ssh-mcp --help` for the full list (logging, keepalive, reconnect, host-key 
 
 ## Long-running jobs
 
-Start potentially long commands with `background=true`. A foreground `timeout_ms` is only the server-side SSH wait limit, not the full tool-call deadline. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier. The configured default of 300000 ms therefore does not guarantee that an MCP harness will wait that long. In background mode you immediately get `{job_id, pid, log_path}`, where `log_path` is a local log on the MCP server (default `/tmp/ssh-mcp/<job_id>.log`). Poll with `check_process`:
+Start potentially long commands with `background=true`. A foreground `timeout_ms` is only the server-side SSH wait limit, not the full tool-call deadline. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier. The configured default of 300000 ms therefore does not guarantee that an MCP harness will wait that long. In background mode you immediately get `{job_id, pid, log_path}`, where `log_path` is stored in the configured or per-user platform-default spool directory. Poll with `check_process`:
 
 ```json
 {"job_id": "abc123", "tail_lines": 50}

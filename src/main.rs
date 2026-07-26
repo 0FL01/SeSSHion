@@ -29,10 +29,12 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     // Parse CLI arguments
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Initialize logging (JSON to file if specified, text to stderr)
     let _guard = init_logging(&args)?;
+
+    let spool_dir = args.spool_dir.take();
 
     // Validate and create config
     let config = Config::from_args(args)?;
@@ -68,7 +70,7 @@ async fn run() -> Result<()> {
     }
 
     // Create MCP server
-    let server = SshMcpServer::new(config).await?;
+    let server = SshMcpServer::new_with_spool_dir(config, spool_dir).await?;
 
     info!("SSH MCP Server running on stdio");
 

@@ -67,7 +67,7 @@ A high-performance Rust implementation of the SSH Model Context Protocol (MCP) s
 │   │       ├── mod.rs          # Module exports
 │   │       ├── check_process.rs # check_process tool handler
 │   │       ├── apply_patch.rs  # apply_patch orchestration and MCP responses
-│   │       └── file_edit_common.rs # /tmp-backed snapshot and atomic commit helpers
+│   │       └── file_edit_common.rs # Spool-backed snapshot and atomic commit helpers
 │   ├── shell_escape.rs         # Shell string escaping utilities (neutral, no ssh/background deps)
 │   ├── config.rs               # Configuration and CLI argument parsing
 │   ├── error.rs                # Centralized error handling

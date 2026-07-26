@@ -1,12 +1,9 @@
-//! Local background job state + log spooling (Phase 1 scaffold).
+//! Local background job state and log spooling.
 //!
-//! Goal: move background job logs from remote `system temp directory / ssh-mcp subdirectory/*.log` to a local-only
-//! spool directory while keeping the public MCP tool API stable.
-//!
-//! Phase 1 provides the core types:
+//! The core types are:
 //! - [`JobState`]: per-job state (pid, local log path, exit code, status)
 //! - [`JobRegistry`]: thread-safe registry for active + recently completed jobs
-//! - [`LocalLogSpooler`]: local `system temp directory / ssh-mcp subdirectory` directory management
+//! - [`LocalLogSpooler`]: configured or per-user local spool directory management
 
 pub mod job;
 pub(crate) mod marker;

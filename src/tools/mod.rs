@@ -42,7 +42,7 @@ pub struct ExecParams {
 
     /// Local log path for background mode output (stored on MCP server)
     ///
-    /// Defaults to ssh-mcp/<job_id>.log in the system temp directory.
+    /// Defaults to <job_id>.log in the configured or platform-default local spool.
     pub log_path: Option<String>,
 }
 
@@ -66,7 +66,7 @@ pub struct SudoExecParams {
 
     /// Local log path for background mode output (stored on MCP server)
     ///
-    /// Defaults to ssh-mcp/<job_id>.log in the system temp directory.
+    /// Defaults to <job_id>.log in the configured or platform-default local spool.
     pub log_path: Option<String>,
 }
 

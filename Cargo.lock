@@ -3201,6 +3201,7 @@ dependencies = [
  "nix",
  "rmcp",
  "russh",
+ "rustix",
  "schemars 1.2.0",
  "serde",
  "serde_json",

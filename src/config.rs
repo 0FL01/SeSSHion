@@ -67,6 +67,10 @@ pub struct Args {
     #[arg(long, env = "SSH_MCP_KEY")]
     pub key: Option<PathBuf>,
 
+    /// Absolute local directory for background job logs and state
+    #[arg(long, env = "SSH_MCP_SPOOL_DIR")]
+    pub spool_dir: Option<PathBuf>,
+
     /// Password for `su` elevation
     #[arg(long, env = "SSH_MCP_SU_PASSWORD")]
     pub su_password: Option<String>,
@@ -395,6 +399,7 @@ mod tests {
             user: "test".to_string(),
             password: Some("secret".to_string()),
             key: None,
+            spool_dir: None,
             su_password: None,
             sudo_password: None,
             timeout: DEFAULT_TIMEOUT_MS,
@@ -522,6 +527,24 @@ mod tests {
 
         assert_eq!(args.strict_host_key_checking, HostKeyCheckMode::Yes);
         assert_eq!(args.known_hosts, Some(PathBuf::from("/tmp/known_hosts")));
+    }
+
+    #[test]
+    fn test_args_parse_spool_dir() {
+        let args = Args::try_parse_from([
+            "ssh-mcp",
+            "--host",
+            "example.com",
+            "--user",
+            "alice",
+            "--password",
+            "secret",
+            "--spool-dir",
+            "/tmp/ssh-mcp-alice",
+        ])
+        .unwrap();
+
+        assert_eq!(args.spool_dir, Some(PathBuf::from("/tmp/ssh-mcp-alice")));
     }
 
     #[test]

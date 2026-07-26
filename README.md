@@ -81,7 +81,7 @@ Add to `opencode.jsonc` (SSH key recommended; password auth uses the `exec-raw` 
         "--host=192.168.1.10",
         "--port=22",
         "--user=agent-nc",
-        "--key=/path/to/private/key"
+        "--key=~/.ssh/id_ed25519"
       ],
       "enabled": true
     }
@@ -90,6 +90,7 @@ Add to `opencode.jsonc` (SSH key recommended; password auth uses the `exec-raw` 
 ```
 
 Use `--password=your-password` instead of `--key=...` for password authentication.
+For `--key`, a leading `~/` is resolved through the local `HOME`; other tilde forms are left unchanged.
 
 <details>
 <summary><b>Claude Code</b> — .mcp.json or ~/.claude.json</summary>
@@ -152,7 +153,7 @@ Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--
 | `--user` | `SSH_MCP_USER` | SSH username (required) |
 | `--port` | `SSH_MCP_PORT` | SSH port (default: 22) |
 | `--password` | `SSH_MCP_PASSWORD` | SSH password (alternative to key) |
-| `--key` | `SSH_MCP_KEY` | Path to private key file |
+| `--key` | `SSH_MCP_KEY` | Path to private key file (leading `~/` uses local `HOME`) |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
 | `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell output token limit (default: 16000 ≈ 64KB; `none` to disable) |

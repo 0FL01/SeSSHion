@@ -5,6 +5,13 @@ services:
     image: ssh-mcp-debian-sshd:latest
     ports:
       - "127.0.0.1:2222:2222"
+    volumes:
+      - type: bind
+        source: ${HOME}/.ssh/termius.pub
+        target: /home/test/.ssh/authorized_keys
+        read_only: true
+        bind:
+          create_host_path: false
     logging:
       driver: "json-file"
       options:

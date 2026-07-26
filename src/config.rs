@@ -1,7 +1,8 @@
 //! Configuration and CLI argument parsing for SSH MCP Server
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::HostKeyCheckMode;
@@ -208,6 +209,15 @@ pub struct Config {
 impl Config {
     /// Create Config from CLI Args
     pub fn from_args(args: Args) -> Result<Self> {
+        let home = std::env::var_os("HOME");
+        Self::from_args_with_home(args, home.as_deref())
+    }
+
+    fn from_args_with_home(mut args: Args, home: Option<&OsStr>) -> Result<Self> {
+        args.key = args
+            .key
+            .map(|path| expand_key_path(path, home))
+            .transpose()?;
         validate_args(&args)?;
 
         let max_chars = parse_max_chars(args.max_chars.as_deref());
@@ -234,6 +244,24 @@ impl Config {
             known_hosts: args.known_hosts,
         })
     }
+}
+
+fn expand_key_path(path: PathBuf, home: Option<&OsStr>) -> Result<PathBuf> {
+    if !path.as_os_str().as_encoded_bytes().starts_with(b"~/") {
+        return Ok(path);
+    }
+
+    let home = home.filter(|value| !value.is_empty()).ok_or_else(|| {
+        SshMcpError::Config(format!(
+            "Cannot expand SSH key path {}: HOME is not set",
+            path.display()
+        ))
+    })?;
+    let suffix = path
+        .strip_prefix("~")
+        .expect("leading ~/ path must have a tilde component");
+
+    Ok(Path::new(home).join(suffix))
 }
 
 /// Validate CLI arguments
@@ -426,6 +454,53 @@ mod tests {
         assert_eq!(config.max_chars, Some(64_000));
         assert_eq!(config.strict_host_key_checking, HostKeyCheckMode::AcceptNew);
         assert!(config.known_hosts.is_none());
+    }
+
+    #[test]
+    fn test_config_expands_tilde_key_before_validation() {
+        let home = tempfile::tempdir().unwrap();
+        let key_path = home.path().join(".ssh/id_ed25519");
+        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        std::fs::write(&key_path, "test key").unwrap();
+
+        let mut args = base_args();
+        args.password = None;
+        args.key = Some(PathBuf::from("~/.ssh/id_ed25519"));
+
+        let config = Config::from_args_with_home(args, Some(home.path().as_os_str())).unwrap();
+        assert_eq!(config.key, Some(key_path));
+    }
+
+    #[test]
+    fn test_expand_key_path_only_expands_leading_home_prefix() {
+        let home = OsStr::new("/home/test");
+        let cases = [
+            ("~", "~"),
+            ("~user/key", "~user/key"),
+            ("dir/~/key", "dir/~/key"),
+            ("$HOME/key", "$HOME/key"),
+            (r"~\key", r"~\key"),
+            ("/tmp/key", "/tmp/key"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                expand_key_path(PathBuf::from(input), Some(home)).unwrap(),
+                PathBuf::from(expected)
+            );
+        }
+        assert_eq!(
+            expand_key_path(PathBuf::from("~/.ssh/id_ed25519"), Some(home)).unwrap(),
+            PathBuf::from("/home/test/.ssh/id_ed25519")
+        );
+    }
+
+    #[test]
+    fn test_expand_key_path_requires_home() {
+        for home in [None, Some(OsStr::new(""))] {
+            let error = expand_key_path(PathBuf::from("~/.ssh/id_ed25519"), home).unwrap_err();
+            assert!(error.to_string().contains("HOME is not set"));
+        }
     }
 
     #[test]

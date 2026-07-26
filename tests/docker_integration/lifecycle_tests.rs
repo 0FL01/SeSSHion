@@ -1,6 +1,9 @@
 #![cfg(unix)]
 
 use super::common::*;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -24,28 +27,39 @@ struct McpProcess {
 
 impl McpProcess {
     async fn spawn(host: &str, port: u16) -> Self {
+        let auth_args = [
+            OsString::from("--user=test"),
+            OsString::from("--password=secret"),
+            OsString::from("--strict-host-key-checking=no"),
+        ];
+        Self::spawn_with_auth(host, port, None, None, &auth_args).await
+    }
+
+    async fn spawn_with_auth(
+        host: &str,
+        port: u16,
+        current_dir: Option<&Path>,
+        home: Option<&Path>,
+        auth_args: &[OsString],
+    ) -> Self {
         let temp_dir = tempfile::tempdir().expect("create isolated lifecycle temp dir");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ssh-mcp"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ssh-mcp"));
+        command
             .arg("--host")
             .arg(host)
             .arg("--port")
             .arg(port.to_string())
-            .args([
-                "--user",
-                "test",
-                "--password",
-                "secret",
-                "--strict-host-key-checking",
-                "no",
-            ])
+            .args(auth_args)
             .env("TMPDIR", temp_dir.path())
-            .current_dir(temp_dir.path())
+            .current_dir(current_dir.unwrap_or_else(|| temp_dir.path()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn ssh-mcp binary");
+            .kill_on_drop(true);
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let mut child = command.spawn().expect("spawn ssh-mcp binary");
 
         let stdin = child.stdin.take().expect("child stdin");
         let stdout = child.stdout.take().expect("child stdout");
@@ -235,6 +249,84 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
 
     process.close_stdin().await;
     process.assert_successful_exit().await;
+}
+
+#[tokio::test]
+async fn cli_key_paths_authenticate_with_absolute_relative_and_tilde_forms() {
+    init_test_env().expect("Failed to initialize test environment");
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("start SSH test container");
+    let host = container.get_host().await.expect("get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("get mapped SSH port");
+    wait_for_tcp(&host.to_string(), port).await;
+
+    let home = tempfile::tempdir().expect("create isolated home");
+    let key_path = home.path().join(".ssh/id_ed25519");
+    std::fs::create_dir_all(key_path.parent().expect("key parent")).expect("create .ssh");
+    std::fs::write(&key_path, TEST_PRIVATE_KEY).expect("write private key");
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod private key");
+    let other_cwd = home.path().join("work");
+    std::fs::create_dir(&other_cwd).expect("create alternate cwd");
+
+    let cases = [
+        ("absolute", key_path.as_os_str(), other_cwd.as_path()),
+        ("relative", OsStr::new(".ssh/id_ed25519"), home.path()),
+        (
+            "home-relative",
+            OsStr::new("~/.ssh/id_ed25519"),
+            other_cwd.as_path(),
+        ),
+    ];
+    for (case, key, current_dir) in cases {
+        let mut key_arg = OsString::from("--key=");
+        key_arg.push(key);
+        let auth_args = [
+            OsString::from("--user=test"),
+            key_arg,
+            OsString::from("--strict-host-key-checking=no"),
+        ];
+        let mut process = McpProcess::spawn_with_auth(
+            &host.to_string(),
+            port,
+            Some(current_dir),
+            Some(home.path()),
+            &auth_args,
+        )
+        .await;
+        process.initialize().await;
+        process
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "shell",
+                    "arguments": {"command": "id -un"}
+                }
+            }))
+            .await;
+        let response = process.response(2).await;
+        assert!(
+            response.get("error").is_none(),
+            "{case} key path failed: {response}"
+        );
+        assert_ne!(
+            response["result"]["isError"].as_bool(),
+            Some(true),
+            "{case} key path returned a tool error: {response}"
+        );
+        assert_eq!(tool_text(&response).trim(), "test", "{case} key path");
+
+        process.close_stdin().await;
+        process.assert_successful_exit().await;
+    }
 }
 
 #[tokio::test]

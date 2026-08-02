@@ -16,9 +16,12 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::background::job::NewRunningJob;
+use crate::background::transfer::{SharedTransferJob, TransferJobRegistry};
 use crate::background::{JobRegistry, JobState, LocalLogSpooler, SharedJobState};
 use crate::config::Config;
 use crate::error::{Result, SshMcpError};
@@ -31,7 +34,10 @@ use crate::ssh::{
     CommandOutput, SshConfig, SshConnectionManager, sanitize_command, wrap_sudo_command,
 };
 use crate::tools::ApplyPatchParams;
-use crate::transfer::{TransferEngine, TransferParams, TransferRunContext, TransferSshOptions};
+use crate::transfer::{
+    TransferEngine, TransferEventSink, TransferParams, TransferResponse, TransferRunContext,
+    TransferSshOptions,
+};
 
 mod args;
 mod exec;
@@ -76,7 +82,45 @@ pub struct SshMcpServer {
     spooler: Arc<LocalLogSpooler>,
     job_registry: Arc<JobRegistry>,
 
+    transfer_job_registry: Arc<TransferJobRegistry>,
+    transfer_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    transfer_shutdown: CancellationToken,
+
     transfer: TransferEngine,
+}
+
+struct TransferTerminalGuard {
+    job: SharedTransferJob,
+    fallback: Option<TransferResponse>,
+}
+
+impl TransferTerminalGuard {
+    fn new(job: SharedTransferJob, fallback: TransferResponse) -> Self {
+        Self {
+            job,
+            fallback: Some(fallback),
+        }
+    }
+
+    fn finish(mut self, response: &TransferResponse) {
+        if let Ok(mut job) = self.job.lock() {
+            job.finish(response);
+        }
+        self.fallback = None;
+    }
+}
+
+impl Drop for TransferTerminalGuard {
+    fn drop(&mut self) {
+        let Some(fallback) = self.fallback.take() else {
+            return;
+        };
+        if let Ok(mut job) = self.job.lock()
+            && !job.is_terminal()
+        {
+            job.finish(&fallback);
+        }
+    }
 }
 
 impl SshMcpServer {
@@ -100,6 +144,7 @@ impl SshMcpServer {
             ))
         })?;
         let job_registry = Arc::new(JobRegistry::new(JOB_COMPLETED_RETENTION));
+        let transfer_job_registry = Arc::new(TransferJobRegistry::new(JOB_COMPLETED_RETENTION));
 
         // Build SSH configuration
         let mut ssh_config = SshConfig::new(&config.host, &config.user).with_port(config.port);
@@ -158,6 +203,9 @@ impl SshMcpServer {
             max_chars,
             spooler,
             job_registry,
+            transfer_job_registry,
+            transfer_tasks: Arc::new(Mutex::new(Vec::new())),
+            transfer_shutdown: CancellationToken::new(),
             transfer: TransferEngine::new(local_root),
         })
     }
@@ -277,6 +325,18 @@ impl SshMcpServer {
     /// Close the server and cleanup resources
     pub async fn shutdown(&self) {
         info!("Shutting down SSH MCP Server...");
+        self.transfer_shutdown.cancel();
+        let tasks = {
+            let mut tasks = self.transfer_tasks.lock().await;
+            std::mem::take(&mut *tasks)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        for mut task in tasks {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         self.connection.close().await;
     }
 
@@ -484,31 +544,17 @@ impl SshMcpServer {
             .map_err(|e| McpError::invalid_params(format!("invalid {tool_name} params: {e}"), None))
     }
 
-    /// Execute transfer tool with connection management and JSON serialization.
-    async fn execute_transfer(
+    async fn run_transfer_response(
         &self,
         params: TransferParams,
-        verbose: bool,
-    ) -> std::result::Result<CallToolResult, McpError> {
+        cancellation: CancellationToken,
+        progress: Option<TransferEventSink>,
+    ) -> TransferResponse {
         let timeout = self.resolve_timeout(params.timeout_ms);
         let key_path = self.config.key.clone();
 
-        // Ensure connection is established (so errors are deterministic).
-        if let Err(e) = self.connection.ensure_connected().await {
-            let resp = crate::transfer::TransferResponse::error(
-                params,
-                self.transfer.local_root(),
-                &e.to_string(),
-            );
-            let body = resp
-                .to_json(verbose)
-                .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization_error\"}".to_string());
-            return Ok(CallToolResult::success(vec![ContentBlock::text(body)]));
-        }
-
-        let resp = self
-            .transfer
-            .run(
+        self.transfer
+            .run_controlled(
                 &self.connection,
                 params,
                 TransferRunContext {
@@ -522,12 +568,75 @@ impl SshMcpServer {
                         known_hosts: self.config.known_hosts.clone(),
                     },
                 },
+                cancellation,
+                progress,
             )
-            .await;
+            .await
+    }
+
+    /// Execute a foreground transfer and serialize its response.
+    async fn execute_transfer(
+        &self,
+        params: TransferParams,
+        verbose: bool,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let resp = self.run_transfer_response(params, cancellation, None).await;
         let body = resp
             .to_json(verbose)
             .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization_error\"}".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+    }
+
+    async fn execute_background_transfer(
+        &self,
+        params: TransferParams,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let job_id = format!("transfer-{}", make_job_id());
+        let job = self.transfer_job_registry.register(job_id.clone());
+        let progress_job = Arc::clone(&job);
+        let progress = TransferEventSink::new(move |event| {
+            if let Ok(mut job) = progress_job.lock() {
+                job.apply_event(event);
+            }
+        });
+
+        let server = self.clone();
+        let task_params = params.clone();
+        let fallback = TransferResponse::error(
+            params,
+            self.transfer.local_root(),
+            "background transfer stopped unexpectedly",
+        );
+        let body = serde_json::json!({
+            "ok": true,
+            "background": true,
+            "job_id": job_id,
+            "job_type": "transfer",
+            "state": "running",
+            "phase": "queued",
+        });
+
+        let mut tasks = self.transfer_tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let terminal = TransferTerminalGuard::new(job, fallback);
+            let response = server
+                .run_transfer_response(
+                    task_params,
+                    server.transfer_shutdown.child_token(),
+                    Some(progress),
+                )
+                .await;
+            terminal.finish(&response);
+        });
+        tasks.push(task);
+        drop(tasks);
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
     }
 }
 
@@ -633,7 +742,12 @@ impl ServerHandler for SshMcpServer {
             "transfer" => {
                 let params: TransferParams = self.parse_tool_params(args, "transfer")?;
                 let verbose = params.verbose;
-                self.execute_transfer(params, verbose).await
+                if params.background {
+                    self.execute_background_transfer(params).await
+                } else {
+                    self.execute_transfer(params, verbose, context.ct.clone())
+                        .await
+                }
             }
             "check_process" => {
                 let params: args::CheckProcessToolArgs =

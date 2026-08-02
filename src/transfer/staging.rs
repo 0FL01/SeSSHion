@@ -5,8 +5,6 @@ use crate::ssh::{SshConnectionManager, escape_for_shell};
 
 use super::exec_raw;
 
-const REMOTE_STAGING_BASE_SUFFIX: &str = "/.ssh-mcp/staging";
-
 pub(crate) const STAGE_MARKER: &str = "__SSH_MCP_STAGE=";
 pub(crate) const STAGE_BASE_MARKER: &str = "__SSH_MCP_STAGE_BASE=";
 pub(crate) const BACKUP_MARKER: &str = "__SSH_MCP_BACKUP=";
@@ -16,10 +14,6 @@ pub(crate) fn parse_marker_value(stderr: &str, prefix: &str) -> Option<String> {
     stderr
         .lines()
         .find_map(|line| line.strip_prefix(prefix).map(|v| v.to_string()))
-}
-
-pub(crate) fn remote_home_staging_base(remote_home: &str) -> String {
-    format!("{remote_home}{REMOTE_STAGING_BASE_SUFFIX}")
 }
 
 pub(crate) fn ensure_remote_exec_success(
@@ -81,8 +75,8 @@ pub(crate) async fn remote_prepare_put_file_stage(
     conn: &SshConnectionManager,
     remote_home: &str,
     remote_dst: &str,
-    overwrite: bool,
-    id: u64,
+    _overwrite: bool,
+    id: &str,
     timeout: Duration,
 ) -> Result<RemoteStage> {
     exec_raw::validate_remote_user_path(remote_home, "remote_home")?;
@@ -90,35 +84,17 @@ pub(crate) async fn remote_prepare_put_file_stage(
 
     let remote_tmp_sibling = exec_raw::remote_temp_sibling(remote_dst, id);
     let remote_dir = exec_raw::remote_parent_dir(remote_dst);
-    let home_staging_base = remote_home_staging_base(remote_home);
-
     let dir_escaped = escape_for_shell(&remote_dir);
     let dst_escaped = escape_for_shell(remote_dst);
     let tmp_sib_escaped = escape_for_shell(&remote_tmp_sibling);
-    let home_base_escaped = escape_for_shell(&home_staging_base);
 
-    let cmd = if overwrite {
-        format!(
-            r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; home_base=$4; id=$5; \
-             home_ok=1; if ! mkdir -p -- "$home_base" 2>/dev/null; then home_ok=0; fi; \
-             stage_dir="$home_base/$id"; if [ "$home_ok" -eq 1 ]; then if ! mkdir -p -- "$stage_dir" 2>/dev/null; then home_ok=0; fi; fi; \
-             bn=${{dst##*/}}; stage="$sib"; stage_base="$parent"; \
-             if ! (mkdir -p -- "$parent" 2>/dev/null && : > "$sib" 2>/dev/null); then \
-               if [ "$home_ok" -eq 1 ]; then stage="$stage_dir/$bn.ssh-mcp-staging-$id"; stage_base="$home_base"; : > "$stage"; \
-               else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; exit 1; fi; \
-             fi; \
-             printf "%s\\n" "{STAGE_MARKER}$stage" >&2; \
-             printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}' '{home_base_escaped}' '{id}'"#
-        )
-    } else {
-        format!(
-            r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; \
-             if ! (mkdir -p -- "$parent" 2>/dev/null && : > "$sib" 2>/dev/null); then \
-               printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; exit 1; fi; \
-             printf "%s\\n" "{STAGE_MARKER}$sib" >&2; \
-             printf "%s\\n" "{STAGE_BASE_MARKER}$parent" >&2' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}'"#
-        )
-    };
+    let cmd = format!(
+        r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; \
+         if ! (mkdir -p -- "$parent" 2>/dev/null && (set -C; : > "$sib") 2>/dev/null); then \
+           if [ -e "$sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; fi; \
+         printf "%s\\n" "{STAGE_MARKER}$sib" >&2; \
+         printf "%s\\n" "{STAGE_BASE_MARKER}$parent" >&2' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}'"#
+    );
 
     let out = conn.exec_command(&cmd, timeout).await?;
     ensure_remote_exec_success("prepare_put_file_stage", &out)?;
@@ -167,7 +143,7 @@ pub(crate) async fn remote_prepare_put_dir_stage(
     remote_home: &str,
     remote_dst_dir: &str,
     overwrite: bool,
-    id: u64,
+    id: &str,
     timeout: Duration,
 ) -> Result<RemoteStage> {
     exec_raw::validate_remote_user_path(remote_home, "remote_home")?;
@@ -175,25 +151,19 @@ pub(crate) async fn remote_prepare_put_dir_stage(
 
     let remote_parent = exec_raw::remote_parent_dir(remote_dst_dir);
     let remote_stage_sibling = exec_raw::remote_temp_dir_sibling(remote_dst_dir, id);
-    let home_staging_base = remote_home_staging_base(remote_home);
-
     let parent_escaped = escape_for_shell(&remote_parent);
     let dst_escaped = escape_for_shell(remote_dst_dir);
     let stage_sib_escaped = escape_for_shell(&remote_stage_sibling);
-    let home_base_escaped = escape_for_shell(&home_staging_base);
 
     let cmd = if overwrite {
         format!(
-            r#"sh -c 'set -eu; parent=$1; dst=$2; stage_sib=$3; home_base=$4; id=$5; \
-             home_ok=1; if ! mkdir -p -- "$home_base" 2>/dev/null; then home_ok=0; fi; \
-             stage_dir="$home_base/$id"; if [ "$home_ok" -eq 1 ]; then if ! mkdir -p -- "$stage_dir" 2>/dev/null; then home_ok=0; fi; fi; \
+            r#"sh -c 'set -eu; parent=$1; dst=$2; stage_sib=$3; \
               stage="$stage_sib"; stage_base="$parent"; \
-             if ! (mkdir -p -- "$parent" 2>/dev/null && rm -rf -- "$stage_sib" 2>/dev/null && mkdir -p -- "$stage_sib" 2>/dev/null); then \
-               if [ "$home_ok" -eq 1 ]; then stage="$stage_dir/stage-dir-$id"; stage_base="$home_base"; rm -rf -- "$stage" 2>/dev/null || true; mkdir -p -- "$stage"; \
-               else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; exit 1; fi; \
+             if ! (mkdir -p -- "$parent" 2>/dev/null && mkdir -- "$stage_sib" 2>/dev/null); then \
+               if [ -e "$stage_sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; \
                fi; \
              printf "%s\\n" "{STAGE_MARKER}$stage" >&2; \
-             printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2' sh '{parent_escaped}' '{dst_escaped}' '{stage_sib_escaped}' '{home_base_escaped}' '{id}'"#
+             printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2' sh '{parent_escaped}' '{dst_escaped}' '{stage_sib_escaped}'"#
         )
     } else {
         format!(
@@ -227,7 +197,7 @@ pub(crate) async fn remote_finalize_put_dir_overwrite_true(
     remote_home: &str,
     remote_dst_dir: &str,
     stage_dir: &str,
-    id: u64,
+    id: &str,
     timeout: Duration,
 ) -> Result<Option<String>> {
     exec_raw::validate_remote_user_path(remote_home, "remote_home")?;
@@ -235,29 +205,19 @@ pub(crate) async fn remote_finalize_put_dir_overwrite_true(
     exec_raw::validate_remote_user_path(stage_dir, "remote_stage")?;
 
     let remote_backup_sibling = exec_raw::remote_backup_dir_sibling(remote_dst_dir, id);
-    let home_staging_base = remote_home_staging_base(remote_home);
-
     let dst_escaped = escape_for_shell(remote_dst_dir);
     let stage_escaped = escape_for_shell(stage_dir);
     let backup_sib_escaped = escape_for_shell(&remote_backup_sibling);
-    let home_base_escaped = escape_for_shell(&home_staging_base);
 
     let cmd = format!(
-        r#"sh -c 'set -eu; dst=$1; stage=$2; backup_sib=$3; home_base=$4; id=$5; \
-          home_ok=1; if ! mkdir -p -- "$home_base" 2>/dev/null; then home_ok=0; fi; \
-          stage_dir="$home_base/$id"; if [ "$home_ok" -eq 1 ]; then if ! mkdir -p -- "$stage_dir" 2>/dev/null; then home_ok=0; fi; fi; \
-          backup=""; \
+        r#"sh -c 'set -eu; dst=$1; stage=$2; backup=$3; had_dst=0; \
           if [ -e "$dst" ]; then \
-            if rm -rf -- "$backup_sib" 2>/dev/null && mv -- "$dst" "$backup_sib" 2>/dev/null; then backup="$backup_sib"; \
-            else \
-              if [ "$home_ok" -eq 1 ]; then backup_home="$stage_dir/backup-dir-$id"; rm -rf -- "$backup_home" 2>/dev/null || true; \
-                if mv -- "$dst" "$backup_home" 2>/dev/null; then backup="$backup_home"; else rm -rf -- "$dst" 2>/dev/null || true; backup=""; fi; \
-              else rm -rf -- "$dst" 2>/dev/null || true; backup=""; fi; \
-            fi; \
+            if [ -e "$backup" ]; then printf "%s\\n" "{ERR_MARKER}backup_collision" >&2; exit 1; fi; \
+            if ! mv -- "$dst" "$backup"; then printf "%s\\n" "{ERR_MARKER}backup_failed" >&2; exit 1; fi; had_dst=1; \
           fi; \
           printf "%s\\n" "{BACKUP_MARKER}$backup" >&2; \
-          mv -- "$stage" "$dst"; \
-          if [ -n "$backup" ]; then rm -rf -- "$backup" 2>/dev/null || true; fi' sh '{dst_escaped}' '{stage_escaped}' '{backup_sib_escaped}' '{home_base_escaped}' '{id}'"#
+          if mv -- "$stage" "$dst"; then if [ "$had_dst" -eq 1 ]; then rm -rf -- "$backup" 2>/dev/null || true; fi; exit 0; fi; \
+          if [ "$had_dst" -eq 1 ] && ! mv -- "$backup" "$dst"; then printf "%s\\n" "{ERR_MARKER}rollback_failed:$backup" >&2; else printf "%s\\n" "{ERR_MARKER}install_failed" >&2; fi; exit 1' sh '{dst_escaped}' '{stage_escaped}' '{backup_sib_escaped}'"#
     );
 
     let out = conn.exec_command(&cmd, timeout).await?;

@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::{HostKeyCheckMode, SshConnectionManager, escape_for_shell};
@@ -35,8 +36,10 @@ pub struct OpenSshTransferArgs<'a> {
     pub conn: &'a SshConnectionManager,
     pub remote_home: &'a str,
     pub local_root: &'a Path,
-    pub id: u64,
+    pub id: String,
     pub timeout: Duration,
+    pub cancellation: CancellationToken,
+    pub progress: Option<super::TransferEventSink>,
     pub operation: TransferOperation,
     pub kind: TransferKind,
     pub local_path: PathBuf,
@@ -50,6 +53,8 @@ pub async fn run_transfer(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+    preflight(&endpoint, args.transport, args.timeout, &args.cancellation).await?;
+
     skeleton::dispatch_transfer(skeleton::DispatchTransferArgs {
         operation: args.operation,
         kind: args.kind,
@@ -138,6 +143,7 @@ async fn run_sftp_batch(
     endpoint: &OpenSshEndpoint,
     batch: &str,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
     let mut cmd = Command::new("sftp");
     cmd.arg("-P").arg(endpoint.port.to_string());
@@ -150,25 +156,38 @@ async fn run_sftp_batch(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    process::configure_child_command(&mut cmd);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| classify_spawn_error(OpenSshTransport::Sftp, e))?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(batch.as_bytes())
-            .await
-            .map_err(super::io_to_transport_attempt)?;
+        let write = stdin.write_all(batch.as_bytes());
+        tokio::pin!(write);
+        let write_result = tokio::select! {
+            result = &mut write => result.map_err(super::io_to_transport_attempt),
+            _ = tokio::time::sleep(timeout) => Err(super::TransportAttemptError::Other(
+                SshMcpError::Timeout(timeout.as_millis() as u64),
+            )),
+            _ = cancellation.cancelled() => Err(super::TransportAttemptError::Other(
+                SshMcpError::connection("transfer cancelled"),
+            )),
+        };
+        if let Err(error) = write_result {
+            process::terminate_child(&mut child).await;
+            return Err(error);
+        }
         let _ = stdin.shutdown().await;
     }
 
-    wait_child_with_timeout(OpenSshTransport::Sftp, child, timeout).await
+    wait_child_with_timeout(OpenSshTransport::Sftp, child, timeout, cancellation).await
 }
 
 async fn run_scp(
     endpoint: &OpenSshEndpoint,
     args: &[String],
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
     let mut cmd = Command::new("scp");
     cmd.arg("-P").arg(endpoint.port.to_string());
@@ -182,11 +201,12 @@ async fn run_scp(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    process::configure_child_command(&mut cmd);
 
     let child = cmd
         .spawn()
         .map_err(|e| classify_spawn_error(OpenSshTransport::Scp, e))?;
-    wait_child_with_timeout(OpenSshTransport::Scp, child, timeout).await
+    wait_child_with_timeout(OpenSshTransport::Scp, child, timeout, cancellation).await
 }
 
 fn scp_legacy_args(extra: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -237,12 +257,56 @@ async fn wait_child_with_timeout(
     _transport: OpenSshTransport,
     child: tokio::process::Child,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
-    let captured = process::wait_child_with_timeout(child, timeout).await?;
+    let captured = process::wait_child_with_timeout(child, timeout, cancellation).await?;
     Ok(ProcessOutput {
         status: captured.status,
         stderr: String::from_utf8_lossy(&captured.stderr).to_string(),
     })
+}
+
+async fn preflight(
+    endpoint: &OpenSshEndpoint,
+    transport: OpenSshTransport,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), super::TransportAttemptError> {
+    match transport {
+        OpenSshTransport::Sftp => {
+            let out = run_sftp_batch(endpoint, "quit\n", timeout, cancellation).await?;
+            if out.status.success() {
+                return Ok(());
+            }
+            let stderr = out.stderr.as_str();
+            if out.status.code() == Some(255)
+                && (stderr.contains("subsystem request failed")
+                    || stderr.contains("Subsystem request failed")
+                    || stderr.contains("Unknown subsystem")
+                    || stderr.contains("unknown subsystem"))
+            {
+                return Err(super::TransportAttemptError::FallbackSafe {
+                    transport: super::TransferTransport::Sftp,
+                    reason: stderr.trim().to_string(),
+                });
+            }
+            Err(classify_openssh_failure(OpenSshTransport::Sftp, &out))
+        }
+        OpenSshTransport::Scp => {
+            let mut command = Command::new("scp");
+            command
+                .arg("-V")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            process::configure_child_command(&mut command);
+            let child = command
+                .spawn()
+                .map_err(|error| classify_spawn_error(OpenSshTransport::Scp, error))?;
+            let _ = process::wait_child_with_timeout(child, timeout, cancellation).await?;
+            Ok(())
+        }
+    }
 }
 
 fn classify_spawn_error(
@@ -262,48 +326,12 @@ fn classify_spawn_error(
 }
 
 fn classify_openssh_failure(
-    transport: OpenSshTransport,
+    _transport: OpenSshTransport,
     out: &ProcessOutput,
 ) -> super::TransportAttemptError {
     let exit_code = out.status.code();
 
     let stderr = out.stderr.as_str();
-
-    if matches!(transport, OpenSshTransport::Sftp)
-        && exit_code == Some(255)
-        && (stderr.contains("subsystem request failed")
-            || stderr.contains("Subsystem request failed")
-            || stderr.contains("Unknown subsystem")
-            || stderr.contains("unknown subsystem"))
-    {
-        return super::TransportAttemptError::Unsupported {
-            transport: super::TransferTransport::Sftp,
-            reason: stderr.trim().to_string(),
-        };
-    }
-
-    if matches!(transport, OpenSshTransport::Scp)
-        && (stderr.contains("unknown option -- O")
-            || stderr.contains("illegal option -- O")
-            || stderr.contains("unknown option: -O")
-            || stderr.contains("unrecognized option") && stderr.contains("-O"))
-    {
-        return super::TransportAttemptError::Unsupported {
-            transport: super::TransferTransport::Scp,
-            reason: "scp -O flag unsupported".to_string(),
-        };
-    }
-
-    if matches!(transport, OpenSshTransport::Scp)
-        && (exit_code == Some(127)
-            || stderr.contains("scp: not found")
-            || stderr.contains("scp: command not found"))
-    {
-        return super::TransportAttemptError::Unsupported {
-            transport: super::TransferTransport::Scp,
-            reason: stderr.trim().to_string(),
-        };
-    }
 
     super::TransportAttemptError::Other(SshMcpError::connection(format!(
         "OpenSSH transport failed: exit_code={exit_code:?}; stderr={}",
@@ -324,6 +352,8 @@ async fn put_file(
         local_root: _,
         id,
         timeout,
+        cancellation,
+        progress,
         operation: _,
         kind: _,
         local_path,
@@ -339,9 +369,10 @@ async fn put_file(
             remote_home,
             remote_path,
             overwrite,
-            id,
+            id: &id,
             timeout,
             local_path: &local_path,
+            progress: progress.as_ref(),
         },
         move |stage_path| async move {
             match transport {
@@ -351,7 +382,7 @@ async fn put_file(
                         sftp_quote_token(&local_path_str),
                         sftp_quote_token(&stage_path)
                     );
-                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
+                    let out = run_sftp_batch(&endpoint, &batch, timeout, &cancellation).await?;
                     if !out.status.success() {
                         return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
@@ -359,18 +390,9 @@ async fn put_file(
                 OpenSshTransport::Scp => {
                     let remote = scp_remote_spec(&endpoint, &stage_path);
                     let try_o = scp_legacy_args([local_path_str.clone(), remote.clone()]);
-                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    let out_o = run_scp(&endpoint, &try_o, timeout, &cancellation).await?;
                     if !out_o.status.success() {
-                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = vec![local_path_str, remote];
-                            let out = run_scp(&endpoint, &no_o, timeout).await?;
-                            if !out.status.success() {
-                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
-                            }
-                        } else {
-                            return Err(classified);
-                        }
+                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out_o));
                     }
                 }
             }
@@ -392,6 +414,8 @@ async fn get_file(
         local_root,
         id,
         timeout,
+        cancellation,
+        progress,
         operation: _,
         kind: _,
         local_path,
@@ -407,7 +431,8 @@ async fn get_file(
             local_path: &local_path,
             remote_path: remote_path.as_str(),
             overwrite,
-            id,
+            id: &id,
+            progress: progress.as_ref(),
         },
         move |tmp_path| async move {
             match transport {
@@ -417,7 +442,7 @@ async fn get_file(
                         sftp_quote_token(&remote_path_for_download),
                         sftp_quote_token(&tmp_path)
                     );
-                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
+                    let out = run_sftp_batch(&endpoint, &batch, timeout, &cancellation).await?;
                     if !out.status.success() {
                         return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
@@ -426,18 +451,9 @@ async fn get_file(
                     let remote = scp_remote_spec(&endpoint, &remote_path_for_download);
                     let try_o =
                         scp_legacy_args(scp_receive_args([remote.clone(), tmp_path.clone()]));
-                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    let out_o = run_scp(&endpoint, &try_o, timeout, &cancellation).await?;
                     if !out_o.status.success() {
-                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = scp_receive_args([remote, tmp_path]);
-                            let out = run_scp(&endpoint, &no_o, timeout).await?;
-                            if !out.status.success() {
-                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
-                            }
-                        } else {
-                            return Err(classified);
-                        }
+                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out_o));
                     }
                 }
             }
@@ -462,6 +478,8 @@ async fn put_dir(
         remote_home,
         id,
         timeout,
+        cancellation,
+        progress,
         local_path,
         remote_path,
         overwrite,
@@ -483,9 +501,10 @@ async fn put_dir(
             remote_home,
             remote_path,
             overwrite,
-            id,
+            id: &id,
             timeout,
             counts,
+            progress: progress.as_ref(),
         },
         move |stage_path| async move {
             match transport {
@@ -496,7 +515,7 @@ async fn put_dir(
                         sftp_quote_token(&local_dot),
                         sftp_quote_token(&stage_path)
                     );
-                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
+                    let out = run_sftp_batch(&endpoint, &batch, timeout, &cancellation).await?;
                     if !out.status.success() {
                         return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
@@ -509,18 +528,9 @@ async fn put_dir(
                         local_path_for_scp.clone(),
                         remote.clone(),
                     ]);
-                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    let out_o = run_scp(&endpoint, &try_o, timeout, &cancellation).await?;
                     if !out_o.status.success() {
-                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = vec!["-r".to_string(), local_path_for_scp, remote];
-                            let out = run_scp(&endpoint, &no_o, timeout).await?;
-                            if !out.status.success() {
-                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
-                            }
-                        } else {
-                            return Err(classified);
-                        }
+                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out_o));
                     }
                 }
             }
@@ -542,6 +552,8 @@ async fn get_dir(
         local_root,
         id,
         timeout,
+        cancellation,
+        progress,
         operation: _,
         kind: _,
         local_path,
@@ -558,8 +570,9 @@ async fn get_dir(
             local_path: &local_path,
             remote_path: remote_path.as_str(),
             overwrite,
-            id,
+            id: &id,
             timeout,
+            progress: progress.as_ref(),
         },
         move |extract_target| async move {
             match transport {
@@ -570,7 +583,7 @@ async fn get_dir(
                         sftp_quote_token(&remote_dot),
                         sftp_quote_token(&extract_target)
                     );
-                    let out = run_sftp_batch(&endpoint, &batch, timeout).await?;
+                    let out = run_sftp_batch(&endpoint, &batch, timeout, &cancellation).await?;
                     if !out.status.success() {
                         return Err(classify_openssh_failure(OpenSshTransport::Sftp, &out));
                     }
@@ -583,18 +596,9 @@ async fn get_dir(
                         remote.clone(),
                         extract_target.clone(),
                     ]));
-                    let out_o = run_scp(&endpoint, &try_o, timeout).await?;
+                    let out_o = run_scp(&endpoint, &try_o, timeout, &cancellation).await?;
                     if !out_o.status.success() {
-                        let classified = classify_openssh_failure(OpenSshTransport::Scp, &out_o);
-                        if matches!(classified, super::TransportAttemptError::Unsupported { .. }) {
-                            let no_o = scp_receive_args(["-r".to_string(), remote, extract_target]);
-                            let out = run_scp(&endpoint, &no_o, timeout).await?;
-                            if !out.status.success() {
-                                return Err(classify_openssh_failure(OpenSshTransport::Scp, &out));
-                            }
-                        } else {
-                            return Err(classified);
-                        }
+                        return Err(classify_openssh_failure(OpenSshTransport::Scp, &out_o));
                     }
                 }
             }

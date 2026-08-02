@@ -3,6 +3,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::{HostKeyCheckMode, SshConnectionManager, escape_for_shell};
@@ -30,8 +31,10 @@ pub struct RsyncTransferArgs<'a> {
     pub conn: &'a SshConnectionManager,
     pub remote_home: &'a str,
     pub local_root: &'a Path,
-    pub id: u64,
+    pub id: String,
     pub timeout: Duration,
+    pub cancellation: CancellationToken,
+    pub progress: Option<super::TransferEventSink>,
     pub operation: TransferOperation,
     pub kind: TransferKind,
     pub local_path: &'a Path,
@@ -45,18 +48,13 @@ pub async fn run_transfer(
     args: RsyncTransferArgs<'_>,
 ) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
     // Check local rsync availability first
-    if let Err(e) = check_local_rsync().await {
-        return Err(super::TransportAttemptError::Unsupported {
-            transport: super::TransferTransport::Rsync,
-            reason: format!("local rsync not available: {e}"),
-        });
-    }
+    check_local_rsync(args.timeout, &args.cancellation).await?;
 
     // Check remote rsync availability via SSH
     match check_remote_rsync(args.conn, args.timeout).await {
         Ok(true) => {}
         Ok(false) => {
-            return Err(super::TransportAttemptError::Unsupported {
+            return Err(super::TransportAttemptError::FallbackSafe {
                 transport: super::TransferTransport::Rsync,
                 reason: "rsync not found on remote host".to_string(),
             });
@@ -79,14 +77,25 @@ pub async fn run_transfer(
     .await
 }
 
-async fn check_local_rsync() -> Result<()> {
-    match Command::new("rsync").arg("--version").output().await {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(_) => Err(SshMcpError::connection("rsync --version failed")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(SshMcpError::connection("rsync binary not found"))
-        }
-        Err(e) => Err(SshMcpError::Io(e)),
+async fn check_local_rsync(
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), super::TransportAttemptError> {
+    let mut command = Command::new("rsync");
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process::configure_child_command(&mut command);
+    let child = command.spawn().map_err(classify_spawn_error)?;
+    let output = process::wait_child_with_timeout(child, timeout, cancellation).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(super::TransportAttemptError::Other(
+            SshMcpError::connection("rsync --version failed"),
+        ))
     }
 }
 
@@ -163,6 +172,7 @@ async fn run_rsync(
     src: &str,
     dst: &str,
     timeout_duration: Duration,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<TransferCounts, super::TransportAttemptError> {
     let ssh_opts = build_ssh_options(endpoint);
     let mut cmd = Command::new("rsync");
@@ -190,9 +200,10 @@ async fn run_rsync(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    process::configure_child_command(&mut cmd);
 
     let child = cmd.spawn().map_err(classify_spawn_error)?;
-    let captured = process::wait_child_with_timeout(child, timeout_duration).await?;
+    let captured = process::wait_child_with_timeout(child, timeout_duration, cancellation).await?;
 
     let stdout = String::from_utf8_lossy(&captured.stdout).to_string();
     let stderr = String::from_utf8_lossy(&captured.stderr).to_string();
@@ -257,10 +268,9 @@ fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> super::Transp
         || stderr_lower.contains("rsync: command not found")
         || stderr_lower.contains("could not find rsync")
     {
-        return super::TransportAttemptError::Unsupported {
-            transport: super::TransferTransport::Rsync,
-            reason: "rsync not found on remote host".to_string(),
-        };
+        return super::TransportAttemptError::Other(SshMcpError::connection(
+            "rsync not found on remote host after preflight",
+        ));
     }
 
     // Check for SSH connection issues
@@ -301,6 +311,8 @@ async fn put_file(
         local_root: _,
         id,
         timeout,
+        cancellation,
+        progress,
         operation: _,
         kind: _,
         local_path,
@@ -318,15 +330,23 @@ async fn put_file(
             remote_home,
             remote_path,
             overwrite,
-            id,
+            id: &id,
             timeout,
             local_path,
+            progress: progress.as_ref(),
         },
         move |stage_path| async move {
             let remote = rsync_remote_spec(&endpoint, &stage_path);
-            run_rsync(&endpoint, &rsync_options, &local_path_str, &remote, timeout)
-                .await
-                .map(|_| ())
+            run_rsync(
+                &endpoint,
+                &rsync_options,
+                &local_path_str,
+                &remote,
+                timeout,
+                &cancellation,
+            )
+            .await
+            .map(|_| ())
         },
     )
     .await
@@ -342,6 +362,8 @@ async fn get_file(
         local_root,
         id,
         timeout,
+        cancellation,
+        progress,
         operation: _,
         kind: _,
         local_path,
@@ -358,12 +380,20 @@ async fn get_file(
             local_path,
             remote_path,
             overwrite,
-            id,
+            id: &id,
+            progress: progress.as_ref(),
         },
         move |tmp_path| async move {
-            run_rsync(&endpoint, &rsync_options, &remote, &tmp_path, timeout)
-                .await
-                .map(|_| ())
+            run_rsync(
+                &endpoint,
+                &rsync_options,
+                &remote,
+                &tmp_path,
+                timeout,
+                &cancellation,
+            )
+            .await
+            .map(|_| ())
         },
     )
     .await
@@ -382,6 +412,8 @@ async fn put_dir(
         remote_home,
         id,
         timeout,
+        cancellation,
+        progress,
         local_path,
         remote_path,
         overwrite,
@@ -401,16 +433,24 @@ async fn put_dir(
             remote_home,
             remote_path,
             overwrite,
-            id,
+            id: &id,
             timeout,
             counts,
+            progress: progress.as_ref(),
         },
         move |stage_path| async move {
             let local_dot = format!("{}/.", local_path.display());
             let remote = rsync_remote_spec(&endpoint, &stage_path);
-            run_rsync(&endpoint, &rsync_options, &local_dot, &remote, timeout)
-                .await
-                .map(|_| ())
+            run_rsync(
+                &endpoint,
+                &rsync_options,
+                &local_dot,
+                &remote,
+                timeout,
+                &cancellation,
+            )
+            .await
+            .map(|_| ())
         },
     )
     .await
@@ -426,6 +466,8 @@ async fn get_dir(
         local_root,
         id,
         timeout,
+        cancellation,
+        progress,
         operation: _,
         kind: _,
         local_path,
@@ -444,13 +486,21 @@ async fn get_dir(
             local_path,
             remote_path,
             overwrite,
-            id,
+            id: &id,
             timeout,
+            progress: progress.as_ref(),
         },
         move |extract_target| async move {
-            run_rsync(&endpoint, &rsync_options, &remote, &extract_target, timeout)
-                .await
-                .map(|_| ())
+            run_rsync(
+                &endpoint,
+                &rsync_options,
+                &remote,
+                &extract_target,
+                timeout,
+                &cancellation,
+            )
+            .await
+            .map(|_| ())
         },
     )
     .await

@@ -22,13 +22,17 @@ pub use types::{
     TransferCounts, TransferKind, TransferOperation, TransferParams, TransferResponse,
     TransferStaging, TransferTransport,
 };
+pub(crate) use types::{TransferEvent, TransferEventSink, TransferProgressTarget};
 
+use std::collections::HashSet;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::{HostKeyCheckMode, SshConnectionManager};
@@ -40,10 +44,12 @@ fn io_to_transport_attempt(err: std::io::Error) -> TransportAttemptError {
 struct StepCtx<'a> {
     conn: &'a SshConnectionManager,
     remote_home: &'a str,
-    id: u64,
+    id: &'a str,
     kind: TransferKind,
     resolved: &'a ResolvedPaths,
     timeout: Duration,
+    cancellation: &'a CancellationToken,
+    progress: Option<&'a TransferEventSink>,
     response: &'a mut TransferResponse,
 }
 
@@ -52,13 +58,26 @@ struct OpenSshContext<'a> {
     remote_home: &'a str,
     key_path: Option<&'a Path>,
     ssh: &'a TransferSshOptions,
-    id: u64,
+    id: &'a str,
     timeout: Duration,
+    cancellation: &'a CancellationToken,
+    progress: Option<&'a TransferEventSink>,
 }
 
 struct OpenSshOperation<'a> {
     transport: openssh::OpenSshTransport,
     kind: TransferKind,
+    response: &'a mut TransferResponse,
+}
+
+struct ExecRawOperation<'a> {
+    conn: &'a SshConnectionManager,
+    remote_home: &'a str,
+    id: &'a str,
+    kind: TransferKind,
+    timeout: Duration,
+    cancellation: &'a CancellationToken,
+    progress: Option<&'a TransferEventSink>,
     response: &'a mut TransferResponse,
 }
 
@@ -69,13 +88,20 @@ struct OpenSshOperation<'a> {
 #[derive(Clone, Debug)]
 pub struct TransferEngine {
     local_root: Arc<PathBuf>,
-    counter: Arc<AtomicU64>,
+    active_destinations: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TransferRunContext {
     pub timeout: Duration,
     pub ssh: TransferSshOptions,
+}
+
+struct TransferExecutionContext {
+    timeout: Duration,
+    ssh: TransferSshOptions,
+    cancellation: CancellationToken,
+    progress: Option<TransferEventSink>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,11 +114,24 @@ pub struct TransferSshOptions {
     pub known_hosts: Option<PathBuf>,
 }
 
+struct DestinationGuard {
+    key: String,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for DestinationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
 impl TransferEngine {
     pub fn new(local_root: PathBuf) -> Self {
         Self {
             local_root: Arc::new(local_root),
-            counter: Arc::new(AtomicU64::new(1)),
+            active_destinations: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -100,8 +139,55 @@ impl TransferEngine {
         self.local_root.as_path()
     }
 
-    fn next_id(&self) -> u64 {
-        self.counter.fetch_add(1, Ordering::Relaxed)
+    fn next_attempt_token(&self) -> Result<String> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|error| {
+            SshMcpError::connection(format!("failed to create staging token: {error}"))
+        })?;
+        let mut token = String::with_capacity(32);
+        for byte in bytes {
+            write!(&mut token, "{byte:02x}")
+                .map_err(|_| SshMcpError::connection("failed to format staging token"))?;
+        }
+        Ok(token)
+    }
+
+    fn reserve_destination(
+        &self,
+        params: &TransferParams,
+        kind: TransferKind,
+    ) -> Result<DestinationGuard> {
+        let key = match params.operation {
+            TransferOperation::Put => {
+                exec_raw::validate_remote_user_path(&params.remote_path, "remote_path")?;
+                format!("put:{}", normalize_remote_path(&params.remote_path))
+            }
+            TransferOperation::Get => {
+                let resolved = local_root::resolve_paths(self.local_root(), params, kind)
+                    .map_err(SshMcpError::invalid_params)?;
+                format!("get:{}", resolved.local_path.display())
+            }
+        };
+
+        let mut active = self
+            .active_destinations
+            .lock()
+            .map_err(|_| SshMcpError::connection("destination guard poisoned"))?;
+        if !active.insert(key.clone()) {
+            return Err(SshMcpError::invalid_params(format!(
+                "destination busy: {}",
+                match params.operation {
+                    TransferOperation::Put => &params.remote_path,
+                    TransferOperation::Get => &params.local_path,
+                }
+            )));
+        }
+        drop(active);
+
+        Ok(DestinationGuard {
+            key,
+            active: Arc::clone(&self.active_destinations),
+        })
     }
 
     pub async fn run(
@@ -110,10 +196,71 @@ impl TransferEngine {
         params: TransferParams,
         ctx: TransferRunContext,
     ) -> TransferResponse {
-        let key_path_opt = ctx.ssh.key_path.clone();
+        self.run_controlled(conn, params, ctx, CancellationToken::new(), None)
+            .await
+    }
+
+    pub(crate) async fn run_controlled(
+        &self,
+        conn: &SshConnectionManager,
+        params: TransferParams,
+        ctx: TransferRunContext,
+        external_cancellation: CancellationToken,
+        progress: Option<TransferEventSink>,
+    ) -> TransferResponse {
+        const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
         let started_at = Instant::now();
-        let id = self.next_id();
+        let transfer_timeout = ctx.timeout;
+        let response_params = params.clone();
+        let work_cancellation = CancellationToken::new();
+        let execution_ctx = TransferExecutionContext {
+            timeout: ctx.timeout,
+            ssh: ctx.ssh,
+            cancellation: work_cancellation.clone(),
+            progress,
+        };
+
+        let work = self.run_inner(conn, params, execution_ctx, started_at);
+        tokio::pin!(work);
+
+        enum StopReason {
+            Cancelled,
+            TimedOut,
+        }
+
+        let stop_reason = tokio::select! {
+            response = &mut work => return response,
+            _ = external_cancellation.cancelled() => StopReason::Cancelled,
+            _ = tokio::time::sleep_until(started_at + transfer_timeout) => StopReason::TimedOut,
+        };
+
+        work_cancellation.cancel();
+        let _ = tokio::time::timeout(TEARDOWN_GRACE, &mut work).await;
+
+        let message = match stop_reason {
+            StopReason::Cancelled => "transfer cancelled".to_string(),
+            StopReason::TimedOut => {
+                format!("transfer timeout after {}ms", transfer_timeout.as_millis())
+            }
+        };
+        let mut response = TransferResponse::error(response_params, self.local_root(), &message);
+        response.elapsed_ms = Some(started_at.elapsed().as_millis() as u64);
+        response
+    }
+
+    async fn run_inner(
+        &self,
+        conn: &SshConnectionManager,
+        params: TransferParams,
+        ctx: TransferExecutionContext,
+        started_at: Instant,
+    ) -> TransferResponse {
+        let key_path_opt = ctx.ssh.key_path.clone();
+
+        if let Some(progress) = &ctx.progress {
+            progress.emit(types::TransferEvent::Preparing);
+        }
 
         let remote_home = match exec_raw::resolve_remote_home(conn, ctx.timeout).await {
             Ok(home) => home,
@@ -133,7 +280,14 @@ impl TransferEngine {
             self.local_root(),
         );
 
-        let kind = match resolve_kind(conn, self.local_root(), &response.params, ctx.timeout).await
+        let kind = match resolve_kind(
+            conn,
+            self.local_root(),
+            &response.params,
+            ctx.timeout,
+            &ctx.cancellation,
+        )
+        .await
         {
             Ok(kind) => kind,
             Err(e) => {
@@ -143,6 +297,15 @@ impl TransferEngine {
             }
         };
         response.kind = Some(kind);
+
+        let _destination_guard = match self.reserve_destination(&response.params, kind) {
+            Ok(guard) => guard,
+            Err(error) => {
+                response.set_error(&error.to_string());
+                response.elapsed_ms = Some(started_at.elapsed().as_millis() as u64);
+                return response;
+            }
+        };
 
         let transports = match response.params.transport {
             TransferTransport::Auto => {
@@ -158,14 +321,32 @@ impl TransferEngine {
 
         let mut attempted_transports: Vec<TransferTransport> = Vec::new();
         let mut unsupported_reasons: Vec<String> = Vec::new();
-        let mut failed_reasons: Vec<String> = Vec::new();
 
         for transport in transports {
+            let id = match self.next_attempt_token() {
+                Ok(id) => id,
+                Err(error) => {
+                    response.set_error(&error.to_string());
+                    break;
+                }
+            };
             attempted_transports.push(transport);
             response.transport_used = transport;
+            if let Some(progress) = &ctx.progress {
+                progress.emit(types::TransferEvent::Transferring(transport));
+            }
             let attempt = match transport {
                 TransferTransport::ExecRaw => self
-                    .run_exec_raw(conn, &remote_home, id, kind, ctx.timeout, &mut response)
+                    .run_exec_raw(ExecRawOperation {
+                        conn,
+                        remote_home: &remote_home,
+                        id: &id,
+                        kind,
+                        timeout: ctx.timeout,
+                        cancellation: &ctx.cancellation,
+                        progress: ctx.progress.as_ref(),
+                        response: &mut response,
+                    })
                     .await
                     .map_err(TransportAttemptError::Other),
                 TransferTransport::Sftp => {
@@ -175,8 +356,10 @@ impl TransferEngine {
                             remote_home: &remote_home,
                             key_path: key_path_opt.as_deref(),
                             ssh: &ctx.ssh,
-                            id,
+                            id: &id,
                             timeout: ctx.timeout,
+                            cancellation: &ctx.cancellation,
+                            progress: ctx.progress.as_ref(),
                         },
                         OpenSshOperation {
                             transport: openssh::OpenSshTransport::Sftp,
@@ -193,8 +376,10 @@ impl TransferEngine {
                             remote_home: &remote_home,
                             key_path: key_path_opt.as_deref(),
                             ssh: &ctx.ssh,
-                            id,
+                            id: &id,
                             timeout: ctx.timeout,
+                            cancellation: &ctx.cancellation,
+                            progress: ctx.progress.as_ref(),
                         },
                         OpenSshOperation {
                             transport: openssh::OpenSshTransport::Scp,
@@ -216,8 +401,10 @@ impl TransferEngine {
                             remote_home: &remote_home,
                             key_path: key_path_opt.as_deref(),
                             ssh: &ctx.ssh,
-                            id,
+                            id: &id,
                             timeout: ctx.timeout,
+                            cancellation: &ctx.cancellation,
+                            progress: ctx.progress.as_ref(),
                         },
                         kind,
                         &mut response,
@@ -231,15 +418,11 @@ impl TransferEngine {
                     response.ok = true;
                     break;
                 }
-                Err(TransportAttemptError::Unsupported { transport, reason }) => {
+                Err(TransportAttemptError::FallbackSafe { transport, reason }) => {
                     unsupported_reasons.push(format!("{transport:?}: {reason}"));
                     continue;
                 }
                 Err(e) => {
-                    if response.params.transport == TransferTransport::Auto {
-                        failed_reasons.push(format!("{transport:?}: {e}"));
-                        continue;
-                    }
                     response.set_error(&e.to_string());
                     break;
                 }
@@ -255,11 +438,7 @@ impl TransferEngine {
             && response.error.is_none()
             && response.params.transport == TransferTransport::Auto
         {
-            // If we have both unsupported and failed errors, include all of them
-            let all_reasons: Vec<String> = unsupported_reasons
-                .into_iter()
-                .chain(failed_reasons)
-                .collect();
+            let all_reasons = unsupported_reasons;
 
             if all_reasons.is_empty() {
                 response.set_error("all transfer transports failed");
@@ -275,15 +454,17 @@ impl TransferEngine {
         response
     }
 
-    async fn run_exec_raw(
-        &self,
-        conn: &SshConnectionManager,
-        remote_home: &str,
-        id: u64,
-        kind: TransferKind,
-        timeout: Duration,
-        response: &mut TransferResponse,
-    ) -> Result<()> {
+    async fn run_exec_raw(&self, operation: ExecRawOperation<'_>) -> Result<()> {
+        let ExecRawOperation {
+            conn,
+            remote_home,
+            id,
+            kind,
+            timeout,
+            cancellation,
+            progress,
+            response,
+        } = operation;
         let resolved = self
             .resolve_and_validate_local_paths(&response.params, kind)
             .await?;
@@ -296,6 +477,8 @@ impl TransferEngine {
             kind,
             resolved: &resolved,
             timeout,
+            cancellation,
+            progress,
             response,
         };
 
@@ -310,6 +493,8 @@ impl TransferEngine {
             conn: ctx.conn,
             id: ctx.id,
             timeout: ctx.timeout,
+            cancellation: ctx.cancellation,
+            progress: ctx.progress,
         };
 
         match ctx.kind {
@@ -338,7 +523,7 @@ impl TransferEngine {
                 ctx.response.staging = Some(staging);
                 ctx.response.counts = Some(counts);
                 ctx.response.semantics = Some(
-                    "directory transfer behavior depends on overwrite: if overwrite=true, it stages into a temp dir (sibling under destination parent when possible, else $HOME/.ssh-mcp/staging) and then swaps into place via rename, optionally moving an existing destination to a backup path removed on success (backup may remain if swap fails); if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)"
+                    "directory transfer behavior depends on overwrite: if overwrite=true, it uses an exclusively created sibling staging directory and rollback-protected rename; if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)"
                         .to_string(),
                 );
                 Ok(())
@@ -351,6 +536,8 @@ impl TransferEngine {
             conn: ctx.conn,
             id: ctx.id,
             timeout: ctx.timeout,
+            cancellation: ctx.cancellation,
+            progress: ctx.progress,
         };
 
         // If the client explicitly provided a kind, validate the remote path kind
@@ -397,7 +584,7 @@ impl TransferEngine {
                 ctx.response.staging = Some(staging);
                 ctx.response.counts = Some(counts);
                 ctx.response.semantics = Some(
-                    "directory transfer writes into a sibling staging dir under local_root, then swaps into place via rename; local_path must not normalize to '.'; if the destination existed, it is first renamed to a sibling backup path and removed after the swap (backup may remain if swap fails)"
+                    "directory transfer writes into an exclusively created sibling staging directory under local_root, then installs it with rollback-protected rename; local_path must not normalize to '.'"
                         .to_string(),
                 );
                 Ok(())
@@ -413,7 +600,7 @@ impl TransferEngine {
         let key_path = match ctx.key_path {
             Some(p) => p,
             None => {
-                return Err(TransportAttemptError::Unsupported {
+                return Err(TransportAttemptError::FallbackSafe {
                     transport: match op.transport {
                         openssh::OpenSshTransport::Sftp => TransferTransport::Sftp,
                         openssh::OpenSshTransport::Scp => TransferTransport::Scp,
@@ -445,6 +632,8 @@ impl TransferEngine {
                     conn: ctx.conn,
                     id: ctx.id,
                     timeout: ctx.timeout,
+                    cancellation: ctx.cancellation,
+                    progress: ctx.progress,
                 },
                 remote_path: &remote_path,
             })
@@ -478,8 +667,10 @@ impl TransferEngine {
             conn: ctx.conn,
             remote_home: ctx.remote_home,
             local_root: self.local_root(),
-            id: ctx.id,
+            id: ctx.id.to_string(),
             timeout: ctx.timeout,
+            cancellation: ctx.cancellation.clone(),
+            progress: ctx.progress.cloned(),
             operation,
             kind,
             local_path: resolved.local_path,
@@ -492,8 +683,8 @@ impl TransferEngine {
         response.counts = Some(counts);
         if kind == TransferKind::Directory {
             response.semantics = Some(match operation {
-                TransferOperation::Put => "directory transfer behavior depends on overwrite: if overwrite=true, it stages into a temp dir (sibling under destination parent when possible, else $HOME/.ssh-mcp/staging) and then swaps into place via rename, optionally moving an existing destination to a backup path removed on success (backup may remain if swap fails); if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)".to_string(),
-                TransferOperation::Get => "directory transfer writes into a sibling staging dir under local_root, then swaps into place via rename; local_path must not normalize to '.'; if the destination existed, it is first renamed to a sibling backup path and removed after the swap (backup may remain if swap fails)".to_string(),
+                TransferOperation::Put => "directory transfer behavior depends on overwrite: if overwrite=true, it uses an exclusively created sibling staging directory and rollback-protected rename; if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap)".to_string(),
+                TransferOperation::Get => "directory transfer writes into an exclusively created sibling staging directory under local_root, then installs it with rollback-protected rename; local_path must not normalize to '.'".to_string(),
             });
         }
         Ok(())
@@ -505,6 +696,13 @@ impl TransferEngine {
         kind: TransferKind,
         response: &mut TransferResponse,
     ) -> std::result::Result<(), TransportAttemptError> {
+        if ctx.key_path.is_none() {
+            return Err(TransportAttemptError::FallbackSafe {
+                transport: TransferTransport::Rsync,
+                reason: "SSH key required for rsync transport".to_string(),
+            });
+        }
+
         let resolved = self
             .resolve_and_validate_local_paths(&response.params, kind)
             .await
@@ -524,6 +722,8 @@ impl TransferEngine {
                     conn: ctx.conn,
                     id: ctx.id,
                     timeout: ctx.timeout,
+                    cancellation: ctx.cancellation,
+                    progress: ctx.progress,
                 },
                 remote_path: &remote_path,
             })
@@ -557,8 +757,10 @@ impl TransferEngine {
             conn: ctx.conn,
             remote_home: ctx.remote_home,
             local_root: self.local_root(),
-            id: ctx.id,
+            id: ctx.id.to_string(),
             timeout: ctx.timeout,
+            cancellation: ctx.cancellation.clone(),
+            progress: ctx.progress.cloned(),
             operation,
             kind,
             local_path: &resolved.local_path,
@@ -572,8 +774,8 @@ impl TransferEngine {
         response.counts = Some(counts);
         if kind == TransferKind::Directory {
             response.semantics = Some(match operation {
-                TransferOperation::Put => "directory transfer behavior depends on overwrite: if overwrite=true, it stages into a temp dir (sibling under destination parent when possible, else $HOME/.ssh-mcp/staging) and then swaps into place via rename, optionally moving an existing destination to a backup path removed on success (backup may remain if swap fails); if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap); on upload error it attempts to remove the stage directory (best-effort; for overwrite=false this is the created destination directory, and partial contents may remain)".to_string(),
-                TransferOperation::Get => "directory transfer writes into a sibling staging dir under local_root, then swaps into place via rename; local_path must not normalize to '.'; if the destination existed, it is first renamed to a sibling backup path and removed after the swap (backup may remain if swap fails)".to_string(),
+                TransferOperation::Put => "directory transfer behavior depends on overwrite: if overwrite=true, it uses an exclusively created sibling staging directory and rollback-protected rename; if overwrite=false, it creates the destination directory and writes directly into it (no atomic swap)".to_string(),
+                TransferOperation::Get => "directory transfer writes into an exclusively created sibling staging directory under local_root, then installs it with rollback-protected rename; local_path must not normalize to '.'".to_string(),
             });
         }
         Ok(())
@@ -606,9 +808,34 @@ impl TransferEngine {
     }
 }
 
+fn normalize_remote_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            ".." if !absolute => parts.push(part),
+            ".." => {}
+            _ => parts.push(part),
+        }
+    }
+
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
 #[derive(Debug)]
 enum TransportAttemptError {
-    Unsupported {
+    FallbackSafe {
         transport: TransferTransport,
         reason: String,
     },
@@ -618,7 +845,7 @@ enum TransportAttemptError {
 impl std::fmt::Display for TransportAttemptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported { transport, reason } => {
+            Self::FallbackSafe { transport, reason } => {
                 write!(f, "transport {transport:?} unsupported: {reason}")
             }
             Self::Other(e) => write!(f, "{e}"),
@@ -633,6 +860,7 @@ async fn resolve_kind(
     local_root: &Path,
     params: &TransferParams,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<TransferKind> {
     match params.kind {
         Some(kind) => Ok(kind),
@@ -651,13 +879,60 @@ async fn resolve_kind(
                 exec_raw::probe_remote_kind(exec_raw::ProbeRemoteKindArgs {
                     ctx: exec_raw::ExecRawCtx {
                         conn,
-                        id: 0,
+                        id: "",
                         timeout,
+                        cancellation,
+                        progress: None,
                     },
                     remote_path: &params.remote_path,
                 })
                 .await
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destination_guard_rejects_normalized_alias_until_release() {
+        let engine = TransferEngine::new(PathBuf::from("/tmp/local-root"));
+        let first = TransferParams {
+            remote_path: "/tmp/a/../target".to_string(),
+            ..TransferParams::default()
+        };
+        let second = TransferParams {
+            remote_path: "/tmp/target".to_string(),
+            ..TransferParams::default()
+        };
+
+        let guard = engine
+            .reserve_destination(&first, TransferKind::File)
+            .expect("first destination reservation");
+        let error = engine
+            .reserve_destination(&second, TransferKind::File)
+            .err()
+            .expect("normalized alias must be busy");
+        assert!(error.to_string().contains("destination busy"));
+
+        drop(guard);
+        assert!(
+            engine
+                .reserve_destination(&second, TransferKind::File)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn attempt_tokens_are_128_bit_hex() {
+        let engine = TransferEngine::new(PathBuf::from("/tmp/local-root"));
+        let first = engine.next_attempt_token().expect("first token");
+        let second = engine.next_attempt_token().expect("second token");
+
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 }

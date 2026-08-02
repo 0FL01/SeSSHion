@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +97,10 @@ pub struct TransferParams {
     /// Optional timeout override for this transfer.
     pub timeout_ms: Option<u64>,
 
+    /// Run as an in-memory background job and return a job ID immediately.
+    #[serde(default)]
+    pub background: bool,
+
     /// When true, return full diagnostic response including staging details.
     /// When false or omitted, return compact response with only essential fields.
     #[serde(default)]
@@ -132,9 +137,46 @@ impl Default for TransferParams {
             kind: None,
             overwrite: default_overwrite(),
             timeout_ms: None,
+            background: false,
             verbose: false,
             rsync_options: RsyncOptions::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TransferProgressTarget {
+    Local(PathBuf),
+    Remote(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TransferEvent {
+    Preparing,
+    Transferring(TransferTransport),
+    FileStage {
+        target: TransferProgressTarget,
+        total_bytes: Option<u64>,
+    },
+    Finalizing,
+}
+
+#[derive(Clone)]
+pub(crate) struct TransferEventSink(Arc<dyn Fn(TransferEvent) + Send + Sync>);
+
+impl std::fmt::Debug for TransferEventSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TransferEventSink(..)")
+    }
+}
+
+impl TransferEventSink {
+    pub(crate) fn new(callback: impl Fn(TransferEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub(crate) fn emit(&self, event: TransferEvent) {
+        (self.0)(event);
     }
 }
 

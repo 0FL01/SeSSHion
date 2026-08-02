@@ -9,7 +9,8 @@ use super::TransportAttemptError;
 use super::exec_raw;
 use super::staging;
 use super::types::{
-    StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferOperation, TransferStaging,
+    StagingLocal, StagingRemote, TransferCounts, TransferEvent, TransferEventSink, TransferKind,
+    TransferOperation, TransferProgressTarget, TransferStaging,
 };
 
 pub(in crate::transfer) struct DispatchTransferArgs<E, A, PF, GF, PD, GD> {
@@ -72,9 +73,10 @@ pub(in crate::transfer) struct PutFileWithRemoteStagingArgs<'a> {
     pub(in crate::transfer) remote_home: &'a str,
     pub(in crate::transfer) remote_path: String,
     pub(in crate::transfer) overwrite: bool,
-    pub(in crate::transfer) id: u64,
+    pub(in crate::transfer) id: &'a str,
     pub(in crate::transfer) timeout: Duration,
     pub(in crate::transfer) local_path: &'a Path,
+    pub(in crate::transfer) progress: Option<&'a TransferEventSink>,
 }
 
 pub(in crate::transfer) struct GetFileWithLocalStagingArgs<'a> {
@@ -82,7 +84,8 @@ pub(in crate::transfer) struct GetFileWithLocalStagingArgs<'a> {
     pub(in crate::transfer) local_path: &'a Path,
     pub(in crate::transfer) remote_path: &'a str,
     pub(in crate::transfer) overwrite: bool,
-    pub(in crate::transfer) id: u64,
+    pub(in crate::transfer) id: &'a str,
+    pub(in crate::transfer) progress: Option<&'a TransferEventSink>,
 }
 
 pub(in crate::transfer) struct PutDirWithRemoteStagingArgs<'a> {
@@ -90,9 +93,10 @@ pub(in crate::transfer) struct PutDirWithRemoteStagingArgs<'a> {
     pub(in crate::transfer) remote_home: &'a str,
     pub(in crate::transfer) remote_path: String,
     pub(in crate::transfer) overwrite: bool,
-    pub(in crate::transfer) id: u64,
+    pub(in crate::transfer) id: &'a str,
     pub(in crate::transfer) timeout: Duration,
     pub(in crate::transfer) counts: TransferCounts,
+    pub(in crate::transfer) progress: Option<&'a TransferEventSink>,
 }
 
 pub(in crate::transfer) struct GetDirWithLocalStagingArgs<'a> {
@@ -101,8 +105,9 @@ pub(in crate::transfer) struct GetDirWithLocalStagingArgs<'a> {
     pub(in crate::transfer) local_path: &'a Path,
     pub(in crate::transfer) remote_path: &'a str,
     pub(in crate::transfer) overwrite: bool,
-    pub(in crate::transfer) id: u64,
+    pub(in crate::transfer) id: &'a str,
     pub(in crate::transfer) timeout: Duration,
+    pub(in crate::transfer) progress: Option<&'a TransferEventSink>,
 }
 
 pub(in crate::transfer) async fn put_file_with_remote_staging<F, Fut>(
@@ -136,9 +141,20 @@ where
 
     let stage_path = stage.stage_path.clone();
 
+    if let Some(progress) = args.progress {
+        progress.emit(TransferEvent::FileStage {
+            target: TransferProgressTarget::Remote(stage_path.clone()),
+            total_bytes: Some(size),
+        });
+    }
+
     if let Err(e) = upload_into_stage(stage_path.clone()).await {
         best_effort_remote_rm_file(args.conn, args.timeout, &stage_path).await;
         return Err(e);
+    }
+
+    if let Some(progress) = args.progress {
+        progress.emit(TransferEvent::Finalizing);
     }
 
     if let Err(e) = staging::remote_finalize_put_file(
@@ -192,6 +208,13 @@ where
 
     let tmp_str = tmp.display().to_string();
 
+    if let Some(progress) = args.progress {
+        progress.emit(TransferEvent::FileStage {
+            target: TransferProgressTarget::Local(tmp.clone()),
+            total_bytes: None,
+        });
+    }
+
     if let Err(e) = download_into_tmp(tmp_str.clone()).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e);
@@ -201,6 +224,10 @@ where
         .await
         .map_err(super::io_to_transport_attempt)?;
     let bytes = meta.len();
+
+    if let Some(progress) = args.progress {
+        progress.emit(TransferEvent::Finalizing);
+    }
 
     if args.overwrite {
         exec_raw::atomic_replace_file(&tmp, args.local_path)
@@ -245,6 +272,7 @@ where
         id,
         timeout,
         counts,
+        progress,
     } = args;
 
     let stage = staging::remote_prepare_put_dir_stage(
@@ -264,6 +292,10 @@ where
     if let Err(e) = upload_into_stage(stage_path.clone()).await {
         best_effort_remote_rm_dir(conn, timeout, &stage_path).await;
         return Err(e);
+    }
+
+    if let Some(progress) = progress {
+        progress.emit(TransferEvent::Finalizing);
     }
 
     let backup_path = if overwrite {
@@ -353,6 +385,10 @@ where
             return Err(TransportAttemptError::Other(e));
         }
     };
+
+    if let Some(progress) = args.progress {
+        progress.emit(TransferEvent::Finalizing);
+    }
 
     let (staging_path, backup_path) = if args.overwrite {
         let backup = match local_backup.as_ref() {

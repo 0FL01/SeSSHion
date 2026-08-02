@@ -76,7 +76,12 @@ pub(super) fn transfer_tool() -> Tool {
             },
             "timeout_ms": {
                 "type": "integer",
-                "description": "Server-side transfer limit; the client deadline may expire earlier."
+                "description": "Server-side whole-transfer limit; client deadline may expire earlier."
+            },
+            "background": {
+                "type": "boolean",
+                "default": false,
+                "description": "Return job_id; poll."
             }
         },
         "required": ["operation", "local_path", "remote_path"]
@@ -96,7 +101,7 @@ pub(super) fn check_process_tool() -> Tool {
         "properties": {
             "job_id": {
                 "type": "string",
-                "description": "job_id from shell/sudo_shell"
+                "description": "job_id from any background tool"
             },
             "tail_lines": {
                 "type": "integer",

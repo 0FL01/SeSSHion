@@ -406,3 +406,120 @@ async fn signal_cancels_scheduled_check_before_ssh_cleanup() {
     assert_eq!(status["running"], true);
     process.assert_successful_exit().await;
 }
+
+#[tokio::test]
+async fn background_transfer_is_immediately_pollable_and_completes() {
+    init_test_env().expect("Failed to initialize test environment");
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("start SSH test container");
+    let host = container.get_host().await.expect("get container host");
+    let port = container
+        .get_host_port_ipv4(2222)
+        .await
+        .expect("get mapped SSH port");
+    wait_for_tcp(&host.to_string(), port).await;
+
+    let local_root = tempfile::tempdir().expect("local transfer root");
+    std::fs::write(
+        local_root.path().join("payload.txt"),
+        b"background transfer\n",
+    )
+    .expect("write local payload");
+    let auth_args = [
+        OsString::from("--user=test"),
+        OsString::from("--password=secret"),
+        OsString::from("--strict-host-key-checking=no"),
+    ];
+    let mut process = McpProcess::spawn_with_auth(
+        &host.to_string(),
+        port,
+        Some(local_root.path()),
+        None,
+        &auth_args,
+    )
+    .await;
+    process.initialize().await;
+
+    let remote_path = format!("/home/test/background-transfer-{}.txt", std::process::id());
+    process
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "transfer",
+                "arguments": {
+                    "operation": "put",
+                    "local_path": "payload.txt",
+                    "remote_path": remote_path.clone(),
+                    "transport": "exec-raw",
+                    "kind": "file",
+                    "background": true,
+                    "timeout_ms": 30000
+                }
+            }
+        }))
+        .await;
+    let started = process.response(2).await;
+    assert!(started.get("error").is_none(), "transfer failed: {started}");
+    let started: Value =
+        serde_json::from_str(tool_text(&started)).expect("background transfer response JSON");
+    assert_eq!(started["job_type"], "transfer");
+    assert_eq!(started["state"], "running");
+    let job_id = started["job_id"]
+        .as_str()
+        .expect("background transfer job id")
+        .to_string();
+
+    let mut terminal = None;
+    for request_id in 3..103 {
+        process
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_process",
+                    "arguments": {"job_id": job_id.clone(), "wait_for": 0, "tail_lines": 0}
+                }
+            }))
+            .await;
+        let response = process.response(request_id).await;
+        assert!(
+            response.get("error").is_none(),
+            "check_process failed: {response}"
+        );
+        let status: Value =
+            serde_json::from_str(tool_text(&response)).expect("transfer status JSON");
+        assert_eq!(status["job_type"], "transfer");
+        if status["running"] == false {
+            terminal = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let terminal = terminal.expect("background transfer should finish");
+    assert_eq!(terminal["state"], "completed", "{terminal}");
+    assert_eq!(terminal["result"]["ok"], true, "{terminal}");
+
+    process
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 103,
+            "method": "tools/call",
+            "params": {
+                "name": "shell",
+                "arguments": {"command": format!("cat -- '{}' && rm -f -- '{}'", remote_path, remote_path)}
+            }
+        }))
+        .await;
+    let remote = process.response(103).await;
+    assert_eq!(tool_text(&remote), "background transfer\n");
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}

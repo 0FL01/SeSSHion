@@ -746,6 +746,7 @@ async fn test_rsync_with_options() {
             kind: Some(TransferKind::File),
             overwrite: true,
             timeout_ms: Some(30000),
+            background: false,
             verbose: false,
             rsync_options: ssh_mcp::transfer::RsyncOptions {
                 checksum: true,

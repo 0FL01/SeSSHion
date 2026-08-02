@@ -12,7 +12,7 @@ Capability-bound SSH MCP for autonomous DevOps agents: composable primitives, de
 ## Why
 
 - **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, patch one file, transfer files, and inspect background jobs.
-- **Deterministic long-running jobs.** `background=true` returns `{job_id, pid, log_path}` immediately; output streams to a local log you poll with `check_process`, avoiding client RPC deadlines.
+- **Deterministic long-running jobs.** `background=true` returns a `job_id` immediately for commands and transfers; poll it with `check_process` instead of depending on the client RPC deadline.
 - **Bounded context.** Foreground shell output is capped by `--max-output-tokens` by default. Use bounded commands when inspecting large remote files.
 - **Atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo.
 
@@ -22,10 +22,10 @@ Capability-bound SSH MCP for autonomous DevOps agents: composable primitives, de
 |------|---------|
 | `shell` | Run a command via POSIX `sh` as the connected user; `background=true` for long tasks. |
 | `sudo_shell` | Same, under `sudo` (uses `--sudo-password`); can be disabled with `--disable-sudo`. |
-| `check_process` | Poll a background job by `job_id` and read the tail of its local log. |
+| `check_process` | Poll a command or transfer background job by `job_id`. |
 | `apply_patch` | Create, update, or delete one remote UTF-8 file with an exact patch (atomic, conflict-checked). |
 | `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
-| `transfer` | Move files/directories (`put`/`get`) via `auto` → `rsync` → `sftp` → `scp` → `exec-raw`. |
+| `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. `auto` falls back through `rsync` → `sftp` → `scp` → `exec-raw` only when a transport is unavailable before writing. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
@@ -174,7 +174,7 @@ The explicit spool path must be absolute. Without it, Unix uses `$XDG_RUNTIME_DI
 
 ## Long-running jobs
 
-Start potentially long commands with `background=true`. A foreground `timeout_ms` is only the server-side SSH wait limit, not the full tool-call deadline. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier. The configured default of 300000 ms therefore does not guarantee that an MCP harness will wait that long. In background mode you immediately get `{job_id, pid, log_path}`, where `log_path` is stored in the configured or per-user platform-default spool directory. Poll with `check_process`:
+Start potentially long commands or transfers with `background=true`. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier even when the server-side timeout is longer. Background mode returns a `job_id` before SSH connection or transfer preflight. Poll it with `check_process`:
 
 ```json
 {"job_id": "abc123", "tail_lines": 50}
@@ -186,15 +186,19 @@ For a scheduled one-shot observation, set a local wait in seconds:
 {"job_id": "abc123", "wait_for": 600, "tail_lines": 10}
 ```
 
-`check_process` first validates and snapshots the job. Errors and terminal states return immediately. A running job waits locally for the full `wait_for` interval without polling, then returns one fresh snapshot; completion during the interval does not wake the call early. The MCP client deadline must exceed the requested interval and the two SSH probes.
+Command jobs return PID, command, log path/tail, and exit state. Transfer jobs return `job_type="transfer"`, coarse phase, elapsed time, current transport, reliable file staging bytes when available, and the compact transfer result at completion. Transfer jobs are in-memory only. Their `timeout_ms` is one whole-operation deadline including connection, preflight, and safe fallback; cleanup gets a short separate grace period.
 
-Cancelling the request stops only the passive local wait after its initial snapshot. It does not interrupt an initial SSH probe or a final probe that has already started, send a stop signal, close SSH, or cancel the background streamer. RMCP suppresses the late response to a protocol-cancelled request; call `check_process` again for authoritative state because the job may still be running or may have completed naturally.
+`check_process` first validates and snapshots the job. Errors and terminal states return immediately. A running job waits locally for the full `wait_for` interval without polling, then returns one fresh snapshot; completion during the interval does not wake the call early.
+
+Cancelling `check_process` stops only its passive local wait. Cancelling the request that created a background job after handoff does not stop that job. Foreground transfer cancellation stops its owned writer and prevents commit; call `check_process` again for authoritative background state.
 
 On SIGINT or SIGTERM, the server cancels the MCP service and performs its bounded request drain before closing SSH. Shutdown prevents new SSH connections and reconnects, but closing the session may terminate channel-bound remote commands; no explicit remote kill or survival guarantee is made.
 
-The returned state is always one of `running`, `completed`, `failed`, or `state_lost`, plus the log tail. `completed` and `failed` include an `exit_code`; `state_lost` means the server no longer has a trustworthy terminal outcome.
+For command jobs, the returned state is one of `running`, `completed`, `failed`, or `state_lost`, plus the log tail. `completed` and `failed` include an `exit_code`; `state_lost` means the server no longer has a trustworthy terminal outcome.
 
-Background tracking requires the MCP server and its SSH session to remain alive; jobs are not guaranteed to survive server shutdown, an SSH disconnect, or an MCP server restart.
+Transfer destinations have one active in-process writer. Staging names are collision-resistant and exclusively created; overwrite commits use sibling staging, and directory replacement rolls back the old destination if installation fails. Directory `overwrite=false` intentionally remains non-atomic.
+
+Background tracking requires the MCP server and its SSH session to remain alive; transfer jobs do not survive server restart and do not automatically resume.
 
 ## Safety
 

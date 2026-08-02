@@ -607,11 +607,9 @@ async fn test_fallback_all_the_way_to_execraw() {
     let _ = std::fs::remove_dir_all(&local_base);
 }
 
-/// Test that fallback tries all transports on generic errors.
-/// This test verifies that when SFTP fails with a generic error (e.g., permission denied),
-/// the system continues to try SCP and ExecRaw rather than breaking early.
+/// Generic runtime errors are terminal so Auto never starts a second writer.
 #[tokio::test]
-async fn test_fallback_tries_all_on_generic_error() {
+async fn test_fallback_stops_after_generic_error() {
     init_test_env().expect("Failed to initialize test environment");
 
     let _ = tracing_subscriber::fmt()
@@ -678,9 +676,8 @@ async fn test_fallback_tries_all_on_generic_error() {
     std::fs::write(&local_file, "content\n").expect("write local file");
 
     // We intentionally write to a location where 'test' user has no permissions.
-    // This will cause a generic error (Permission denied) in SFTP.
-    // If the bug exists, Auto transport will fail immediately and not try SCP/ExecRaw.
-    // If fixed, it should try ALL transports and the final error should list all of them.
+    // This fails after the first available transport starts its attempt. Auto must not
+    // retry with another transport because the first attempt may already have mutated staging.
     let remote_file = "/root/secret_file.txt".to_string();
 
     let resp = server
@@ -700,35 +697,13 @@ async fn test_fallback_tries_all_on_generic_error() {
     // It should fail because we don't have permissions to write to /root
     assert!(!resp.ok, "Transfer should fail due to permission denied");
 
-    let error_msg = resp.error.unwrap_or_default();
-
-    // If the fix is applied, the error message should indicate that multiple transports were tried.
-    // For example, it should collect "failed_reasons" which includes Sftp, Scp, Rsync, and ExecRaw.
-    let tries_sftp = error_msg.contains("Sftp");
-    let tries_scp = error_msg.contains("Scp");
-    let tries_rsync = error_msg.contains("Rsync");
-    let tries_exec_raw = error_msg.contains("ExecRaw");
-
-    assert!(
-        tries_sftp,
-        "Should try Sftp first. Actual error: {}",
-        error_msg
+    assert_eq!(
+        resp.fallback_chain.len(),
+        1,
+        "generic errors must not start a fallback writer: {:?}",
+        resp.fallback_chain
     );
-    assert!(
-        tries_scp,
-        "Should try Scp after Sftp fails with generic error. Bug: breaks early. Actual error: {}",
-        error_msg
-    );
-    assert!(
-        tries_rsync,
-        "Should try Rsync after Scp fails. Actual error: {}",
-        error_msg
-    );
-    assert!(
-        tries_exec_raw,
-        "Should try ExecRaw after Rsync fails. Actual error: {}",
-        error_msg
-    );
+    assert_eq!(resp.fallback_chain[0], resp.transport_used);
 
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(&local_base);

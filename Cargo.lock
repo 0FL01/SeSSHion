@@ -3194,10 +3194,11 @@ dependencies = [
 
 [[package]]
 name = "ssh-mcp-rs"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.4.3",
  "nix",
  "rmcp",
  "russh",

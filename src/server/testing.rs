@@ -196,17 +196,9 @@ impl SshMcpServer {
             .unwrap_or(self.timeout);
         let key_path = self.config.key.clone();
 
-        if let Err(e) = self.connection.ensure_connected().await {
-            return crate::transfer::TransferResponse::error(
-                params,
-                self.transfer.local_root(),
-                &e.to_string(),
-            );
-        }
-
         use crate::transfer::{TransferRunContext, TransferSshOptions};
         self.transfer
-            .run(
+            .run_controlled(
                 &self.connection,
                 params,
                 TransferRunContext {
@@ -220,7 +212,18 @@ impl SshMcpServer {
                         known_hosts: self.config.known_hosts.clone(),
                     },
                 },
+                tokio_util::sync::CancellationToken::new(),
+                None,
             )
             .await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_background_transfer(
+        &self,
+        mut params: crate::transfer::TransferParams,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        params.background = true;
+        self.execute_background_transfer(params).await
     }
 }

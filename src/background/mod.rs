@@ -11,6 +11,7 @@ pub mod registry;
 pub(crate) mod response;
 pub mod spooler;
 pub mod stream;
+pub(crate) mod transfer;
 pub(crate) mod wrapper;
 
 pub use job::{JobState, JobStatus, SharedJobState};

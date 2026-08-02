@@ -15,6 +15,7 @@ use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use super::config::TIMEOUT_KILL_AFTER_SECS;
@@ -1006,17 +1007,42 @@ impl SshConnectionManager {
     pub async fn exec_raw_streaming<R, W>(
         &self,
         command: &str,
-        mut stdin: Option<&mut R>,
-        mut stdout: Option<&mut W>,
+        stdin: Option<&mut R>,
+        stdout: Option<&mut W>,
         timeout_duration: Duration,
     ) -> Result<TransferRawOutput>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        self.exec_raw_streaming_cancellable(
+            command,
+            stdin,
+            stdout,
+            timeout_duration,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn exec_raw_streaming_cancellable<R, W>(
+        &self,
+        command: &str,
+        mut stdin: Option<&mut R>,
+        mut stdout: Option<&mut W>,
+        timeout_duration: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<TransferRawOutput>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        const CHANNEL_TEARDOWN_GRACE: Duration = Duration::from_secs(3);
+
         let _permit = self.acquire_command_slot().await?;
 
         self.ensure_connected().await?;
+        let operation_cancellation = CancellationToken::new();
 
         // Raw transfers must not reuse the PTY/su channel.
         let fut = async {
@@ -1032,8 +1058,9 @@ impl SshConnectionManager {
             let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
             let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RawStreamEvent>(8);
 
+            let channel_cancellation = operation_cancellation.clone();
             let task_guard = JoinAbortGuard::new(tokio::spawn(async move {
-                raw_channel_task(channel, &mut stdin_rx, out_tx).await
+                raw_channel_task(channel, &mut stdin_rx, out_tx, channel_cancellation).await
             }));
 
             let mut output = TransferRawOutput::default();
@@ -1117,6 +1144,10 @@ impl SshConnectionManager {
                             }
                         }
                     }
+                    _ = operation_cancellation.cancelled(), if !stdin_done => {
+                        stdin_done = true;
+                        stdin_tx = None;
+                    }
                 }
             }
 
@@ -1149,12 +1180,26 @@ impl SshConnectionManager {
             }
         };
 
-        match timeout(timeout_duration, fut).await {
-            Ok(res) => res,
-            Err(_) => {
-                self.invalidate_session("raw command timed out").await;
-                Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64))
+        tokio::pin!(fut);
+        enum StopReason {
+            Cancelled,
+            TimedOut,
+        }
+        let stop_reason = tokio::select! {
+            result = &mut fut => return result,
+            _ = tokio::time::sleep(timeout_duration) => {
+                StopReason::TimedOut
             }
+            _ = cancellation.cancelled() => {
+                StopReason::Cancelled
+            }
+        };
+
+        operation_cancellation.cancel();
+        let _ = tokio::time::timeout(CHANNEL_TEARDOWN_GRACE, &mut fut).await;
+        match stop_reason {
+            StopReason::TimedOut => Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64)),
+            StopReason::Cancelled => Err(SshMcpError::connection("transfer cancelled")),
         }
     }
 
@@ -1539,11 +1584,28 @@ async fn raw_channel_task(
     mut channel: russh::Channel<russh::client::Msg>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     out_tx: tokio::sync::mpsc::Sender<RawStreamEvent>,
+    cancellation: CancellationToken,
 ) -> Result<()> {
     let mut stdin_closed = false;
     let mut sent_closed = false;
     loop {
         tokio::select! {
+            _ = cancellation.cancelled() => {
+                let _ = channel.eof().await;
+                let _ = channel.close().await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while let Some(message) = channel.wait().await {
+                        if matches!(message, ChannelMsg::Close) {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                if !sent_closed {
+                    let _ = out_tx.send(RawStreamEvent::Closed).await;
+                }
+                return Err(SshMcpError::connection("transfer cancelled"));
+            }
             maybe_chunk = stdin_rx.recv(), if !stdin_closed => {
                 match maybe_chunk {
                     Some(chunk) => {

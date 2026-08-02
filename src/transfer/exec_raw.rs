@@ -6,6 +6,7 @@ use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
@@ -16,16 +17,18 @@ use crate::validate::validate_basic_path_str;
 use super::local_root;
 use super::staging::{
     BACKUP_MARKER, ERR_MARKER, STAGE_BASE_MARKER, STAGE_MARKER, parse_marker_value,
-    remote_home_staging_base,
 };
 use super::tar;
 use super::types::{StagingLocal, StagingRemote, TransferCounts, TransferKind, TransferStaging};
+use super::types::{TransferEvent, TransferEventSink, TransferProgressTarget};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExecRawCtx<'a> {
     pub conn: &'a SshConnectionManager,
-    pub id: u64,
+    pub id: &'a str,
     pub timeout: Duration,
+    pub cancellation: &'a CancellationToken,
+    pub progress: Option<&'a TransferEventSink>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,8 +136,6 @@ pub async fn probe_remote_kind(args: ProbeRemoteKindArgs<'_>) -> Result<Transfer
 pub async fn put_file_exec_raw(
     args: PutFileExecRawArgs<'_>,
 ) -> Result<(TransferStaging, TransferCounts)> {
-    let id = args.ctx.id;
-
     validate_remote_user_path(args.remote_home, "remote_home")?;
     validate_remote_user_file_path(args.remote_dst, "remote_path")?;
 
@@ -146,47 +147,46 @@ pub async fn put_file_exec_raw(
 
     let remote_tmp_sibling = remote_temp_sibling(args.remote_dst, args.ctx.id);
     let remote_dir = remote_parent_dir(args.remote_dst);
-    let home_staging_base = remote_home_staging_base(args.remote_home);
-
     let dir_escaped = escape_for_shell(&remote_dir);
     let dst_escaped = escape_for_shell(args.remote_dst);
     let tmp_sib_escaped = escape_for_shell(&remote_tmp_sibling);
-    let home_base_escaped = escape_for_shell(&home_staging_base);
 
-    // Decide the staging path before consuming stdin (single pass).
-    // overwrite=true: prefer a sibling stage for atomic-ish rename; fall back to $HOME staging.
-    // overwrite=false: require sibling staging so finalize can use hard-link without replacement.
+    if let Some(progress) = args.ctx.progress {
+        progress.emit(TransferEvent::FileStage {
+            target: TransferProgressTarget::Remote(remote_tmp_sibling.clone()),
+            total_bytes: Some(size),
+        });
+    }
+
+    // Decide and exclusively own a sibling staging path before consuming stdin.
     let cmd = if args.overwrite {
         format!(
-            r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; home_base=$4; id=$5; \
-             home_ok=1; if ! mkdir -p -- "$home_base" 2>/dev/null; then home_ok=0; fi; \
-             stage_dir="$home_base/$id"; if [ "$home_ok" -eq 1 ]; then if ! mkdir -p -- "$stage_dir" 2>/dev/null; then home_ok=0; fi; fi; \
-             bn=${{dst##*/}}; stage="$sib"; stage_base="$parent"; \
-             if ! (mkdir -p -- "$parent" 2>/dev/null && : > "$sib" 2>/dev/null); then \
-                if [ "$home_ok" -eq 1 ]; then stage="$stage_dir/$bn.ssh-mcp-staging-$id"; stage_base="$home_base"; \
-                 else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; exit 1; fi; \
+            r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; expected=$4; \
+             stage="$sib"; stage_base="$parent"; \
+             if ! (mkdir -p -- "$parent" 2>/dev/null && (set -C; : > "$sib") 2>/dev/null); then \
+                if [ -e "$sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; \
                fi; \
              trap "rm -f -- \"$stage\" 2>/dev/null || true" EXIT; \
                printf "%s\\n" "{STAGE_MARKER}$stage" >&2; \
                printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2; \
-                cat > "$stage"; \
+                cat > "$stage"; actual=$(wc -c < "$stage"); if [ "$actual" -ne "$expected" ]; then printf "%s\\n" "{ERR_MARKER}size_mismatch:$actual:$expected" >&2; exit 1; fi; \
                 if [ -d "$dst" ]; then printf "%s\\n" "{ERR_MARKER}destination_is_directory" >&2; exit 1; fi; \
                 mv -- "$stage" "$dst"; \
-                trap - EXIT' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}' '{home_base_escaped}' '{id}'"#
+                 trap - EXIT' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}' '{size}'"#
         )
     } else {
         format!(
-            r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; \
-             if ! (mkdir -p -- "$parent" 2>/dev/null && : > "$sib" 2>/dev/null); then \
-                  printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; exit 1; fi; \
+            r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; expected=$4; \
+             if ! (mkdir -p -- "$parent" 2>/dev/null && (set -C; : > "$sib") 2>/dev/null); then \
+                  if [ -e "$sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; fi; \
                 trap "rm -f -- \"$sib\" 2>/dev/null || true" EXIT; \
                 printf "%s\\n" "{STAGE_MARKER}$sib" >&2; \
                 printf "%s\\n" "{STAGE_BASE_MARKER}$parent" >&2; \
-                cat > "$sib"; \
+                cat > "$sib"; actual=$(wc -c < "$sib"); if [ "$actual" -ne "$expected" ]; then printf "%s\\n" "{ERR_MARKER}size_mismatch:$actual:$expected" >&2; exit 1; fi; \
                 if [ -d "$dst" ]; then printf "%s\\n" "{ERR_MARKER}destination_is_directory" >&2; exit 1; fi; \
                 if ln -- "$sib" "$dst" 2>/dev/null; then rm -f -- "$sib" 2>/dev/null || true; trap - EXIT; exit 0; fi; \
                 if [ -e "$dst" ]; then printf "%s\\n" "{ERR_MARKER}destination_exists" >&2; else printf "%s\\n" "{ERR_MARKER}hardlink_failed" >&2; fi; \
-                exit 1' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}'"#
+                exit 1' sh '{dir_escaped}' '{dst_escaped}' '{tmp_sib_escaped}' '{size}'"#
         )
     };
 
@@ -195,7 +195,13 @@ pub async fn put_file_exec_raw(
     let out = args
         .ctx
         .conn
-        .exec_raw_streaming(&cmd, Some(&mut input), Some(&mut sink), args.ctx.timeout)
+        .exec_raw_streaming_cancellable(
+            &cmd,
+            Some(&mut input),
+            Some(&mut sink),
+            args.ctx.timeout,
+            args.ctx.cancellation,
+        )
         .await?;
 
     ensure_remote_success("put_file", &out)?;
@@ -233,6 +239,13 @@ pub async fn get_file_exec_raw(
     let (tmp, mut out_file) =
         create_unique_local_staging_file(args.local_root, args.local_dst, args.ctx.id).await?;
 
+    if let Some(progress) = args.ctx.progress {
+        progress.emit(TransferEvent::FileStage {
+            target: TransferProgressTarget::Local(tmp.clone()),
+            total_bytes: None,
+        });
+    }
+
     let src_escaped = escape_for_shell(args.remote_src);
     let cmd = format!(r#"sh -c 'set -eu; src=$1; cat < "$src"' sh '{src_escaped}'"#);
 
@@ -240,11 +253,12 @@ pub async fn get_file_exec_raw(
     let exec_out = match args
         .ctx
         .conn
-        .exec_raw_streaming(
+        .exec_raw_streaming_cancellable(
             &cmd,
             Some(&mut empty),
             Some(&mut out_file),
             args.ctx.timeout,
+            args.ctx.cancellation,
         )
         .await
     {
@@ -264,6 +278,9 @@ pub async fn get_file_exec_raw(
     }
 
     let bytes = exec_out.stdout_bytes;
+    if let Some(progress) = args.ctx.progress {
+        progress.emit(TransferEvent::Finalizing);
+    }
     if args.overwrite {
         atomic_replace_file(&tmp, args.local_dst).await?;
     } else {
@@ -292,8 +309,6 @@ pub async fn get_file_exec_raw(
 pub async fn put_dir_exec_raw(
     args: PutDirExecRawArgs<'_>,
 ) -> Result<(TransferStaging, TransferCounts)> {
-    let id = args.ctx.id;
-
     validate_remote_user_path(args.remote_home, "remote_home")?;
     validate_remote_user_path(args.remote_dst_dir, "remote_path")?;
 
@@ -305,43 +320,32 @@ pub async fn put_dir_exec_raw(
     let remote_parent = remote_parent_dir(args.remote_dst_dir);
     let remote_stage_sibling = remote_temp_dir_sibling(args.remote_dst_dir, args.ctx.id);
     let remote_backup_sibling = remote_backup_dir_sibling(args.remote_dst_dir, args.ctx.id);
-    let home_staging_base = remote_home_staging_base(args.remote_home);
-
     let parent_escaped = escape_for_shell(&remote_parent);
     let dst_escaped = escape_for_shell(args.remote_dst_dir);
     let stage_sib_escaped = escape_for_shell(&remote_stage_sibling);
     let backup_sib_escaped = escape_for_shell(&remote_backup_sibling);
-    let home_base_escaped = escape_for_shell(&home_staging_base);
 
     let cmd = if args.overwrite {
         let tar_extract = portable_tar_extract_cmd("$stage");
-        // Prefer staging as a sibling directory for atomic rename; fall back to $HOME-based staging.
-        // Always emit markers to stderr so we can report actual staging paths.
+        // Use sibling staging so the final rename stays on one filesystem.
         format!(
-            r#"sh -c 'set -eu; parent=$1; dst=$2; stage_sib=$3; backup_sib=$4; home_base=$5; id=$6; \
-             home_ok=1; if ! mkdir -p -- "$home_base" 2>/dev/null; then home_ok=0; fi; \
-             stage_dir="$home_base/$id"; if [ "$home_ok" -eq 1 ]; then if ! mkdir -p -- "$stage_dir" 2>/dev/null; then home_ok=0; fi; fi; \
+            r#"sh -c 'set -eu; parent=$1; dst=$2; stage_sib=$3; backup_sib=$4; \
               stage="$stage_sib"; stage_base="$parent"; \
-             if ! (mkdir -p -- "$parent" 2>/dev/null && rm -rf -- "$stage_sib" 2>/dev/null && mkdir -p -- "$stage_sib" 2>/dev/null); then \
-               if [ "$home_ok" -eq 1 ]; then stage="$stage_dir/stage-dir-$id"; stage_base="$home_base"; rm -rf -- "$stage" 2>/dev/null || true; mkdir -p -- "$stage"; \
-                 else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; exit 1; fi; \
+             if ! (mkdir -p -- "$parent" 2>/dev/null && mkdir -- "$stage_sib" 2>/dev/null); then \
+               if [ -e "$stage_sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; \
                fi; \
              trap "rm -rf -- \"$stage\" 2>/dev/null || true" EXIT; \
                printf "%s\\n" "{STAGE_MARKER}$stage" >&2; \
                printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2; \
                {tar_extract}; \
-               backup=""; \
+               had_dst=0; backup="$backup_sib"; \
               if [ -e "$dst" ]; then \
-               if rm -rf -- "$backup_sib" 2>/dev/null && mv -- "$dst" "$backup_sib" 2>/dev/null; then backup="$backup_sib"; \
-                else \
-                  if [ "$home_ok" -eq 1 ]; then backup_home="$stage_dir/backup-dir-$id"; rm -rf -- "$backup_home" 2>/dev/null || true; \
-                    if mv -- "$dst" "$backup_home" 2>/dev/null; then backup="$backup_home"; else rm -rf -- "$dst" 2>/dev/null || true; backup=""; fi; \
-                  else rm -rf -- "$dst" 2>/dev/null || true; backup=""; fi; \
-                fi; \
+                if [ -e "$backup" ]; then printf "%s\\n" "{ERR_MARKER}backup_collision" >&2; exit 1; fi; \
+                if ! mv -- "$dst" "$backup"; then printf "%s\\n" "{ERR_MARKER}backup_failed" >&2; exit 1; fi; had_dst=1; \
               fi; \
                printf "%s\\n" "{BACKUP_MARKER}$backup" >&2; \
-              mv -- "$stage" "$dst"; trap - EXIT; \
-               if [ -n "$backup" ]; then rm -rf -- "$backup" 2>/dev/null || true; fi' sh '{parent_escaped}' '{dst_escaped}' '{stage_sib_escaped}' '{backup_sib_escaped}' '{home_base_escaped}' '{id}'"#
+              if mv -- "$stage" "$dst"; then trap - EXIT; if [ "$had_dst" -eq 1 ]; then rm -rf -- "$backup" 2>/dev/null || true; fi; exit 0; fi; \
+               if [ "$had_dst" -eq 1 ] && ! mv -- "$backup" "$dst"; then printf "%s\\n" "{ERR_MARKER}rollback_failed:$backup" >&2; else printf "%s\\n" "{ERR_MARKER}install_failed" >&2; fi; exit 1' sh '{parent_escaped}' '{dst_escaped}' '{stage_sib_escaped}' '{backup_sib_escaped}'"#
         )
     } else {
         let tar_extract = portable_tar_extract_cmd("$dst");
@@ -367,7 +371,13 @@ pub async fn put_dir_exec_raw(
     let exec_res = args
         .ctx
         .conn
-        .exec_raw_streaming(&cmd, Some(&mut rx), Some(&mut sink), args.ctx.timeout)
+        .exec_raw_streaming_cancellable(
+            &cmd,
+            Some(&mut rx),
+            Some(&mut sink),
+            args.ctx.timeout,
+            args.ctx.cancellation,
+        )
         .await;
 
     let tar_res: Result<tar::TarCounts> = match tar_task.await {
@@ -399,6 +409,10 @@ pub async fn put_dir_exec_raw(
     }
 
     let tar_counts = tar_res?;
+
+    if let Some(progress) = args.ctx.progress {
+        progress.emit(TransferEvent::Finalizing);
+    }
 
     let staging_path = parse_marker_value(&exec_out.stderr, STAGE_MARKER)
         .unwrap_or_else(|| remote_stage_sibling.clone());
@@ -463,7 +477,13 @@ pub async fn get_dir_exec_raw(
     let exec_res = args
         .ctx
         .conn
-        .exec_raw_streaming(&cmd, Some(&mut empty), Some(&mut tx), args.ctx.timeout)
+        .exec_raw_streaming_cancellable(
+            &cmd,
+            Some(&mut empty),
+            Some(&mut tx),
+            args.ctx.timeout,
+            args.ctx.cancellation,
+        )
         .await;
     drop(tx);
 
@@ -506,6 +526,10 @@ pub async fn get_dir_exec_raw(
             return Err(e);
         }
     };
+
+    if let Some(progress) = args.ctx.progress {
+        progress.emit(TransferEvent::Finalizing);
+    }
 
     let (staging_path, backup_path) = if args.overwrite {
         let backup = local_backup
@@ -611,19 +635,19 @@ pub(crate) fn remote_parent_dir(path: &str) -> String {
     }
 }
 
-pub(crate) fn remote_temp_sibling(final_path: &str, id: u64) -> String {
+pub(crate) fn remote_temp_sibling(final_path: &str, id: &str) -> String {
     format!("{final_path}.ssh-mcp-staging-{id}")
 }
 
-pub(crate) fn remote_temp_dir_sibling(final_dir: &str, id: u64) -> String {
+pub(crate) fn remote_temp_dir_sibling(final_dir: &str, id: &str) -> String {
     format!("{final_dir}.ssh-mcp-staging-dir-{id}")
 }
 
-pub(crate) fn remote_backup_dir_sibling(final_dir: &str, id: u64) -> String {
+pub(crate) fn remote_backup_dir_sibling(final_dir: &str, id: &str) -> String {
     format!("{final_dir}.ssh-mcp-backup-dir-{id}")
 }
 
-fn local_temp_sibling_with_attempt(final_path: &Path, id: u64, attempt: u32) -> PathBuf {
+fn local_temp_sibling_with_attempt(final_path: &Path, id: &str, attempt: u32) -> PathBuf {
     let file_name = final_path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -636,7 +660,7 @@ fn local_temp_sibling_with_attempt(final_path: &Path, id: u64, attempt: u32) -> 
     }
 }
 
-fn local_temp_dir_sibling_with_attempt(final_dir: &Path, id: u64, attempt: u32) -> PathBuf {
+fn local_temp_dir_sibling_with_attempt(final_dir: &Path, id: &str, attempt: u32) -> PathBuf {
     let name = final_dir
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -649,7 +673,7 @@ fn local_temp_dir_sibling_with_attempt(final_dir: &Path, id: u64, attempt: u32) 
     }
 }
 
-pub(crate) fn local_backup_dir_sibling(final_dir: &Path, id: u64) -> PathBuf {
+pub(crate) fn local_backup_dir_sibling(final_dir: &Path, id: &str) -> PathBuf {
     let name = final_dir
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -709,7 +733,7 @@ pub(crate) async fn atomic_install_file_overwrite_false(
 pub(crate) async fn create_unique_local_staging_file(
     local_root_path: &Path,
     final_path: &Path,
-    id: u64,
+    id: &str,
 ) -> Result<(PathBuf, fs::File)> {
     // Limit retries to avoid an infinite loop in pathological cases.
     for attempt in 0u32..128u32 {
@@ -743,7 +767,7 @@ pub(crate) async fn create_unique_local_staging_file(
 pub(crate) async fn create_unique_local_staging_dir(
     local_root_path: &Path,
     final_dir: &Path,
-    id: u64,
+    id: &str,
 ) -> Result<PathBuf> {
     for attempt in 0u32..128u32 {
         let candidate = local_temp_dir_sibling_with_attempt(final_dir, id, attempt);
@@ -770,15 +794,32 @@ pub(crate) async fn atomic_replace_dir(
     final_dir: &Path,
     backup: &Path,
 ) -> Result<()> {
-    if final_dir.exists() {
-        let _ = fs::remove_dir_all(backup).await;
-        fs::rename(final_dir, backup).await?;
-    }
     if let Some(parent) = final_dir.parent() {
         fs::create_dir_all(parent).await?;
     }
-    fs::rename(staging, final_dir).await?;
-    if backup.exists() {
+
+    let had_destination = fs::try_exists(final_dir).await?;
+    if had_destination {
+        if fs::try_exists(backup).await? {
+            return Err(SshMcpError::connection(format!(
+                "backup path already exists: {}",
+                backup.display()
+            )));
+        }
+        fs::rename(final_dir, backup).await?;
+    }
+
+    if let Err(install_error) = fs::rename(staging, final_dir).await {
+        if had_destination && let Err(rollback_error) = fs::rename(backup, final_dir).await {
+            return Err(SshMcpError::connection(format!(
+                "failed to install staged directory: {install_error}; rollback failed: {rollback_error}; backup retained at {}",
+                backup.display()
+            )));
+        }
+        return Err(SshMcpError::Io(install_error));
+    }
+
+    if had_destination {
         let _ = fs::remove_dir_all(backup).await;
     }
     Ok(())
@@ -797,4 +838,34 @@ fn portable_tar_create_cmd(src_var: &str) -> String {
     format!(
         "(command -v tar >/dev/null 2>&1 && tar -c -f - -C \"{src_var}\" .) || (command -v busybox >/dev/null 2>&1 && busybox tar -c -f - -C \"{src_var}\" .)"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn atomic_replace_dir_restores_destination_when_install_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let final_dir = temp.path().join("final");
+        let missing_stage = temp.path().join("missing-stage");
+        let backup = temp.path().join("backup");
+        fs::create_dir(&final_dir)
+            .await
+            .expect("create destination");
+        fs::write(final_dir.join("old.txt"), b"old")
+            .await
+            .expect("write old file");
+
+        let result = atomic_replace_dir(&missing_stage, &final_dir, &backup).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(final_dir.join("old.txt"))
+                .await
+                .expect("restored destination"),
+            b"old"
+        );
+        assert!(!fs::try_exists(&backup).await.expect("backup existence"));
+    }
 }

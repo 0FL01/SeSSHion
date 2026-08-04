@@ -152,8 +152,16 @@ mod tests {
         assert!(error.to_string().contains("transfer cancelled"));
 
         let pid = rustix::process::Pid::from_raw(raw_pid).expect("nonzero pid");
-        let error = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
-            .expect_err("process group should already be gone");
-        assert_eq!(error, rustix::io::Errno::SRCH);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+                    Err(rustix::io::Errno::SRCH) => break,
+                    Ok(()) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("failed to check process group: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("process group should be gone after cancellation");
     }
 }

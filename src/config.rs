@@ -1,4 +1,4 @@
-//! Configuration and CLI argument parsing for SSH MCP Server
+//! Configuration and CLI argument parsing for SeSSHion
 
 use clap::Parser;
 use std::ffi::OsStr;
@@ -40,12 +40,12 @@ pub const MIN_HEALTH_PROBE_TIMEOUT_MS: u64 = 100;
 /// Maximum health probe timeout in milliseconds
 pub const MAX_HEALTH_PROBE_TIMEOUT_MS: u64 = 30_000;
 
-/// SSH MCP Server CLI Arguments
+/// SeSSHion CLI arguments
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ssh-mcp")]
 #[command(author = "0FL01")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "MCP server exposing SSH control for Linux systems via Model Context Protocol")]
+#[command(about = "SeSSHion — capability-bound SSH MCP server for autonomous DevOps agents")]
 pub struct Args {
     /// SSH host to connect to
     #[arg(long, env = "SSH_MCP_HOST")]

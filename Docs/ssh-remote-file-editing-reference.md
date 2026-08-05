@@ -1,7 +1,7 @@
 # SSH Remote File Editing - Implementation Reference
 
 > **Use Case**: Reference implementation for adding remote file editing capabilities to MCP servers  
-> **Target**: Integration with SSH MCP Server infrastructure
+> **Target**: Integration with SeSSHion SSH MCP server infrastructure
 
 ---
 

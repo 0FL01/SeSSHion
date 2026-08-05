@@ -1,6 +1,6 @@
-# SSH MCP Server (Rust)
+# SeSSHion (Rust SSH MCP Server)
 
-A high-performance Rust implementation of the SSH Model Context Protocol (MCP) server. This tool enables AI models to securely interact with remote Linux systems via SSH, providing persistent connections, command execution, and root elevation capabilities.
+SeSSHion is a high-performance Rust SSH Model Context Protocol (MCP) server. It enables AI models to securely interact with remote Linux systems through persistent connections, command execution, and explicit root elevation.
 
 ## Repository Structure
 

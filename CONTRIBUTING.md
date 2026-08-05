@@ -1,6 +1,6 @@
-# Contributing to ssh-mcp
+# Contributing to SeSSHion
 
-Thank you for your interest in contributing to ssh-mcp! Your help is greatly appreciated. Please follow these guidelines to make the process smooth for everyone.
+Thank you for your interest in contributing to SeSSHion! Your help is greatly appreciated. Please follow these guidelines to make the process smooth for everyone.
 
 ## How to Contribute
 
@@ -67,4 +67,4 @@ cargo test --all
 - Be respectful and inclusive in all interactions.
 - See the [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) if available.
 
-Thank you for helping make ssh-mcp better!
+Thank you for helping make SeSSHion better!

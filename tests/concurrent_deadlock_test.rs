@@ -1,4 +1,4 @@
-//! Concurrent crash-test harness for SSH MCP Server.
+//! Concurrent crash-test harness for SeSSHion.
 //!
 //! Spawns the ssh-mcp binary as a child process, communicates via JSON-RPC
 //! over stdin/stdout (the MCP stdio transport), and fires concurrent tool
@@ -324,7 +324,7 @@ async fn check_alive(client: &McpClient, label: &str) -> bool {
 }
 
 async fn run_test() -> anyhow::Result<()> {
-    println!("SSH MCP Server — Concurrent Deadlock Reproduction Test");
+    println!("SeSSHion — Concurrent Deadlock Reproduction Test");
     println!("=========================================================\n");
 
     let binary = std::env::current_dir()

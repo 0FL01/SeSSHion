@@ -1,8 +1,8 @@
-//! Error types for SSH MCP Server
+//! Error types for SeSSHion
 
 use thiserror::Error;
 
-/// Main error type for the SSH MCP Server
+/// Main error type for SeSSHion
 #[derive(Debug, Error)]
 pub enum SshMcpError {
     /// SSH connection failed

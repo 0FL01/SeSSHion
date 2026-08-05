@@ -174,7 +174,7 @@ jobs:
           COMMIT_COUNT="$(git rev-list --count "$RANGE")"
 
           {
-            echo "## SSH MCP Rolling Release"
+            echo "## SeSSHion — SSH MCP Rolling Release"
             echo
             if [ -n "$PREVIOUS_LABEL" ]; then
               echo "**Previous release:** \`${PREVIOUS_LABEL}\`"
@@ -320,7 +320,7 @@ jobs:
           COMMIT_COUNT="$(git rev-list --count "$RANGE")"
 
           {
-            echo "## SSH MCP v${VERSION}"
+            echo "## SeSSHion — SSH MCP v${VERSION}"
             echo
             if [ -n "$PREVIOUS_TAG" ]; then
               echo "**Previous release:** \`${PREVIOUS_TAG}\`"

@@ -1,13 +1,13 @@
-# SSH MCP Server
+# SeSSHion — SSH MCP Server
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
 [![crates.io](https://img.shields.io/crates/v/ssh-mcp-rs.svg)](https://crates.io/crates/ssh-mcp-rs)
 
-Capability-bound SSH MCP for autonomous DevOps agents: composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
+**SeSSHion** (formerly **ssh-mcp / ssh-mcp-rs**) is a capability-bound SSH MCP server for autonomous DevOps agents: composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
 
-`ssh-mcp` is a Rust [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session. It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
+Written in Rust, SeSSHion gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session through the [Model Context Protocol](https://modelcontextprotocol.io). It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
 
 ## Why
 
@@ -35,16 +35,16 @@ Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, 
 
 ### Pre-built binaries (recommended)
 
-Download the latest rolling release from the [Releases page](https://github.com/0FL01/ssh-mcp-rs/releases/tag/rolling):
+Download the latest rolling release from the [Releases page](https://github.com/0FL01/SeSSHion/releases/tag/rolling):
 
 | Platform | Download |
 |----------|----------|
-| Linux x86_64 | [ssh-mcp-linux-x86_64](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-linux-x86_64) |
-| Windows x86_64 | [ssh-mcp-windows-x86_64.exe](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-windows-x86_64.exe) |
-| macOS ARM64 | [ssh-mcp-macos-aarch64](https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-macos-aarch64) |
+| Linux x86_64 | [ssh-mcp-linux-x86_64](https://github.com/0FL01/SeSSHion/releases/download/rolling/ssh-mcp-linux-x86_64) |
+| Windows x86_64 | [ssh-mcp-windows-x86_64.exe](https://github.com/0FL01/SeSSHion/releases/download/rolling/ssh-mcp-windows-x86_64.exe) |
+| macOS ARM64 | [ssh-mcp-macos-aarch64](https://github.com/0FL01/SeSSHion/releases/download/rolling/ssh-mcp-macos-aarch64) |
 
 ```bash
-curl -L https://github.com/0FL01/ssh-mcp-rs/releases/download/rolling/ssh-mcp-linux-x86_64 -o ssh-mcp
+curl -L https://github.com/0FL01/SeSSHion/releases/download/rolling/ssh-mcp-linux-x86_64 -o ssh-mcp
 chmod +x ssh-mcp && sudo mv ssh-mcp /usr/local/bin/
 ssh-mcp --version
 ```
@@ -55,12 +55,14 @@ ssh-mcp --version
 cargo install ssh-mcp-rs   # installs the `ssh-mcp` binary to ~/.cargo/bin
 ```
 
+SeSSHion retains the established `ssh-mcp-rs` crate and `ssh-mcp` executable names for installation and configuration compatibility.
+
 ### Build from source
 
 Requires the [Rust toolchain](https://rustup.rs/) plus `pkg-config` and OpenSSL headers (`libssl-dev` on Debian/Ubuntu).
 
 ```bash
-git clone https://github.com/0FL01/ssh-mcp-rs.git && cd ssh-mcp-rs
+git clone https://github.com/0FL01/SeSSHion.git && cd SeSSHion
 cargo build --release
 ```
 

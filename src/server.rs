@@ -61,7 +61,7 @@ fn make_job_id() -> String {
     format!("{}-{}", epoch_ms, counter)
 }
 
-/// SSH MCP Server
+/// SeSSHion SSH MCP server
 ///
 /// The main server implementation that provides MCP tools for remote SSH
 /// command execution.
@@ -124,7 +124,7 @@ impl Drop for TransferTerminalGuard {
 }
 
 impl SshMcpServer {
-    /// Create a new SSH MCP Server
+    /// Create a new SeSSHion server
     ///
     /// This sets up the SSH connection manager based on the provided configuration.
     /// Connection is not established until a tool is actually used.
@@ -132,7 +132,7 @@ impl SshMcpServer {
         Self::new_with_spool_dir(config, None).await
     }
 
-    /// Create a new SSH MCP Server with an optional local spool directory.
+    /// Create a new SeSSHion server with an optional local spool directory.
     pub async fn new_with_spool_dir(config: Config, spool_dir: Option<PathBuf>) -> Result<Self> {
         let local_root = std::env::current_dir()?;
 
@@ -324,7 +324,7 @@ impl SshMcpServer {
 
     /// Close the server and cleanup resources
     pub async fn shutdown(&self) {
-        info!("Shutting down SSH MCP Server...");
+        info!("Shutting down SeSSHion...");
         self.transfer_shutdown.cancel();
         let tasks = {
             let mut tasks = self.transfer_tasks.lock().await;
@@ -651,14 +651,21 @@ fn resolve_local_spooler(spool_dir: Option<PathBuf>) -> Result<LocalLogSpooler> 
     }
 }
 
+fn server_implementation() -> Implementation {
+    Implementation::new("ssh-mcp", env!("CARGO_PKG_VERSION"))
+        .with_title("SeSSHion")
+        .with_description("Capability-bound SSH MCP server for autonomous DevOps agents")
+        .with_website_url("https://github.com/0FL01/SeSSHion")
+}
+
 impl ServerHandler for SshMcpServer {
     /// Return server information
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_server_info(Implementation::from_build_env())
+            .with_server_info(server_implementation())
             .with_instructions(format!(
-                "SSH MCP Server v{} - Execute commands on {}@{}:{}",
+                "SeSSHion v{} - SSH MCP server for {}@{}:{}",
                 env!("CARGO_PKG_VERSION"),
                 self.config.user,
                 self.config.host,
@@ -807,8 +814,21 @@ mod tests {
 
     #[test]
     fn test_server_info() {
-        // Verify the package version is defined
-        assert!(!env!("CARGO_PKG_VERSION").is_empty());
+        let implementation = server_implementation();
+
+        assert_eq!(implementation.name, "ssh-mcp");
+        assert_eq!(implementation.title.as_deref(), Some("SeSSHion"));
+        assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            implementation.website_url.as_deref(),
+            Some("https://github.com/0FL01/SeSSHion")
+        );
+        assert!(
+            implementation
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("SSH MCP server"))
+        );
     }
 
     #[test]

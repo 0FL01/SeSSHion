@@ -1,6 +1,6 @@
-//! SSH MCP Server - Entry point
+//! SeSSHion - Entry point
 //!
-//! This is the main entry point for the SSH MCP Server.
+//! This is the main entry point for SeSSHion.
 //! It parses CLI arguments, validates configuration, starts the MCP server
 //! on stdio transport, and handles graceful shutdown.
 
@@ -39,7 +39,7 @@ async fn run() -> Result<()> {
     // Validate and create config
     let config = Config::from_args(args)?;
 
-    info!("SSH MCP Server v{} starting...", env!("CARGO_PKG_VERSION"));
+    info!("SeSSHion v{} starting...", env!("CARGO_PKG_VERSION"));
     info!(
         "Connecting to {}@{}:{}",
         config.user, config.host, config.port
@@ -72,7 +72,7 @@ async fn run() -> Result<()> {
     // Create MCP server
     let server = SshMcpServer::new_with_spool_dir(config, spool_dir).await?;
 
-    info!("SSH MCP Server running on stdio");
+    info!("SeSSHion running on stdio");
 
     // Keep a clone for cleanup after the MCP service has stopped.
     let server_for_shutdown = server.clone();
@@ -144,7 +144,7 @@ async fn run() -> Result<()> {
     }
     server_for_shutdown.shutdown().await;
 
-    info!("SSH MCP Server stopped");
+    info!("SeSSHion stopped");
 
     service_result
 }

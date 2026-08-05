@@ -1,4 +1,4 @@
-//! SeSSHion - A Model Context Protocol server for remote SSH command execution
+//! SeSSHion - A lightweight SSH MCP server for LLM agents
 //!
 //! This crate provides an MCP server that allows executing commands on remote Linux
 //! systems via SSH. It supports both password and key-based authentication, as well

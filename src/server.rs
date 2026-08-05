@@ -654,7 +654,7 @@ fn resolve_local_spooler(spool_dir: Option<PathBuf>) -> Result<LocalLogSpooler> 
 fn server_implementation() -> Implementation {
     Implementation::new("ssh-mcp", env!("CARGO_PKG_VERSION"))
         .with_title("SeSSHion")
-        .with_description("Capability-bound SSH MCP server for autonomous DevOps agents")
+        .with_description(env!("CARGO_PKG_DESCRIPTION"))
         .with_website_url("https://github.com/0FL01/SeSSHion")
 }
 
@@ -823,11 +823,9 @@ mod tests {
             implementation.website_url.as_deref(),
             Some("https://github.com/0FL01/SeSSHion")
         );
-        assert!(
-            implementation
-                .description
-                .as_deref()
-                .is_some_and(|description| description.contains("SSH MCP server"))
+        assert_eq!(
+            implementation.description.as_deref(),
+            Some(env!("CARGO_PKG_DESCRIPTION"))
         );
     }
 

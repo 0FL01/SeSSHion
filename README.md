@@ -5,9 +5,9 @@
 [![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue.svg)](https://modelcontextprotocol.io)
 [![crates.io](https://img.shields.io/crates/v/ssh-mcp-rs.svg)](https://crates.io/crates/ssh-mcp-rs)
 
-**SeSSHion** (formerly **ssh-mcp / ssh-mcp-rs**) is a capability-bound SSH MCP server for autonomous DevOps agents: composable primitives, deterministic long-running jobs, bounded context, and atomic remote edits.
+**SeSSHion** (formerly **ssh-mcp / ssh-mcp-rs**) is a lightweight SSH MCP server for LLM agents.
 
-Written in Rust, SeSSHion gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session through the [Model Context Protocol](https://modelcontextprotocol.io). It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
+Its capability-bound toolset combines deterministic long-running jobs, bounded context, and atomic remote edits. Written in Rust, SeSSHion gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session through the [Model Context Protocol](https://modelcontextprotocol.io). It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
 
 ## Why
 

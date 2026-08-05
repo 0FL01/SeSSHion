@@ -45,7 +45,7 @@ pub const MAX_HEALTH_PROBE_TIMEOUT_MS: u64 = 30_000;
 #[command(name = "ssh-mcp")]
 #[command(author = "0FL01")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "SeSSHion — capability-bound SSH MCP server for autonomous DevOps agents")]
+#[command(about = env!("CARGO_PKG_DESCRIPTION"))]
 pub struct Args {
     /// SSH host to connect to
     #[arg(long, env = "SSH_MCP_HOST")]

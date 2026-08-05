@@ -1,6 +1,6 @@
 # SeSSHion (Rust SSH MCP Server)
 
-SeSSHion is a high-performance Rust SSH Model Context Protocol (MCP) server. It enables AI models to securely interact with remote Linux systems through persistent connections, command execution, and explicit root elevation.
+SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM agents. It provides persistent connections, command execution, and explicit root elevation for remote Linux systems.
 
 ## Repository Structure
 

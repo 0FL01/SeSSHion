@@ -1,6 +1,6 @@
 [package]
 name = "ssh-mcp-rs"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2024"
 authors = ["0FL01"]
 description = "SeSSHion: lightweight SSH MCP server for LLM agents"

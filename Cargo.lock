@@ -3194,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mcp-rs"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "anyhow",
  "clap",

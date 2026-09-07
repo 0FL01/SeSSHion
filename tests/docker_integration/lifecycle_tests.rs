@@ -211,6 +211,71 @@ async fn stdin_eof_stops_initialized_server() {
 }
 
 #[tokio::test]
+async fn modern_stdio_discovery_and_tool_results() {
+    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "lifecycle-test", "version": "1.0.0"
+        },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+
+    // Modern stdio requests carry their own metadata instead of initialize.
+    process
+        .send(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": meta}
+        }))
+        .await;
+    let response = process.response(1).await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["supportedVersions"]
+            .as_array()
+            .expect("supported versions")
+            .contains(&json!("2026-07-28"))
+    );
+    assert_eq!(response["result"]["capabilities"], json!({"tools": {}}));
+    assert_eq!(
+        response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "ssh-mcp"
+    );
+
+    process
+        .send(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"_meta": meta}
+        }))
+        .await;
+    let response = process.response(2).await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["resultType"], "complete");
+    let tools = response["result"]["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 6);
+    assert!(tools.iter().any(|tool| tool["name"] == "check_process"));
+
+    process
+        .send(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "_meta": meta,
+                "name": "check_process",
+                "arguments": {"job_id": "missing-job"}
+            }
+        }))
+        .await;
+    let response = process.response(3).await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(response["result"]["isError"], true);
+    assert!(tool_text(&response).contains("job not found: missing-job"));
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[tokio::test]
 async fn default_tool_surface_is_exact_and_read_is_unknown() {
     let mut process = McpProcess::spawn("127.0.0.1", 9).await;
     process.initialize().await;

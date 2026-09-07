@@ -1,12 +1,25 @@
-# rmcp - Official Rust MCP SDK (v2.2.0)
+# rmcp - Official Rust MCP SDK (v3.2.0)
 
-> Source: https://docs.rs/rmcp/latest/rmcp/
+> Source: https://docs.rs/rmcp/3.2.0/rmcp/
 
 ## Overview
 
 The official Rust SDK for the Model Context Protocol (MCP).
 
 rmcp allows building MCP **servers** and **clients** in Rust.
+
+## SeSSHion Integration
+
+SeSSHion uses `server` and `transport-io` with the default SDK features.
+The manual `ServerHandler::call_tool` implementation returns `CallToolResponse`;
+internal handlers still return `CallToolResult`, converted at the dispatcher boundary.
+Tool failures remain completed results with `isError: true`, not JSON-RPC errors.
+
+`ProtocolVersion::LATEST` is MCP `2026-07-28`. The SDK handles discovery and
+per-request metadata for the modern lifecycle, as well as version negotiation
+for clients using `initialize`. There is no application compatibility layer.
+Background jobs remain SeSSHion's `job_id` / `check_process` contract; upgrading
+the SDK does not enable MCP Tasks, MRTR, subscriptions, caching, or HTTP transport.
 
 ## Server Implementation
 
@@ -89,7 +102,8 @@ async fn calculate(
 |------|-------------|
 | `ServerHandler` | Trait to implement for server types |
 | `ToolRouter<T>` | Router for tool dispatch |
-| `CallToolResult` | Result type for tool calls |
+| `CallToolResult` | Completed tool result, including tool errors |
+| `CallToolResponse` | Server handler response encompassing completed, input-required, or task results |
 | `ContentBlock::text()` | Create text content response |
 | `ErrorData` | MCP error representation |
 

@@ -741,8 +741,7 @@ impl ServerHandler for SshMcpServer {
 
         Ok(ListToolsResult {
             tools,
-            next_cursor: None,
-            meta: Default::default(),
+            ..Default::default()
         })
     }
 
@@ -751,7 +750,7 @@ impl ServerHandler for SshMcpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResponse, McpError> {
         let tool_name: &str = request.name.as_ref();
         debug!("call_tool called: {:?}", tool_name);
 
@@ -839,6 +838,7 @@ impl ServerHandler for SshMcpServer {
                 None,
             )),
         }
+        .map(CallToolResponse::from)
     }
 }
 

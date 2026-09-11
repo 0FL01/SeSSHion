@@ -128,14 +128,14 @@ pub(super) fn check_process_tool() -> Tool {
 pub(super) fn apply_patch_tool() -> Tool {
     patch_tool(
         "apply_patch",
-        "Apply an exact, conflict-checked patch as the SSH user; never elevates.",
+        "Exact multi-file patch as SSH user; never elevates.",
     )
 }
 
 pub(super) fn sudo_apply_patch_tool() -> Tool {
     patch_tool(
         "sudo_apply_patch",
-        "Apply an exact, conflict-checked patch under sudo.",
+        "Exact multi-file patch under sudo.",
     )
 }
 
@@ -145,7 +145,7 @@ fn patch_tool(name: &'static str, description: &'static str) -> Tool {
         "properties": {
             "patch": {
                 "type": "string",
-                "description": "One-file Add/Update/Delete patch using an absolute remote path"
+                "description": "Add/Update/Delete; absolute paths. 1 MiB/file; no file/hunk cap or rollback."
             }
         },
         "required": ["patch"],

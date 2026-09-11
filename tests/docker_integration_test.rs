@@ -101,12 +101,14 @@ async fn test_mcp_tools_with_docker() {
     let add_path = "/tmp/ssh-mcp-apply-patch/added.txt";
     let edit_path = "/tmp/ssh-mcp-apply-patch/edit.txt";
     let delete_path = "/tmp/ssh-mcp-apply-patch/delete.txt";
+    let noop_path = "/tmp/ssh-mcp-apply-patch/noop.txt";
     server
         .test_execute_command(&format!(
-            r#"sh -c 'set -eu; rm -rf -- {dir}; mkdir -p -- {dir}; printf "alpha\nbeta\nomega\n" > {edit}; printf "remove me\n" > {delete}'"#,
+            r#"sh -c 'set -eu; rm -rf -- {dir}; mkdir -p -- {dir}; printf "alpha\nbeta\nomega\n" > {edit}; printf "remove me\n" > {delete}; printf "same\n" > {noop}'"#,
             dir = ssh_mcp::escape_for_shell(patch_dir),
             edit = ssh_mcp::escape_for_shell(edit_path),
             delete = ssh_mcp::escape_for_shell(delete_path),
+            noop = ssh_mcp::escape_for_shell(noop_path),
         ))
         .await
         .expect("failed to prepare apply_patch fixtures");
@@ -173,6 +175,58 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to verify deleted file");
     assert_eq!(extract_text_from_result(&delete_probe), "deleted");
 
+    // One envelope mixes operations and reports a no-op without a write.
+    let batch = server
+        .test_apply_patch(&format!(
+            "*** Begin Patch\n*** Add File: {delete_path}\n+restored\n*** Update File: {add_path}\n@@\n-created\n+batch\n*** Delete File: {edit_path}\n*** Update File: {noop_path}\n@@\n-same\n+same\n*** End Patch"
+        ))
+        .await
+        .expect("multi-file apply_patch call failed");
+    assert!(!batch.is_error.unwrap_or(false));
+    let body: serde_json::Value = serde_json::from_str(&extract_text_from_result(&batch)).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"ok": true, "files": [
+            {"path": delete_path, "operation": "add", "status": "applied"},
+            {"path": add_path, "operation": "update", "status": "applied"},
+            {"path": edit_path, "operation": "delete", "status": "applied"},
+            {"path": noop_path, "operation": "update", "status": "unchanged"},
+        ]})
+    );
+    let state = server
+        .test_execute_command(&format!(
+            "cat -- {add_path} {delete_path} {noop_path}; test ! -e {edit_path} && printf deleted"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        extract_text_from_result(&state),
+        "batch\nrestored\nsame\ndeleted"
+    );
+
+    // A planning error in the second file must leave the first file untouched.
+    let preflight = server
+        .test_apply_patch(&format!(
+            "*** Begin Patch\n*** Update File: {add_path}\n@@\n-batch\n+must-not-commit\n*** Update File: {edit_path}\n@@\n-missing\n+new\n*** End Patch"
+        ))
+        .await
+        .unwrap();
+    assert!(preflight.is_error.unwrap_or(false));
+    let body: serde_json::Value =
+        serde_json::from_str(&extract_text_from_result(&preflight)).unwrap();
+    assert_eq!(body["phase"], "preflight");
+    assert_eq!(body["error"], "not_found");
+    assert_eq!(body["path"], edit_path);
+    assert_eq!(body["files"][0]["status"], "not_attempted");
+    assert_eq!(body["files"][1]["status"], "failed");
+    let state = server
+        .test_execute_command(&format!(
+            "cat -- {add_path}; test ! -e {edit_path} && printf missing"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(extract_text_from_result(&state), "batch\nmissing");
+
     // 4b. apply_patch stays unprivileged; sudo_apply_patch preserves the same edit flow.
     let privileged_dir = "/tmp/ssh-mcp-sudo-apply-patch";
     let privileged_update = "/tmp/ssh-mcp-sudo-apply-patch/update.txt";
@@ -230,6 +284,31 @@ async fn test_mcp_tools_with_docker() {
         .expect("failed to verify protected fixtures");
     assert_eq!(extract_text_from_result(&unchanged), "before\ndelete me\n");
 
+    // Readable protected file passes planning but fails at commit. Keep the first
+    // commit, report the failure, and do not attempt the third file or elevate.
+    let partial = server
+        .test_apply_patch(&format!(
+            "*** Begin Patch\n*** Update File: {add_path}\n@@\n-batch\n+partial\n*** Update File: {privileged_update}\n@@\n-before\n+forbidden\n*** Add File: {edit_path}\n+not attempted\n*** End Patch"
+        ))
+        .await
+        .unwrap();
+    assert!(partial.is_error.unwrap_or(false));
+    let body: serde_json::Value =
+        serde_json::from_str(&extract_text_from_result(&partial)).unwrap();
+    assert_eq!(body["phase"], "commit");
+    assert_eq!(body["error"], "permission_denied");
+    assert_eq!(body["path"], privileged_update);
+    assert_eq!(body["files"][0]["status"], "applied");
+    assert_eq!(body["files"][1]["status"], "failed");
+    assert_eq!(body["files"][2]["status"], "not_attempted");
+    let state = server
+        .test_execute_command(&format!(
+            "cat -- {add_path} {privileged_update}; test ! -e {edit_path} && printf missing"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(extract_text_from_result(&state), "partial\nbefore\nmissing");
+
     // Exercise the passwordless sudo wrapper first.
     let mut passwordless_config = config.clone();
     passwordless_config.sudo_password = None;
@@ -270,21 +349,26 @@ async fn test_mcp_tools_with_docker() {
         .await
         .expect("failed to enable password-required sudo");
 
-    for patch in [
-        &privileged_update_patch,
-        &privileged_add_patch,
-        &privileged_delete_patch,
-    ] {
-        let result = server
-            .test_sudo_apply_patch(patch)
-            .await
-            .expect("password-based sudo_apply_patch failed");
-        assert!(
-            !result.is_error.unwrap_or(false),
-            "sudo_apply_patch returned an error: {}",
-            extract_text_from_result(&result)
-        );
-    }
+    let result = server
+        .test_sudo_apply_patch(&format!(
+            "*** Begin Patch\n*** Update File: {privileged_update}\n@@\n-before\n+after\n*** Add File: {privileged_add}\n+added\n*** Delete File: {privileged_delete}\n*** End Patch"
+        ))
+        .await
+        .expect("password-based multi-file sudo_apply_patch failed");
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "sudo_apply_patch returned an error: {}",
+        extract_text_from_result(&result)
+    );
+    let body: serde_json::Value = serde_json::from_str(&extract_text_from_result(&result)).unwrap();
+    assert_eq!(body["files"].as_array().unwrap().len(), 3);
+    assert!(
+        body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["status"] == "applied")
+    );
     let privileged_state = server
         .test_execute_command(&format!(
             "cat -- {} {}; test ! -e {}",

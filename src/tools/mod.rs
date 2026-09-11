@@ -89,7 +89,7 @@ pub struct CheckProcessParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyPatchParams {
-    /// One-file patch envelope with an absolute remote path
+    /// Patch envelope with one or more Add/Update/Delete sections using absolute remote paths
     pub patch: String,
 }
 

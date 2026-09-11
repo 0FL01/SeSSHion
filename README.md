@@ -11,10 +11,10 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 
 ## Why
 
-- **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, patch one file, transfer files, and inspect background jobs.
+- **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, patch files, transfer files, and inspect background jobs.
 - **Deterministic long-running jobs.** `background=true` returns a `job_id` immediately for commands and transfers; poll it with `check_process` instead of depending on the client RPC deadline.
 - **Bounded context.** Foreground shell output is capped by `--max-output-tokens` by default. Use bounded commands when inspecting large remote files.
-- **Atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo.
+- **Per-file atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo. Multi-file calls are not transactions.
 
 ## Tools
 
@@ -23,13 +23,55 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 | `shell` | Run a command via POSIX `sh` as the connected user; `background=true` for long tasks. |
 | `sudo_shell` | Same, under `sudo` (uses `--sudo-password`); can be disabled with `--disable-sudo`. |
 | `check_process` | Poll a command or transfer background job by `job_id`. |
-| `apply_patch` | Create, update, or delete one remote UTF-8 file with an exact patch (atomic, conflict-checked). |
+| `apply_patch` | Create, update, or delete remote UTF-8 files with one exact patch (atomic per file, conflict-checked). |
 | `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
 | `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. `auto` falls back through `rsync` → `sftp` → `scp` → `exec-raw` only when a transport is unavailable before writing. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
 Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, `tail -n 200 -- /path`, or `sed -n '801,1600p' -- /path`. Use `transfer` with `operation=get` to retrieve files instead of printing large content into the MCP response.
+
+### Multi-file patches
+
+Both patch tools accept `{ "patch": "..." }` with one or more file sections:
+
+```text
+*** Begin Patch
+*** Add File: /tmp/new.txt
++hello
+*** Update File: /tmp/existing.txt
+@@
+-before
++after
+*** Delete File: /tmp/obsolete.txt
+*** End Patch
+```
+
+There is **no fixed limit on the number of files or hunks**. Each source and
+result file must be valid UTF-8 and at most **1 MiB**. Model output/context,
+server memory (prepared content is held in memory), and client/SSH timeouts
+remain practical limits. Use one section per absolute path; duplicate paths and
+Move/rename are rejected. Parent directories must already exist.
+
+The entire patch is parsed and all snapshots, plans, and size checks are completed
+before any target writes. A preflight failure changes no target files. Commits
+then run in patch order using the existing per-file SHA checks, locks, and staging.
+A commit failure stops the remaining files; earlier commits are **not rolled back**.
+Write permissions and filesystem conditions can still fail at commit time.
+
+Single-file responses retain `{ok:true,path,operation}` or `{ok:false,error,message}`.
+Multi-file successes return `{ok:true,files:[{path,operation,status},...]}`.
+After parsing, multi-file errors also include `error`, `message`, the failing `path`,
+and `phase` (`preflight` or `commit`). Per-file statuses are `applied`, `unchanged`
+(a planned no-op), `failed`, `not_attempted`, or `unknown`. A preflight failure marks
+the failing file `failed` and all others `not_attempted`; nothing was committed.
+Syntax errors return the simple error response before file outcomes are available.
+`unknown` means the remote commit acknowledgement was lost: inspect remote state
+before retrying, and never blindly replay a partially applied batch. A client
+timeout/cancellation without a response likewise does not prove that nothing changed.
+
+OpenCode forwards this patch string without client-side changes. Restart/reconnect
+the MCP server after installing the new binary to refresh its tool descriptions.
 
 ## Installation
 
@@ -275,7 +317,7 @@ Background tracking requires the MCP server and its SSH session to remain alive;
 - **Logs to stderr.** Internal logging stays off the MCP protocol channel.
 - **Path validation.** Rejects control characters, traversal (`..`), and shell-injection shapes.
 - **Binary protection.** Patch tools reject non-UTF-8 content to prevent corruption.
-- **Atomic edits.** Staging with automatic cleanup and conflict detection; no silent overwrites.
+- **Per-file atomic edits.** Staging with automatic cleanup and conflict detection; multi-file batches have no rollback.
 - **Explicit elevation.** `apply_patch` never retries under sudo; privileged edits require an explicit `sudo_apply_patch` call.
 
 ## Documentation

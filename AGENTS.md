@@ -52,7 +52,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 ├── src/                        # Source code
 │   ├── main.rs                 # Application entry point
 │   ├── lib.rs                  # Library root
-│   ├── patch.rs                # Strict one-file apply_patch parser and planner
+│   ├── patch.rs                # Strict multi-file apply_patch parser and per-file planner
 │   ├── server.rs               # MCP protocol server orchestrator
 │   ├── server/                 # Server submodules (extracted from server.rs)
 │   │   ├── tools.rs            # MCP tool schemas and documentation

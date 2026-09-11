@@ -1,4 +1,5 @@
 use crate::validate::validate_basic_path_str;
+use std::collections::HashSet;
 
 const BEGIN_PATCH: &str = "*** Begin Patch";
 const END_PATCH: &str = "*** End Patch";
@@ -46,7 +47,6 @@ struct PatchHunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannedPatch {
     pub(crate) path: String,
-    pub(crate) operation: PatchOperationKind,
     pub(crate) new_content: Option<String>,
     pub(crate) changed: bool,
 }
@@ -57,8 +57,8 @@ pub(crate) enum PatchError {
     InvalidEnvelope(String),
     #[error("invalid patch section: {0}")]
     InvalidSection(String),
-    #[error("patch must contain exactly one file section")]
-    MultipleFiles,
+    #[error("patch contains more than one section for path: {0}")]
+    DuplicatePath(String),
     #[error("unsupported patch operation: {0}")]
     UnsupportedOperation(String),
     #[error("invalid patch path: {0}")]
@@ -81,7 +81,7 @@ impl PatchError {
             Self::InvalidEnvelope(_) | Self::InvalidSection(_) | Self::InvalidHunk(_) => {
                 "invalid_patch"
             }
-            Self::MultipleFiles => "multiple_files",
+            Self::DuplicatePath(_) => "duplicate_path",
             Self::UnsupportedOperation(_) => "unsupported_operation",
             Self::InvalidPath(_) => "invalid_path",
             Self::AlreadyExists(_) => "already_exists",
@@ -92,28 +92,49 @@ impl PatchError {
     }
 }
 
+pub(crate) fn parse_patch(input: &str) -> Result<Vec<FilePatch>, PatchError> {
+    let input = input.strip_suffix('\n').unwrap_or(input);
+    let lines: Vec<&str> = input.split('\n').collect();
+
+    if lines.first() != Some(&BEGIN_PATCH) {
+        return Err(PatchError::InvalidEnvelope(format!(
+            "first line must be {BEGIN_PATCH:?}"
+        )));
+    }
+    if lines.last() != Some(&END_PATCH) {
+        return Err(PatchError::InvalidEnvelope(format!(
+            "last line must be {END_PATCH:?}"
+        )));
+    }
+    if lines.len() < 3 {
+        return Err(PatchError::InvalidEnvelope(
+            "a file section is required".to_owned(),
+        ));
+    }
+
+    let mut patches = Vec::new();
+    let mut paths = HashSet::new();
+    let mut start = 1;
+    for end in 2..lines.len() {
+        let line = lines[end];
+        if end == lines.len() - 1
+            || line.starts_with(ADD_FILE)
+            || line.starts_with(UPDATE_FILE)
+            || line.starts_with(DELETE_FILE)
+        {
+            let patch = FilePatch::parse_section(&lines[start..end])?;
+            if !paths.insert(patch.path.clone()) {
+                return Err(PatchError::DuplicatePath(patch.path));
+            }
+            patches.push(patch);
+            start = end;
+        }
+    }
+    Ok(patches)
+}
+
 impl FilePatch {
-    pub(crate) fn parse(input: &str) -> Result<Self, PatchError> {
-        let input = input.strip_suffix('\n').unwrap_or(input);
-        let lines: Vec<&str> = input.split('\n').collect();
-
-        if lines.first() != Some(&BEGIN_PATCH) {
-            return Err(PatchError::InvalidEnvelope(format!(
-                "first line must be {BEGIN_PATCH:?}"
-            )));
-        }
-        if lines.last() != Some(&END_PATCH) {
-            return Err(PatchError::InvalidEnvelope(format!(
-                "last line must be {END_PATCH:?}"
-            )));
-        }
-        if lines.len() < 3 {
-            return Err(PatchError::InvalidEnvelope(
-                "a file section is required".to_owned(),
-            ));
-        }
-
-        let section = &lines[1..lines.len() - 1];
+    fn parse_section(section: &[&str]) -> Result<Self, PatchError> {
         let header = section[0];
         let body = &section[1..];
 
@@ -173,7 +194,6 @@ impl FilePatch {
 
         Ok(PlannedPatch {
             path: self.path.clone(),
-            operation: self.operation(),
             new_content,
             changed,
         })
@@ -343,10 +363,7 @@ fn validate_path(path: &str) -> Result<(), PatchError> {
 }
 
 fn section_tail_error(line: &str) -> PatchError {
-    if line.starts_with(ADD_FILE) || line.starts_with(UPDATE_FILE) || line.starts_with(DELETE_FILE)
-    {
-        PatchError::MultipleFiles
-    } else if line.starts_with("*** Move to:") {
+    if line.starts_with("*** Move to:") {
         PatchError::UnsupportedOperation("Move File".to_owned())
     } else {
         PatchError::InvalidSection(line.to_owned())
@@ -359,12 +376,13 @@ mod tests {
 
     #[test]
     fn parses_and_plans_add_and_delete() {
-        let add = FilePatch::parse(
+        let patches = parse_patch(
             "*** Begin Patch\n*** Add File: /tmp/new.txt\n+first\n+second\n*** End Patch",
         )
         .unwrap();
+        let add = &patches[0];
         let add_plan = add.plan(None).unwrap();
-        assert_eq!(add_plan.operation, PatchOperationKind::Add);
+        assert_eq!(add.operation(), PatchOperationKind::Add);
         assert_eq!(add_plan.new_content.as_deref(), Some("first\nsecond\n"));
         assert_eq!(
             add.plan(Some("occupied")).unwrap_err().kind(),
@@ -372,23 +390,22 @@ mod tests {
         );
 
         let delete =
-            FilePatch::parse("*** Begin Patch\n*** Delete File: /tmp/old.txt\n*** End Patch")
-                .unwrap();
-        let delete_plan = delete.plan(Some("old\n")).unwrap();
-        assert_eq!(delete_plan.operation, PatchOperationKind::Delete);
+            parse_patch("*** Begin Patch\n*** Delete File: /tmp/old.txt\n*** End Patch").unwrap();
+        let delete_plan = delete[0].plan(Some("old\n")).unwrap();
+        assert_eq!(delete[0].operation(), PatchOperationKind::Delete);
         assert_eq!(delete_plan.new_content, None);
     }
 
     #[test]
     fn applies_multiple_update_hunks_exactly() {
-        let patch = FilePatch::parse(
+        let patch = parse_patch(
             "*** Begin Patch\n*** Update File: /tmp/app.conf\n@@ server\n server\n-port=80\n+port=8080\n@@\n-enabled=false\n+enabled=true\n*** End Patch",
         )
         .unwrap();
-        let plan = patch
+        let plan = patch[0]
             .plan(Some("server\nport=80\nenabled=false\n"))
             .unwrap();
-        assert_eq!(plan.operation, PatchOperationKind::Update);
+        assert_eq!(patch[0].operation(), PatchOperationKind::Update);
         assert_eq!(
             plan.new_content.as_deref(),
             Some("server\nport=8080\nenabled=true\n")
@@ -396,29 +413,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_or_multiple_sections() {
+    fn rejects_invalid_or_duplicate_sections() {
         let relative =
-            FilePatch::parse("*** Begin Patch\n*** Add File: relative.txt\n+x\n*** End Patch")
+            parse_patch("*** Begin Patch\n*** Add File: relative.txt\n+x\n*** End Patch")
                 .unwrap_err();
         assert_eq!(relative.kind(), "invalid_path");
 
-        let multiple = FilePatch::parse(
-            "*** Begin Patch\n*** Add File: /tmp/a\n+x\n*** Delete File: /tmp/b\n*** End Patch",
+        let duplicate = parse_patch(
+            "*** Begin Patch\n*** Add File: /tmp/a\n+x\n*** Delete File: /tmp/a\n*** End Patch",
         )
         .unwrap_err();
-        assert_eq!(multiple, PatchError::MultipleFiles);
+        assert_eq!(duplicate, PatchError::DuplicatePath("/tmp/a".to_owned()));
 
         let move_file =
-            FilePatch::parse("*** Begin Patch\n*** Move to: /tmp/b\n*** End Patch").unwrap_err();
+            parse_patch("*** Begin Patch\n*** Move to: /tmp/b\n*** End Patch").unwrap_err();
         assert_eq!(move_file.kind(), "unsupported_operation");
+
+        for invalid in [
+            "*** Begin Patch\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: /tmp/a\n*** Update File: /tmp/b\n*** End Patch",
+            "*** Begin Patch\n*** Add File: /tmp/a\n+x\n*** End Patch\n*** Delete File: /tmp/b\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: /tmp/a\n*** Delete File: /tmp/b\ntrailing garbage\n*** End Patch",
+        ] {
+            assert_eq!(parse_patch(invalid).unwrap_err().kind(), "invalid_patch");
+        }
     }
 
     #[test]
     fn rejects_missing_and_ambiguous_update_context() {
-        let patch = FilePatch::parse(
+        let patches = parse_patch(
             "*** Begin Patch\n*** Update File: /tmp/a\n@@\n-value=old\n+value=new\n*** End Patch",
         )
         .unwrap();
+        let patch = &patches[0];
         assert_eq!(
             patch.plan(Some("other=value\n")).unwrap_err(),
             PatchError::ContextNotFound { hunk: 1 }
@@ -426,6 +453,33 @@ mod tests {
         assert_eq!(
             patch.plan(Some("value=old\nvalue=old\n")).unwrap_err(),
             PatchError::AmbiguousContext { hunk: 1 }
+        );
+    }
+
+    #[test]
+    fn parses_mixed_sections_without_splitting_prefixed_content() {
+        let patches = parse_patch(
+            "*** Begin Patch\n*** Add File: /tmp/a\n+*** Delete File: /tmp/literal\n*** Update File: /tmp/b\n@@\n-old\n+new\n@@\n-second\n+changed\n*** Delete File: /tmp/c\n*** Add File: /tmp/empty\n*** End Patch\n",
+        )
+        .unwrap();
+        assert_eq!(patches.len(), 4);
+        assert_eq!(patches[0].path(), "/tmp/a");
+        assert_eq!(
+            patches[0].plan(None).unwrap().new_content.as_deref(),
+            Some("*** Delete File: /tmp/literal\n")
+        );
+        assert_eq!(
+            patches[1]
+                .plan(Some("old\nsecond\n"))
+                .unwrap()
+                .new_content
+                .as_deref(),
+            Some("new\nchanged\n")
+        );
+        assert_eq!(patches[2].operation(), PatchOperationKind::Delete);
+        assert_eq!(
+            patches[3].plan(None).unwrap().new_content.as_deref(),
+            Some("")
         );
     }
 }

@@ -133,10 +133,7 @@ pub(super) fn apply_patch_tool() -> Tool {
 }
 
 pub(super) fn sudo_apply_patch_tool() -> Tool {
-    patch_tool(
-        "sudo_apply_patch",
-        "Exact multi-file patch under sudo.",
-    )
+    patch_tool("sudo_apply_patch", "Exact multi-file patch under sudo.")
 }
 
 fn patch_tool(name: &'static str, description: &'static str) -> Tool {

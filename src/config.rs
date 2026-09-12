@@ -587,21 +587,21 @@ mod tests {
     #[test]
     fn test_config_parses_jump_with_independent_key() {
         let home = tempfile::tempdir().unwrap();
-        let key_path = home.path().join(".ssh/lain");
+        let key_path = home.path().join(".ssh/jump_key");
         std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
         std::fs::write(&key_path, "test key").unwrap();
 
         let mut args = base_args();
-        args.jump = Some("lain@193.181.210.172:1109".to_string());
-        args.jump_key = Some(PathBuf::from("~/.ssh/lain"));
+        args.jump = Some("jump-user@example.com:2200".to_string());
+        args.jump_key = Some(PathBuf::from("~/.ssh/jump_key"));
 
         let config = Config::from_args_with_home(args, Some(home.path().as_os_str())).unwrap();
         assert_eq!(
             config.jump,
             Some(JumpConfig {
-                host: "193.181.210.172".to_string(),
-                port: 1109,
-                user: "lain".to_string(),
+                host: "example.com".to_string(),
+                port: 2200,
+                user: "jump-user".to_string(),
                 password: None,
                 key: Some(key_path),
             })
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn test_jump_validation_requires_one_credential() {
         let mut missing = base_args();
-        missing.jump = Some("lain@example.com".to_string());
+        missing.jump = Some("jump-user@example.com".to_string());
         assert!(Config::from_args(missing).is_err());
 
         let mut orphan = base_args();
@@ -620,7 +620,7 @@ mod tests {
 
         let key = tempfile::NamedTempFile::new().unwrap();
         let mut both = base_args();
-        both.jump = Some("lain@example.com".to_string());
+        both.jump = Some("jump-user@example.com".to_string());
         both.jump_key = Some(key.path().to_path_buf());
         both.jump_password = Some("secret".to_string());
         assert!(Config::from_args(both).is_err());

@@ -122,9 +122,9 @@ Add to `opencode.jsonc` (SSH key recommended; password auth uses the `exec-raw` 
       "type": "local",
       "command": [
         "/absolute/path/to/ssh-mcp",
-        "--host=192.168.1.10",
+        "--host=example.com",
         "--port=22",
-        "--user=agent-nc",
+        "--user=alice",
         "--key=~/.ssh/id_ed25519"
       ],
       "enabled": true
@@ -138,7 +138,7 @@ For `--key`, a leading `~/` is resolved through the local `HOME`; other tilde fo
 
 ### SSH jump host
 
-Configure one jump host with `--jump=USER@HOST[:PORT]` and exactly one independent jump credential. For example, this reaches `radneon@127.0.0.1:2222` as seen from the jump host and uses a different key for each SSH login:
+Configure one jump host with `--jump=USER@HOST[:PORT]` and exactly one independent jump credential. For example, this reaches `alice@127.0.0.1:2222` as seen from the jump host and uses a different key for each SSH login:
 
 ```jsonc
 {
@@ -150,10 +150,10 @@ Configure one jump host with `--jump=USER@HOST[:PORT]` and exactly one independe
         "/absolute/path/to/ssh-mcp",
         "--host=127.0.0.1",
         "--port=2222",
-        "--user=radneon",
-        "--key=~/.ssh/radneon",
-        "--jump=lain@193.181.210.172:1109",
-        "--jump-key=~/.ssh/lain"
+        "--user=alice",
+        "--key=~/.ssh/target_key",
+        "--jump=jump-user@example.com:2200",
+        "--jump-key=~/.ssh/jump_key"
       ],
       "enabled": true
     }
@@ -175,9 +175,9 @@ For password authentication, keep secrets out of the command arguments and pass 
         "/absolute/path/to/ssh-mcp",
         "--host=127.0.0.1",
         "--port=2222",
-        "--user=radneon",
-        "--key=~/.ssh/radneon",
-        "--jump=lain@193.181.210.172:1109"
+        "--user=alice",
+        "--key=~/.ssh/target_key",
+        "--jump=jump-user@example.com:2200"
       ],
       "environment": {
         "SSH_MCP_JUMP_PASSWORD": "{env:JUMP_SSH_PASSWORD}"
@@ -209,9 +209,9 @@ Add to your project's `.mcp.json` (shared via git) or to `~/.claude.json` under 
       "type": "stdio",
       "command": "/absolute/path/to/ssh-mcp",
       "args": [
-        "--host=192.168.1.10",
+        "--host=example.com",
         "--port=22",
-        "--user=agent-nc",
+        "--user=alice",
         "--key=/path/to/private/key"
       ]
     }

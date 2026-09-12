@@ -701,14 +701,14 @@ mod tests {
         let endpoint = OpenSshEndpoint {
             host: "127.0.0.1".to_string(),
             port: 2222,
-            user: "radneon".to_string(),
+            user: "alice".to_string(),
             key_path: PathBuf::from("/keys/target key"),
             host_key_checking: HostKeyCheckMode::Yes,
             known_hosts: Some(PathBuf::from("/tmp/known hosts")),
             jump: Some(super::super::TransferJumpOptions {
-                host: "193.181.210.172".to_string(),
-                port: 1109,
-                user: "lain".to_string(),
+                host: "example.com".to_string(),
+                port: 2200,
+                user: "jump-user".to_string(),
                 key_path: Some(PathBuf::from("/keys/jump key")),
             }),
         };
@@ -718,9 +718,9 @@ mod tests {
             .find(|option| option.starts_with("ProxyCommand="))
             .expect("proxy command");
         assert!(proxy.contains("-i '/keys/jump key'"));
-        assert!(proxy.contains("-p 1109"));
+        assert!(proxy.contains("-p 2200"));
         assert!(proxy.contains("-W '127.0.0.1:2222'"));
-        assert!(proxy.contains("'lain@193.181.210.172'"));
+        assert!(proxy.contains("'jump-user@example.com'"));
         assert!(!proxy.contains("/keys/target key"));
     }
 }

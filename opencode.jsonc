@@ -11,7 +11,7 @@
         "--host=127.0.0.1",
         "--port=2222",
         "--user=test",
-        "--key=~/.ssh/termius",
+        "--key=~/.ssh/id_ed25519",
         "--strict-host-key-checking=no",
         "--keepalive-interval=30",
         "--keepalive-max=3"

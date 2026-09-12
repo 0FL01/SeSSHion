@@ -625,14 +625,14 @@ Total bytes received: 172"#;
         let endpoint = RsyncEndpoint {
             host: "127.0.0.1".to_string(),
             port: 2222,
-            user: "radneon".to_string(),
+            user: "alice".to_string(),
             key_path: Some(PathBuf::from("/keys/target")),
             host_key_checking: HostKeyCheckMode::No,
             known_hosts: None,
             jump: Some(super::super::TransferJumpOptions {
-                host: "193.181.210.172".to_string(),
-                port: 1109,
-                user: "lain".to_string(),
+                host: "example.com".to_string(),
+                port: 2200,
+                user: "jump-user".to_string(),
                 key_path: Some(PathBuf::from("/keys/jump key")),
             }),
         };
@@ -641,6 +641,6 @@ Total bytes received: 172"#;
         assert!(options.contains("ProxyCommand=ssh"));
         assert!(options.contains("/keys/jump key"));
         assert!(options.contains("127.0.0.1:2222"));
-        assert!(options.contains("lain@193.181.210.172"));
+        assert!(options.contains("jump-user@example.com"));
     }
 }

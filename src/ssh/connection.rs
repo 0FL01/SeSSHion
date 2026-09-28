@@ -4,7 +4,7 @@
 //! concurrent access protection, and optional privilege elevation via `su`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use russh::Channel;
@@ -12,9 +12,11 @@ use russh::client::{self, Handle};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::config::SshConfig;
+use super::environment::HostEnvironment;
 use super::handler::SshHandler;
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
@@ -32,9 +34,12 @@ struct ConnectAttemptGuard<'a> {
     connect_notify: &'a Notify,
 }
 
-struct ActiveRoute {
-    target: Handle<SshHandler>,
+pub(super) struct ActiveRoute {
+    pub(super) target: Handle<SshHandler>,
     jump: Option<Handle<SshHandler>>,
+    pub(super) generation: u64,
+    pub(super) environment: Option<HostEnvironment>,
+    auto_elevation_attempted: bool,
 }
 
 impl Drop for ConnectAttemptGuard<'_> {
@@ -57,7 +62,13 @@ pub struct SshConnectionManager {
     pub(crate) config: SshConfig,
 
     /// Active target session and its optional jump session.
-    session: Arc<Mutex<Option<ActiveRoute>>>,
+    pub(super) session: Arc<Mutex<Option<ActiveRoute>>>,
+
+    next_generation: AtomicU64,
+    pub(super) environment_gate: Mutex<()>,
+    pub(super) shutdown_token: CancellationToken,
+    auto_elevation_lock: Mutex<()>,
+    elevation_lock: Mutex<()>,
 
     /// Flag to prevent concurrent connection attempts
     is_connecting: AtomicBool,
@@ -99,6 +110,11 @@ impl SshConnectionManager {
         Self {
             config,
             session: Arc::new(Mutex::new(None)),
+            next_generation: AtomicU64::new(1),
+            environment_gate: Mutex::new(()),
+            shutdown_token: CancellationToken::new(),
+            auto_elevation_lock: Mutex::new(()),
+            elevation_lock: Mutex::new(()),
             is_connecting: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             connect_notify: Arc::new(Notify::new()),
@@ -142,6 +158,13 @@ impl SshConnectionManager {
     /// If already connected, returns immediately. If another task is currently
     /// connecting, waits for that connection attempt to complete.
     pub async fn connect(&self) -> Result<()> {
+        self.connect_transport_only().await?;
+        self.initialize_auto_elevation().await;
+        Ok(())
+    }
+
+    /// Establish the shared route without initiating privilege elevation.
+    async fn connect_transport_only(&self) -> Result<()> {
         self.ensure_not_shutting_down()?;
 
         // Check if already connected
@@ -329,7 +352,7 @@ impl SshConnectionManager {
         .map_err(|error| SshMcpError::connection(format!("{stage} failed: {error}")))
     }
 
-    /// Authenticate, store the session, and optionally elevate.
+    /// Authenticate and publish transport; legacy callers initialize elevation.
     async fn finish_connect(
         &self,
         mut target: Handle<SshHandler>,
@@ -344,12 +367,21 @@ impl SshConnectionManager {
         )
         .await
         {
-            Self::disconnect_route(ActiveRoute { target, jump }).await;
+            Self::disconnect_handle(target).await;
+            if let Some(jump) = jump {
+                Self::disconnect_handle(jump).await;
+            }
             return Err(error);
         }
 
         // Do not publish a connection that completed after shutdown began.
-        let mut route = Some(ActiveRoute { target, jump });
+        let mut route = Some(ActiveRoute {
+            target,
+            jump,
+            generation: self.next_generation.fetch_add(1, Ordering::SeqCst),
+            environment: None,
+            auto_elevation_attempted: false,
+        });
         {
             let mut session_guard = self.session.lock().await;
             if !self.is_shutting_down() {
@@ -370,15 +402,32 @@ impl SshConnectionManager {
             self.config.username, self.config.host, self.config.port
         );
 
-        // If su_password is configured, attempt elevation
-        if self.config.su_password.is_some() {
-            debug!("su_password configured, attempting elevation...");
-            if let Err(e) = self.ensure_elevated().await {
-                warn!(error = ?e, "Failed to elevate to root. Commands will run as normal user.");
-            }
-        }
-
         Ok(())
+    }
+
+    /// Preserve best-effort automatic su even when a rootless probe connected first.
+    async fn initialize_auto_elevation(&self) {
+        if self.config.su_password.is_none() {
+            return;
+        }
+        let _guard = self.auto_elevation_lock.lock().await;
+        let generation = {
+            let mut session = self.session.lock().await;
+            let Some(route) = session.as_mut() else {
+                return;
+            };
+            if route.auto_elevation_attempted || self.is_shutting_down() {
+                return;
+            }
+            route.auto_elevation_attempted = true;
+            route.generation
+        };
+        if let Err(error) = self.ensure_elevated_for_generation(Some(generation)).await {
+            warn!(
+                ?error,
+                "Failed to elevate to root. Commands will run as normal user."
+            );
+        }
     }
 
     /// Authenticate with the SSH server
@@ -483,7 +532,23 @@ impl SshConnectionManager {
 
     /// Ensure connection is established, reconnecting if necessary
     pub async fn ensure_connected(&self) -> Result<()> {
+        self.ensure_connected_transport_only().await?;
+        self.initialize_auto_elevation().await;
+        Ok(())
+    }
+
+    pub(super) async fn ensure_connected_transport_only(&self) -> Result<()> {
         self.ensure_not_shutting_down()?;
+
+        let transport_closed = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|route| route.target.is_closed());
+        if transport_closed {
+            self.invalidate_session("SSH transport closed").await;
+        }
 
         if !self.is_connected().await {
             return self
@@ -570,7 +635,7 @@ impl SshConnectionManager {
         let mut last_error: Option<SshMcpError> = None;
 
         while attempt <= max_attempts {
-            match self.connect().await {
+            match self.connect_transport_only().await {
                 Ok(()) => {
                     if attempt > 1 {
                         info!(
@@ -638,6 +703,12 @@ impl SshConnectionManager {
 
     /// Open a new session channel
     pub async fn open_channel(&self) -> Result<Channel<client::Msg>> {
+        self.open_channel_with_generation()
+            .await
+            .map(|(_, channel)| channel)
+    }
+
+    pub(super) async fn open_channel_with_generation(&self) -> Result<(u64, Channel<client::Msg>)> {
         self.ensure_not_shutting_down()?;
         let session_guard = self.session.lock().await;
         let route = session_guard
@@ -650,7 +721,7 @@ impl SshConnectionManager {
             .await
             .map_err(|e| SshMcpError::connection(format!("Failed to open channel: {}", e)))?;
 
-        Ok(channel)
+        Ok((route.generation, channel))
     }
 
     /// Check if currently elevated to root via su
@@ -779,7 +850,21 @@ impl SshConnectionManager {
     /// This starts an interactive PTY session, runs `su -`, sends the password,
     /// and waits for the root prompt (#).
     pub async fn ensure_elevated(&self) -> Result<()> {
+        self.ensure_elevated_for_generation(None).await
+    }
+
+    async fn ensure_elevated_for_generation(&self, expected: Option<u64>) -> Result<()> {
+        let _elevation_guard = self.elevation_lock.lock().await;
         self.ensure_not_shutting_down()?;
+
+        if let Some(expected) = expected {
+            let session = self.session.lock().await;
+            if session.as_ref().map(|route| route.generation) != Some(expected) {
+                return Err(SshMcpError::elevation_failed(
+                    "SSH route changed before elevation",
+                ));
+            }
+        }
 
         // Already elevated?
         if self.is_elevated.load(Ordering::SeqCst) {
@@ -797,10 +882,17 @@ impl SshConnectionManager {
             .ok_or_else(|| SshMcpError::elevation_failed("No su_password configured"))?;
 
         // Open a channel for PTY shell
-        let channel = self
-            .open_channel()
+        let (generation, channel) = self
+            .open_channel_with_generation()
             .await
             .map_err(|e| SshMcpError::elevation_failed(format!("Failed to open channel: {}", e)))?;
+
+        if expected.is_some_and(|expected| expected != generation) {
+            let _ = timeout(Duration::from_millis(100), channel.close()).await;
+            return Err(SshMcpError::elevation_failed(
+                "SSH route changed before elevation",
+            ));
+        }
 
         debug!("Opened channel for su elevation");
 
@@ -839,10 +931,16 @@ impl SshConnectionManager {
             Ok(elevated_channel) => {
                 // Store the elevated channel
                 let mut channel_guard = self.su_channel.lock().await;
-                if self.is_shutting_down() {
+                let session_guard = self.session.lock().await;
+                if self.is_shutting_down()
+                    || session_guard.as_ref().map(|route| route.generation) != Some(generation)
+                {
+                    drop(session_guard);
                     drop(channel_guard);
-                    let _ = elevated_channel.eof().await;
-                    return self.ensure_not_shutting_down();
+                    let _ = timeout(Duration::from_millis(100), elevated_channel.close()).await;
+                    return Err(SshMcpError::elevation_failed(
+                        "SSH route changed during elevation",
+                    ));
                 }
                 *channel_guard = Some(elevated_channel);
                 self.is_elevated.store(true, Ordering::SeqCst);
@@ -987,22 +1085,19 @@ impl SshConnectionManager {
     /// Close the SSH connection
     pub async fn close(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.shutdown_token.cancel();
 
-        // Close su channel if exists
-        let su_channel = {
+        // Remove the route/cache before asynchronous teardown. Lock order: su -> route.
+        let (su_channel, route) = {
             let mut channel_guard = self.su_channel.lock().await;
-            channel_guard.take()
+            let mut session_guard = self.session.lock().await;
+            self.is_elevated.store(false, Ordering::SeqCst);
+            (channel_guard.take(), session_guard.take())
         };
         if let Some(ch) = su_channel {
             let _ = ch.eof().await;
         }
-        self.is_elevated.store(false, Ordering::SeqCst);
-
         // Close target first, then the jump session that carries it.
-        let route = {
-            let mut session_guard = self.session.lock().await;
-            session_guard.take()
-        };
         if let Some(route) = route {
             Self::disconnect_route(route).await;
         }
@@ -1023,22 +1118,18 @@ impl SshConnectionManager {
         warn!(reason = ?reason, "Invalidating SSH session");
 
         // Take channel out of mutex before awaiting to avoid deadlock
-        let channel = {
+        let (channel, route) = {
             let mut channel_guard = self.su_channel.lock().await;
-            channel_guard.take()
+            let mut session_guard = self.session.lock().await;
+            self.is_elevated.store(false, Ordering::SeqCst);
+            (channel_guard.take(), session_guard.take())
         };
 
         // Drop lock before awaiting EOF
         if let Some(ch) = channel {
             let _ = ch.eof().await;
         }
-        self.is_elevated.store(false, Ordering::SeqCst);
-
         // Attempt best-effort graceful disconnect with short timeout.
-        let route = {
-            let mut session_guard = self.session.lock().await;
-            session_guard.take()
-        };
 
         if let Some(route) = route {
             Self::disconnect_route(route).await;
@@ -1062,7 +1153,9 @@ impl SshConnectionManager {
         self.invalidate_session("explicit reconnect requested")
             .await;
         self.connect_with_retry("explicit reconnect requested")
-            .await
+            .await?;
+        self.initialize_auto_elevation().await;
+        Ok(())
     }
 }
 

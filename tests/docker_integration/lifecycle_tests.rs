@@ -252,7 +252,7 @@ async fn modern_stdio_discovery_and_tool_results() {
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["resultType"], "complete");
     let tools = response["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     assert!(tools.iter().any(|tool| tool["name"] == "check_process"));
 
     process
@@ -305,6 +305,7 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
             "check_process",
             "transfer",
             "apply_patch",
+            "host_environment",
         ]
     );
 
@@ -324,6 +325,113 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
         "unexpected read response: {response}"
     );
 
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[tokio::test]
+async fn host_environment_errors_keep_mcp_alive_and_tool_surface_stable() {
+    for disable_sudo in [false, true] {
+        let mut auth = vec![
+            OsString::from("--user=test"),
+            OsString::from("--password=secret"),
+            OsString::from("--strict-host-key-checking=no"),
+        ];
+        if disable_sudo {
+            auth.push(OsString::from("--disable-sudo"));
+        }
+        let mut process = McpProcess::spawn_with_auth("127.0.0.1", 9, None, None, &auth).await;
+        process.initialize().await;
+        process
+            .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
+            .await;
+        let before = process.response(2).await["result"].clone();
+        assert_eq!(
+            before["tools"].as_array().unwrap().len(),
+            if disable_sudo { 5 } else { 7 }
+        );
+        process
+            .send(
+                json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+                    "name":"host_environment", "arguments":{"refresh":"false"}
+                }}),
+            )
+            .await;
+        assert_eq!(process.response(3).await["error"]["code"], -32602);
+        process
+            .send(
+                json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{
+                    "name":"host_environment", "arguments":{}
+                }}),
+            )
+            .await;
+        let error = process.response(4).await;
+        assert!(
+            error.get("error").is_none(),
+            "transport failure must be a tool error: {error}"
+        );
+        assert_eq!(error["result"]["isError"], true);
+        process
+            .send(json!({"jsonrpc":"2.0", "id":5, "method":"ping", "params":{}}))
+            .await;
+        assert!(process.response(5).await.get("error").is_none());
+        process
+            .send(json!({"jsonrpc":"2.0", "id":6, "method":"tools/list", "params":{}}))
+            .await;
+        assert_eq!(process.response(6).await["result"], before);
+        process.close_stdin().await;
+        process.assert_successful_exit().await;
+    }
+}
+
+#[tokio::test]
+async fn host_environment_stdio_snapshots_are_structured_stable_and_prefix_friendly() {
+    init_test_env().unwrap();
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(2222).await.unwrap();
+    wait_for_tcp(&host, port).await;
+    let mut process = McpProcess::spawn(&host, port).await;
+    process.initialize().await;
+    process
+        .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
+        .await;
+    let definitions = process.response(2).await["result"].clone();
+    let mut previous = None;
+    for (id, arguments) in [
+        (3, json!({})),
+        (4, json!({})),
+        (5, json!({"refresh":true})),
+        (6, json!({})),
+    ] {
+        process
+            .send(
+                json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
+                    "name":"host_environment", "arguments":arguments
+                }}),
+            )
+            .await;
+        let response = process.response(id).await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
+        let snapshot: Value = serde_json::from_str(tool_text(&response)).unwrap();
+        assert_eq!(response["result"]["structuredContent"], snapshot);
+        assert_eq!(snapshot.as_object().unwrap().len(), 12);
+        assert_eq!(snapshot["effective_uid"], 1000);
+        if id == 4 || id == 6 {
+            assert_eq!(previous.as_ref(), Some(&response["result"]));
+        }
+        previous = Some(response["result"].clone());
+    }
+    process
+        .send(json!({"jsonrpc":"2.0", "id":7, "method":"tools/list", "params":{}}))
+        .await;
+    assert_eq!(process.response(7).await["result"], definitions);
     process.close_stdin().await;
     process.assert_successful_exit().await;
 }

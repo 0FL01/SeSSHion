@@ -7,6 +7,7 @@ pub mod command;
 pub mod config;
 pub mod connection;
 pub mod elevation;
+pub mod environment;
 pub mod handler;
 pub mod sanitize;
 

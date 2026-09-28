@@ -8,7 +8,6 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 .
  ├── Cargo.toml            # Project manifest and dependencies
  ├── README.md             # Detailed project overview and usage
- ├── AGENTS.md             # LLM-oriented project documentation (this file)
  ├── CODE_OF_CONDUCT.md    # Community guidelines
  ├── CONTRIBUTING.md       # Contribution guidelines
  ├── docker-compose.yml    # Docker Compose configuration for E2E tests
@@ -31,6 +30,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   │   ├── common.rs             # Shared test utilities and helpers
 │   │   ├── check_process_tests.rs # Process monitoring tests
 │   │   ├── exec_raw_tests.rs     # ExecRaw transport tests
+│   │   ├── host_environment_tests.rs # Rootless probe, bounded failures and session-cache races
 │   │   ├── sftp_tests.rs         # SFTP transport tests
 │   │   ├── scp_tests.rs          # SCP transport tests
 │   │   ├── rsync_tests.rs        # Rsync transfer tests
@@ -67,6 +67,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   │       ├── mod.rs          # Module exports
 │   │       ├── check_process.rs # check_process tool handler
 │   │       ├── apply_patch.rs  # apply_patch orchestration and MCP responses
+│   │       ├── host_environment.rs # Structured snapshot tool; discovery/instructions must stay static
 │   │       └── file_edit_common.rs # Spool-backed snapshot and atomic commit helpers
 │   ├── shell_escape.rs         # Shell string escaping utilities (neutral, no ssh/background deps)
 │   ├── config.rs               # Configuration and CLI argument parsing
@@ -76,10 +77,11 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   ├── validate.rs             # Shared path/string validation utilities with unit tests
 │   ├── ssh/                    # SSH core logic
 │   │   ├── mod.rs              # SSH module definition
-│   │   ├── connection.rs       # SSH session, connection management, and slot semaphore helpers
+│   │   ├── connection.rs       # SSH route generations, deferred auto-su, session cache and slot semaphore
 │   │   ├── command.rs          # Command execution over SSH
 │   │   ├── handler.rs          # SSH event handlers (russh implementation)
 │   │   ├── elevation.rs        # Privileged execution (su/sudo) logic
+│   │   ├── environment.rs      # Bounded user-only probe; never initiate elevation, including connect/reconnect
 │   │   ├── sanitize.rs         # Input validation and command safety
 │   │   └── config.rs           # SSH-specific configuration structures
  │   ├── background/             # Background job subsystem (extracted from server.rs)

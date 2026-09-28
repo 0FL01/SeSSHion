@@ -1,6 +1,19 @@
 use std::sync::Arc;
 
-use rmcp::model::Tool;
+use rmcp::model::{Tool, ToolAnnotations};
+
+pub(super) fn host_environment_tool() -> Tool {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"refresh": {"type": "boolean", "default": false}},
+        "additionalProperties": false
+    });
+    Tool::new(
+        "host_environment",
+        "Best-effort snapshot as SSH user; cached per SSH session. refresh=true recollects; null is unknown. CPU is an estimate.",
+        Arc::new(schema.as_object().cloned().unwrap_or_default()),
+    ).annotate(ToolAnnotations::new().read_only(true))
+}
 
 fn command_tool(name: &'static str, tool_description: &'static str) -> Tool {
     let schema = serde_json::json!({
@@ -156,8 +169,8 @@ fn patch_tool(name: &'static str, description: &'static str) -> Tool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_patch_tool, check_process_tool, shell_tool, sudo_apply_patch_tool, sudo_shell_tool,
-        transfer_tool,
+        apply_patch_tool, check_process_tool, host_environment_tool, shell_tool,
+        sudo_apply_patch_tool, sudo_shell_tool, transfer_tool,
     };
 
     #[test]
@@ -225,7 +238,8 @@ mod tests {
 
     #[test]
     fn default_tool_surface_stays_within_wire_budget() {
-        const WIRE_BUDGET_BYTES: usize = 3200;
+        // Existing 3200-byte allowance plus a 320-byte tool; measured total 3513.
+        const WIRE_BUDGET_BYTES: usize = 3520;
         let tools = vec![
             shell_tool(),
             sudo_shell_tool(),
@@ -233,6 +247,7 @@ mod tests {
             check_process_tool(),
             transfer_tool(),
             apply_patch_tool(),
+            host_environment_tool(),
         ];
         let names = tools
             .iter()
@@ -247,10 +262,15 @@ mod tests {
                 "check_process",
                 "transfer",
                 "apply_patch",
+                "host_environment",
             ]
         );
 
         let bytes = serde_json::to_vec(&tools).expect("serialize default tool surface");
+        println!(
+            "default tool surface: {} bytes (budget {WIRE_BUDGET_BYTES})",
+            bytes.len()
+        );
         assert!(
             bytes.len() <= WIRE_BUDGET_BYTES,
             "default tool surface is {} bytes; budget is {WIRE_BUDGET_BYTES}",

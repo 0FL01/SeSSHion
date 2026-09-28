@@ -7,11 +7,11 @@
 
 **SeSSHion** (formerly **ssh-mcp / ssh-mcp-rs**) is a lightweight SSH MCP server for LLM agents.
 
-Its capability-bound toolset combines deterministic long-running jobs, bounded context, and atomic remote edits. Written in Rust, SeSSHion gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session through the [Model Context Protocol](https://modelcontextprotocol.io). It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
+Its capability-bound toolset combines deterministic long-running jobs, bounded context, and atomic remote edits. Written in Rust, SeSSHion gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session through the [Model Context Protocol](https://modelcontextprotocol.io). It exposes five base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
 
 ## Why
 
-- **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, patch files, transfer files, and inspect background jobs.
+- **Capability-bound surface.** Five base tools and two optional sudo variants, no open-ended remote API. The agent can run commands, patch files, transfer files, inspect background jobs, and obtain a rootless environment snapshot.
 - **Deterministic long-running jobs.** `background=true` returns a `job_id` immediately for commands and transfers; poll it with `check_process` instead of depending on the client RPC deadline.
 - **Bounded context.** Foreground shell output is capped by `--max-output-tokens` by default. Use bounded commands when inspecting large remote files.
 - **Per-file atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo. Multi-file calls are not transactions.
@@ -26,10 +26,56 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 | `apply_patch` | Create, update, or delete remote UTF-8 files with one exact patch (atomic per file, conflict-checked). |
 | `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
 | `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. `auto` falls back through `rsync` → `sftp` → `scp` → `exec-raw` only when a transport is unavailable before writing. |
+| `host_environment` | Read a best-effort remote environment snapshot as the SSH user; cached per SSH session. `refresh=true` recollects. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
 Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, `tail -n 200 -- /path`, or `sed -n '801,1600p' -- /path`. Use `transfer` with `operation=get` to retrieve files instead of printing large content into the MCP response.
+
+### Rootless host environment
+
+Call `host_environment` with `{}` before remote work, or `{"refresh":true}` to
+replace the cached snapshot. It returns a compact JSON object (also supplied as
+MCP `structuredContent`) with these fixed nullable fields:
+
+`hostname`, `os`, `distribution`, `kernel_release`, `machine_architecture`,
+`process_architecture`, `pointer_width`, `available_cpu_parallelism`,
+`effective_uid`, `effective_gid`, `running_as_root`, and `shell_executable`.
+
+Collection never initiates `su` or `sudo`, even when establishing/reestablishing
+the shared SSH connection with elevation configured. A root SSH login can
+legitimately report UID 0. Values describe the ordinary probe's visible
+namespaces/rootfs, not necessarily the physical host or an elevated command.
+Process architecture, pointer width and executable describe its non-login POSIX
+`sh`, not the SSH account's login shell. CPU parallelism is a positive `nproc`
+estimate, **not** a guarantee that every cgroup quota is accounted for.
+
+Missing utilities, unreadable files, unsupported ELF ABIs and malformed values
+become `null`; unknown UID also means `running_as_root:null`. Sources include
+`uname` with selected `/proc` fallbacks, `id` with effective IDs from proc status,
+and `os-release` parsed as data, never sourced/evaluated. `/usr/lib/os-release`
+is used only when `/etc/os-release` is absent; their contents are never merged.
+
+After SSH establishment/health/retries (which keep their existing timeouts), one
+**3-second budget** covers metadata waits, execution and best-effort channel
+cleanup. Raw stdout is capped at 64 KiB, stderr at 4 KiB; text scalars at 1 KiB,
+release/status files at 16 KiB, executable paths at 4 KiB, and ELF at 64 bytes.
+Completed fields survive later timeout/overflow. Metadata failures close only
+the probe channel; closing it is not a guarantee of killing all descendants.
+Detected SSH/authentication failures are ordinary tool errors, not server crashes.
+
+Partial snapshots are cached too, until refresh or SSH reconnect. Refresh replaces
+the whole snapshot, including new nulls; a cancelled/failed refresh does not erase
+the prior cache. Reconnect invalidates lazily: the next tool call recollects.
+There is no startup collection, TTL, polling or automatic host-context injection.
+
+**Prompt/KV-cache friendly:** instructions, tool schemas and order stay static for
+the same version/configuration. Snapshots appear only in new tool results, without
+timestamps or cache-hit/session metadata. Append new results to conversation history;
+they supersede old snapshots semantically rather than rewriting earlier messages or
+system instructions. A previous result remains historical after a transparent SSH
+reconnect until the next `host_environment` call. Provider cache hits and client
+serialization/history compaction are outside the server's control.
 
 ### Multi-file patches
 

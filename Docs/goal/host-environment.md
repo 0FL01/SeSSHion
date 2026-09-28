@@ -1,6 +1,6 @@
 # Goal: rootless host environment snapshot
 
-Status: active
+Status: complete
 Source: user request for remote environment information, the reviewed plan, and
 “делай копию плана в goal и итеративно реализовать и коммит билд, без пуша”.
 Last updated: 2026-09-28
@@ -86,9 +86,10 @@ every required outcome is resolved and affected constraints remain satisfied.
   - Acceptance: successful fmt, clippy, all-features tests/check and release build;
     goal complete with current evidence; intended source/docs/tests committed.
   - Primary evidence: gate output, git diff/status and local commit log.
-  - Status: in_progress
+  - Status: verified
   - Evidence: plan saved; fmt, clippy, all-features tests/check and release build
-    passed. Native binary reports `ssh-mcp 5.0.1`. Local commit remains the final action.
+    passed. Native binary reports `ssh-mcp 5.0.1`. Implementation committed locally
+    as `8238745`; clean worktree confirmed immediately afterwards; no push performed.
 
 ### Constraints
 
@@ -171,22 +172,20 @@ history rewriting/compaction are outside the server's control.
 
 ## Current Checkpoint
 
-- Closes: R6.
-- Smallest next action: stage only reviewed source/docs/tests, create the local feature
-  commit, record its evidence and close this goal in a documentation commit. Do not push.
-- Expected evidence: local commit log and clean worktree, with all gates already green.
-- Replan if: existing transport/elevation behavior exposes a concrete regression.
+- Closed: R1–R6; frozen finish line and affected invariants verified.
+- No further substantive work. This completion record is the only follow-up to
+  the verified implementation commit; no push.
 
 ## Current State
 
-- Resolved: R1–R5 verified, implementation and public usage documentation complete.
+- Resolved: R1–R6 verified; implementation, public documentation and local build complete.
 - Last relevant evidence: `cargo fmt --all -- --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-features --verbose` (308 passed, 4 pre-existing ignored),
   `cargo check --all-features --verbose`, `cargo build --release --all-features`,
   and `target/release/ssh-mcp --version` all pass. All 80 Docker integration tests pass.
 - Blocker: none.
-- Next: local feature commit, goal closure record and documentation commit.
+- Next: none; objective complete.
 
 ## Material Decisions
 
@@ -218,10 +217,22 @@ history rewriting/compaction are outside the server's control.
   before commit; a deterministic lock/poll test passes. All mandatory gates and
   release build repeated successfully after this final code change (308 passed,
   including all 80 Docker integrations; no failed tests or new ignored tests).
+- 2026-09-28: Closure passed against R1–R6 and the frozen change envelope.
+  Feature commit `8238745` contains only the 15 intended source/docs/test files;
+  post-commit worktree is clean. This completion record does not alter built code.
 
 ## Completion
 
-- Resolved outcomes: not yet complete.
-- Commands and artifacts: not yet complete.
-- Constraint and diff-scope check: pending.
-- Final status: active.
+- Resolved outcomes: R1–R6 verified; no blocker.
+- Commands: fmt check, all-target/all-feature clippy with `-D warnings`,
+  all-features tests/check, release build, binary version smoke and git diff checks
+  all passed after the final implementation change.
+- Test results: 308 passed (199 library, 15 compact-response, 80 Docker, 5 integration,
+  3 logging, 6 doctests); four pre-existing ignored tests unchanged. Debian/Fish
+  real SSH and genuine Alpine/BusyBox smoke passed; static tool surface 3513/3520 bytes.
+- Artifacts: local implementation commit `8238745`; native release binary
+  `target/release/ssh-mcp` (version 5.0.1), intentionally not committed.
+- Constraint and diff-scope check: within the frozen envelope; no new dependencies,
+  framework, version bump, runtime discovery mutations, actual secrets, generated
+  artifacts or unrelated changes committed. No push performed.
+- Final status: complete.

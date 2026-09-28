@@ -1,6 +1,6 @@
 # Goal: rootless startup environment in MCP instructions
 
-Status: active
+Status: complete
 Source: user rejected the environment tool, approved the startup-instructions
 plan after recon, then instructed “Утверждаю реализовать и коммит билд”.
 Last updated: 2026-09-28
@@ -79,9 +79,10 @@ every required outcome is resolved and affected constraints remain satisfied.
   - Source: user approval/build/commit request; previous no-push constraint and
     repository commit style.
   - Primary evidence: actual gate outputs, release version smoke, git diff/status/log.
-  - Status: in_progress
+  - Status: verified
   - Evidence: fmt check, strict all-target/all-feature clippy, full tests/check,
-    release build and version smoke passed. Commit/durable closure remain.
+    release build and version smoke passed. Local implementation commit `6a1d40a`
+    contains only approved files; no push or binary/configuration commit occurred.
 
 ### Constraints
 
@@ -134,22 +135,20 @@ edits, general lifecycle redesign, new dependencies or CI job.
 
 ## Current Checkpoint
 
-- Closes: R6.
-- Smallest next action: stage and commit the 14 reviewed implementation/docs/test
-  files, then record the actual commit and close the goal.
-- Expected evidence: only approved files are committed; the two existing user
-  configuration changes remain unchanged and unstaged; no push occurs.
-- Replan if: hooks alter the verified source or reject the intended commit.
+- Closed: R1–R6 verified. No remaining implementation checkpoint.
+- Evidence: all gates and native build succeeded; reviewed implementation commit
+  `6a1d40a` exists. This documentation-only closure records the verified result.
 
 ## Current State
 
-- Resolved: R1–R5; tool/cache removed, bounded startup preparation and immutable
+- Resolved: R1–R6; tool/cache removed, bounded startup preparation and immutable
   instructions installed; documentation updated.
 - Last relevant evidence: all required gates passed; 305 tests passed (197 library,
   15 compact-response, 79 Docker, 5 integration, 3 logging, 6 doctests), 4 previous
   ignored tests unchanged. Native release version smoke reports ssh-mcp 5.0.1.
 - Blocker: none.
-- Next: local implementation commit and durable closure commit, without push.
+- Next: none; objective complete. Only the original user configuration edits
+  remain outside the committed implementation.
 
 ## Material Decisions
 
@@ -172,15 +171,21 @@ edits, general lifecycle redesign, new dependencies or CI job.
   and strict clippy then passed; startup nulls stay frozen after successful recovery.
 - 2026-09-28: Full fmt/clippy/tests/check/release build succeeded. Diff review found
   only the 14 approved files; client/Compose diff hash matches the initial state.
+- 2026-09-28: Created local implementation commit `6a1d40a`; post-commit status
+  contains only the original client/Compose edits. Closure check passes; no push.
 
 ## Completion
 
-- Resolved outcomes: not yet complete.
+- Resolved outcomes: R1–R6 verified; no blocker.
 - Commands: `cargo fmt --all -- --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-features --verbose`, `cargo check --all-features --verbose`,
   `cargo build --release --all-features`, `target/release/ssh-mcp --version` passed.
 - Artifact: `target/release/ssh-mcp`, version 5.0.1; ignored binary stays local.
+- Tests: 305 passed, including 79 Docker integration tests; 4 pre-existing ignored
+  tests unchanged. Real Debian/Fish SSH, BusyBox, both MCP init styles, signals,
+  auth recovery, bounds and lifetime prefix stability verified.
+- Commit: local implementation `6a1d40a`; this closure changes only this goal.
 - Constraint and diff-scope check: approved envelope only; no dependency/version
   changes, actual secrets or artifacts; original client/Compose edits untouched.
-- Final status: active.
+- Final status: complete; no push performed.

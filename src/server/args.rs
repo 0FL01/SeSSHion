@@ -22,13 +22,6 @@ pub(super) struct CheckProcessToolArgs {
     pub(super) wait_for: u64,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct HostEnvironmentArgs {
-    #[serde(default)]
-    pub(super) refresh: bool,
-}
-
 pub(super) fn parse_common_tool_args(
     args: &Map<String, Value>,
 ) -> std::result::Result<CommonToolArgs, McpError> {
@@ -115,29 +108,7 @@ mod tests {
     use rmcp::model::ErrorCode;
     use serde_json::json;
 
-    use super::{CheckProcessToolArgs, HostEnvironmentArgs, parse_common_tool_args};
-
-    #[test]
-    fn host_environment_accepts_only_an_optional_boolean() {
-        assert!(
-            !serde_json::from_value::<HostEnvironmentArgs>(json!({}))
-                .unwrap()
-                .refresh
-        );
-        assert!(
-            serde_json::from_value::<HostEnvironmentArgs>(json!({"refresh": true}))
-                .unwrap()
-                .refresh
-        );
-        for invalid in [
-            json!({"refresh": null}),
-            json!({"refresh": 1}),
-            json!({"refresh": "false"}),
-            json!({"command": "id"}),
-        ] {
-            assert!(serde_json::from_value::<HostEnvironmentArgs>(invalid).is_err());
-        }
-    }
+    use super::{CheckProcessToolArgs, parse_common_tool_args};
 
     #[test]
     fn check_process_wait_for_defaults_to_zero() {

@@ -10,22 +10,6 @@ use crate::tools::{ApplyPatchParams, CheckProcessParams};
 
 impl SshMcpServer {
     #[doc(hidden)]
-    pub async fn test_acquire_command_slot(
-        &self,
-    ) -> crate::error::Result<tokio::sync::OwnedSemaphorePermit> {
-        self.connection.acquire_command_slot().await
-    }
-
-    #[doc(hidden)]
-    pub async fn test_host_environment(
-        &self,
-        refresh: bool,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.execute_host_environment(refresh, cancellation).await
-    }
-
-    #[doc(hidden)]
     pub async fn test_execute_command(
         &self,
         command: &str,

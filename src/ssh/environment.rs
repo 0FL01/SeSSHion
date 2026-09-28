@@ -1,5 +1,5 @@
 //! Bounded, optional metadata from an ordinary remote POSIX shell.
-//! No probe values are ever evaluated as shell code or added to MCP discovery.
+//! Probe values are data, never evaluated as shell code.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::{SshConnectionManager, sanitize::wrap_in_posix_shell};
 use crate::error::{Result, SshMcpError};
 
-const COLLECTION_BUDGET: Duration = Duration::from_secs(3);
+const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(3);
 const CLEANUP_RESERVE: Duration = Duration::from_millis(50);
 const STDOUT_LIMIT: usize = 64 * 1024;
 const STDERR_LIMIT: usize = 4 * 1024;
@@ -88,123 +88,47 @@ impl Drop for ProbeChannel {
 }
 
 impl SshConnectionManager {
-    /// Collect or reuse metadata without initiating su/sudo, even on cold connect.
-    pub async fn host_environment(
+    /// One bounded startup probe, including transport establishment, without su/sudo.
+    pub(crate) async fn collect_startup_environment(
         &self,
-        refresh: bool,
         cancellation: CancellationToken,
     ) -> Result<HostEnvironment> {
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(SshMcpError::connection("Host environment request cancelled")),
-            _ = self.shutdown_token.cancelled() => Err(SshMcpError::connection("SSH connection manager is shutting down")),
-            result = self.host_environment_inner(refresh, &cancellation) => result,
-        }
-    }
-
-    async fn host_environment_inner(
-        &self,
-        refresh: bool,
-        cancellation: &CancellationToken,
-    ) -> Result<HostEnvironment> {
-        // Existing establishment/health/retry budgets apply only to this phase.
-        self.ensure_connected_transport_only().await?;
-        let deadline = Instant::now() + COLLECTION_BUDGET;
-        timeout_at(
-            deadline,
-            self.host_environment_on_route(refresh, deadline, cancellation),
-        )
-        .await
-        .map_err(|_| SshMcpError::Timeout(COLLECTION_BUDGET.as_millis() as u64))?
-    }
-
-    async fn host_environment_on_route(
-        &self,
-        refresh: bool,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<HostEnvironment> {
-        let (generation, cached) = self.environment_cache().await?;
-        if !refresh && let Some(cached) = cached {
-            return Ok(cached);
-        }
-
-        let _gate = timeout_at(deadline, self.environment_gate.lock())
-            .await
-            .map_err(|_| SshMcpError::Timeout(COLLECTION_BUDGET.as_millis() as u64))?;
-        let (current, cached) = self.environment_cache().await?;
-        if current != generation {
-            return Err(SshMcpError::connection(
-                "SSH route changed during environment collection",
-            ));
-        }
-        if !refresh && let Some(cached) = cached {
-            return Ok(cached);
-        }
-
-        let _permit = timeout_at(deadline, self.acquire_command_slot())
-            .await
-            .map_err(|_| SshMcpError::Timeout(COLLECTION_BUDGET.as_millis() as u64))??;
-        let (opened_generation, channel) =
-            timeout_at(deadline, self.open_channel_with_generation())
-                .await
-                .map_err(|_| SshMcpError::Timeout(COLLECTION_BUDGET.as_millis() as u64))??;
-        let mut channel = ProbeChannel(Some(channel));
-        if opened_generation != generation {
-            return Err(SshMcpError::connection(
-                "SSH route changed during environment collection",
-            ));
-        }
-        let snapshot = collect(
-            channel.0.as_mut().expect("live probe channel"),
-            PROBE,
-            deadline,
-        )
-        .await?;
-        self.publish_environment(generation, snapshot, cancellation)
-            .await
-    }
-
-    async fn environment_cache(&self) -> Result<(u64, Option<HostEnvironment>)> {
-        let session = self.session.lock().await;
-        let route = session
-            .as_ref()
-            .filter(|route| !route.target.is_closed())
-            .ok_or_else(|| SshMcpError::connection("SSH connection not established or closed"))?;
-        if self.is_shutting_down() {
-            return Err(SshMcpError::connection(
-                "SSH connection manager is shutting down",
-            ));
-        }
-        Ok((route.generation, route.environment.clone()))
-    }
-
-    async fn publish_environment(
-        &self,
-        generation: u64,
-        snapshot: HostEnvironment,
-        cancellation: &CancellationToken,
-    ) -> Result<HostEnvironment> {
-        let mut session = self.session.lock().await;
-        // Cancellation can occur while a ready channel loop/parser is being polled,
-        // without another select! poll. Recheck at the cache commit boundary.
-        if cancellation.is_cancelled() {
-            return Err(SshMcpError::connection(
-                "Host environment request cancelled",
-            ));
-        }
-        let route = session
-            .as_mut()
-            .filter(|route| {
+        let deadline = Instant::now() + BOOTSTRAP_BUDGET;
+        let operation = async {
+            self.ensure_connected_transport_only().await?;
+            let _permit = self.acquire_command_slot().await?;
+            let (generation, channel) = self.open_channel_with_generation().await?;
+            let mut channel = ProbeChannel(Some(channel));
+            let snapshot = collect(
+                channel.0.as_mut().expect("live probe channel"),
+                PROBE,
+                deadline,
+            )
+            .await?;
+            let session = self.session.lock().await;
+            if cancellation.is_cancelled() {
+                return Err(SshMcpError::connection(
+                    "Startup environment collection cancelled",
+                ));
+            }
+            if !session.as_ref().is_some_and(|route| {
                 route.generation == generation
                     && !route.target.is_closed()
                     && !self.is_shutting_down()
-            })
-            .ok_or_else(|| {
-                SshMcpError::connection("SSH route changed during environment collection")
-            })?;
-        route.environment = Some(snapshot.clone());
-        Ok(snapshot)
+            }) {
+                return Err(SshMcpError::connection(
+                    "SSH route changed during startup environment collection",
+                ));
+            }
+            Ok(snapshot)
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(SshMcpError::connection("Startup environment collection cancelled")),
+            _ = self.shutdown_token.cancelled() => Err(SshMcpError::connection("SSH connection manager is shutting down")),
+            result = timeout_at(deadline, operation) => result
+                .map_err(|_| SshMcpError::Timeout(BOOTSTRAP_BUDGET.as_millis() as u64))?,
+        }
     }
 }
 
@@ -677,7 +601,7 @@ mod tests {
             let call = {
                 let manager = manager.clone();
                 let cancellation = cancellation.clone();
-                tokio::spawn(async move { manager.host_environment(false, cancellation).await })
+                tokio::spawn(async move { manager.collect_startup_environment(cancellation).await })
             };
             // A real TCP connection with no SSH greeting stalls establishment.
             let (_socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
@@ -698,29 +622,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_publication_rechecks_token_after_route_lock() {
-        let manager =
-            SshConnectionManager::new(super::super::SshConfig::new("unused.test", "test")).await;
-        let route_guard = manager.session.lock().await;
-        let cancellation = CancellationToken::new();
-        let mut publication = std::pin::pin!(manager.publish_environment(
-            1,
-            HostEnvironment::default(),
-            &cancellation
-        ));
-        // Deterministically suspend the publisher at the commit lock, then cancel.
-        std::future::poll_fn(|context| {
-            assert!(std::future::Future::poll(publication.as_mut(), context).is_pending());
-            std::task::Poll::Ready(())
-        })
+    async fn startup_deadline_includes_stalled_transport_establishment() {
+        use super::super::{HostKeyCheckMode, SshConfig};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = SshConnectionManager::new(
+            SshConfig::new("127.0.0.1", "test")
+                .with_port(listener.local_addr().unwrap().port())
+                .with_password("fixture-only")
+                .with_host_key_checking(HostKeyCheckMode::No),
+        )
         .await;
-        cancellation.cancel();
-        drop(route_guard);
-        assert!(
-            matches!(publication.await, Err(SshMcpError::Connection(message))
-            if message == "Host environment request cancelled")
-        );
-        assert!(manager.session.lock().await.is_none());
+        let started = Instant::now();
+        assert!(matches!(
+            manager
+                .collect_startup_environment(CancellationToken::new())
+                .await,
+            Err(SshMcpError::Timeout(3000))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(3500));
+        assert!(!manager.is_connected().await);
         manager.close().await;
     }
 }

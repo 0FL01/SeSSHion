@@ -16,7 +16,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::config::SshConfig;
-use super::environment::HostEnvironment;
 use super::handler::SshHandler;
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
@@ -38,7 +37,6 @@ pub(super) struct ActiveRoute {
     pub(super) target: Handle<SshHandler>,
     jump: Option<Handle<SshHandler>>,
     pub(super) generation: u64,
-    pub(super) environment: Option<HostEnvironment>,
     auto_elevation_attempted: bool,
 }
 
@@ -65,7 +63,6 @@ pub struct SshConnectionManager {
     pub(super) session: Arc<Mutex<Option<ActiveRoute>>>,
 
     next_generation: AtomicU64,
-    pub(super) environment_gate: Mutex<()>,
     pub(super) shutdown_token: CancellationToken,
     auto_elevation_lock: Mutex<()>,
     elevation_lock: Mutex<()>,
@@ -111,7 +108,6 @@ impl SshConnectionManager {
             config,
             session: Arc::new(Mutex::new(None)),
             next_generation: AtomicU64::new(1),
-            environment_gate: Mutex::new(()),
             shutdown_token: CancellationToken::new(),
             auto_elevation_lock: Mutex::new(()),
             elevation_lock: Mutex::new(()),
@@ -379,7 +375,6 @@ impl SshConnectionManager {
             target,
             jump,
             generation: self.next_generation.fetch_add(1, Ordering::SeqCst),
-            environment: None,
             auto_elevation_attempted: false,
         });
         {
@@ -1087,7 +1082,7 @@ impl SshConnectionManager {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown_token.cancel();
 
-        // Remove the route/cache before asynchronous teardown. Lock order: su -> route.
+        // Remove the route before asynchronous teardown. Lock order: su -> route.
         let (su_channel, route) = {
             let mut channel_guard = self.su_channel.lock().await;
             let mut session_guard = self.session.lock().await;

@@ -78,10 +78,6 @@ async fn run() -> Result<()> {
     // Create MCP server
     let server = SshMcpServer::new_with_spool_dir(config, spool_dir).await?;
 
-    info!("SeSSHion running on stdio");
-
-    // Keep a clone for cleanup after the MCP service has stopped.
-    let server_for_shutdown = server.clone();
     let lifecycle = CancellationToken::new();
     let signal_lifecycle = lifecycle.clone();
 
@@ -116,6 +112,12 @@ async fn run() -> Result<()> {
         }
         signal_lifecycle.cancel();
     });
+
+    // Prepare immutable instructions once, with signals already active. Optional
+    // metadata collection has one total deadline, including SSH establishment.
+    let server = server.with_startup_environment(lifecycle.clone()).await;
+    let server_for_shutdown = server.clone();
+    info!("SeSSHion running on stdio");
 
     // Start the MCP server on stdio transport
     // Note: rmcp's stdio() returns a transport that connects stdin/stdout for JSON-RPC

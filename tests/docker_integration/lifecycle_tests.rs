@@ -11,6 +11,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use testcontainers::core::ExecCommand;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
@@ -105,7 +106,7 @@ impl McpProcess {
         .expect("timed out waiting for MCP response")
     }
 
-    async fn initialize(&mut self) {
+    async fn initialize(&mut self) -> Value {
         self.send(json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -128,6 +129,7 @@ impl McpProcess {
             "params": {}
         }))
         .await;
+        response
     }
 
     fn signal(&self, signal: Signal) {
@@ -252,7 +254,7 @@ async fn modern_stdio_discovery_and_tool_results() {
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["resultType"], "complete");
     let tools = response["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 6);
     assert!(tools.iter().any(|tool| tool["name"] == "check_process"));
 
     process
@@ -305,7 +307,6 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
             "check_process",
             "transfer",
             "apply_patch",
-            "host_environment",
         ]
     );
 
@@ -330,7 +331,7 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
 }
 
 #[tokio::test]
-async fn host_environment_errors_keep_mcp_alive_and_tool_surface_stable() {
+async fn startup_environment_unavailable_ssh_keeps_init_and_tools_working() {
     for disable_sudo in [false, true] {
         let mut auth = vec![
             OsString::from("--user=test"),
@@ -341,36 +342,32 @@ async fn host_environment_errors_keep_mcp_alive_and_tool_surface_stable() {
             auth.push(OsString::from("--disable-sudo"));
         }
         let mut process = McpProcess::spawn_with_auth("127.0.0.1", 9, None, None, &auth).await;
-        process.initialize().await;
+        let initialized = process.initialize().await;
+        let instructions = initialized["result"]["instructions"].as_str().unwrap();
+        let snapshot: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
+        assert_eq!(snapshot.as_object().unwrap().len(), 12);
+        assert!(snapshot.as_object().unwrap().values().all(Value::is_null));
         process
             .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
             .await;
         let before = process.response(2).await["result"].clone();
         assert_eq!(
             before["tools"].as_array().unwrap().len(),
-            if disable_sudo { 5 } else { 7 }
+            if disable_sudo { 4 } else { 6 }
         );
         process
             .send(
                 json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
-                    "name":"host_environment", "arguments":{"refresh":"false"}
-                }}),
-            )
-            .await;
-        assert_eq!(process.response(3).await["error"]["code"], -32602);
-        process
-            .send(
-                json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{
                     "name":"host_environment", "arguments":{}
                 }}),
             )
             .await;
-        let error = process.response(4).await;
-        assert!(
-            error.get("error").is_none(),
-            "transport failure must be a tool error: {error}"
+        let unknown = process.response(3).await;
+        assert_eq!(unknown["error"]["code"], -32602);
+        assert_eq!(
+            unknown["error"]["message"],
+            "Unknown tool: host_environment"
         );
-        assert_eq!(error["result"]["isError"], true);
         process
             .send(json!({"jsonrpc":"2.0", "id":5, "method":"ping", "params":{}}))
             .await;
@@ -385,7 +382,7 @@ async fn host_environment_errors_keep_mcp_alive_and_tool_surface_stable() {
 }
 
 #[tokio::test]
-async fn host_environment_stdio_snapshots_are_structured_stable_and_prefix_friendly() {
+async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool() {
     init_test_env().unwrap();
     let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
         .with_exposed_port(2222u16.into())
@@ -395,45 +392,115 @@ async fn host_environment_stdio_snapshots_are_structured_stable_and_prefix_frien
     let host = container.get_host().await.unwrap().to_string();
     let port = container.get_host_port_ipv4(2222).await.unwrap();
     wait_for_tcp(&host, port).await;
-    let mut process = McpProcess::spawn(&host, port).await;
-    process.initialize().await;
-    process
-        .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
-        .await;
-    let definitions = process.response(2).await["result"].clone();
-    let mut previous = None;
-    for (id, arguments) in [
-        (3, json!({})),
-        (4, json!({})),
-        (5, json!({"refresh":true})),
-        (6, json!({})),
-    ] {
-        process
-            .send(
-                json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
-                    "name":"host_environment", "arguments":arguments
-                }}),
-            )
-            .await;
-        let response = process.response(id).await;
-        assert!(response.get("error").is_none(), "{response}");
-        assert_eq!(response["result"]["isError"], false);
-        assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
-        let snapshot: Value = serde_json::from_str(tool_text(&response)).unwrap();
-        assert_eq!(response["result"]["structuredContent"], snapshot);
-        assert_eq!(snapshot.as_object().unwrap().len(), 12);
-        assert_eq!(snapshot["effective_uid"], 1000);
-        if id == 4 || id == 6 {
-            assert_eq!(previous.as_ref(), Some(&response["result"]));
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name":"snapshot-test", "version":"1"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    for (modern, failed_startup) in [(false, false), (true, false), (true, true)] {
+        if failed_startup {
+            let mut changed = container
+                .exec(ExecCommand::new([
+                    "sh",
+                    "-c",
+                    "printf 'test:temporarily-unavailable\\n' | chpasswd",
+                ]))
+                .await
+                .unwrap();
+            changed.stdout_to_vec().await.unwrap();
+            assert_eq!(changed.exit_code().await.unwrap(), Some(0));
         }
-        previous = Some(response["result"].clone());
+        let mut process = McpProcess::spawn(&host, port).await;
+        let initial = if modern {
+            process.send(json!({"jsonrpc":"2.0", "id":1, "method":"server/discover", "params":{"_meta":meta}})).await;
+            process.response(1).await
+        } else {
+            process.initialize().await
+        };
+        let instructions = initial["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let snapshot: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
+        assert_eq!(snapshot.as_object().unwrap().len(), 12);
+        if failed_startup {
+            assert!(snapshot.as_object().unwrap().values().all(Value::is_null));
+            let mut changed = container
+                .exec(ExecCommand::new([
+                    "sh",
+                    "-c",
+                    "printf 'test:secret\\n' | chpasswd",
+                ]))
+                .await
+                .unwrap();
+            changed.stdout_to_vec().await.unwrap();
+            assert_eq!(changed.exit_code().await.unwrap(), Some(0));
+        } else {
+            assert_eq!(snapshot["effective_uid"], 1000);
+            assert_eq!(snapshot["running_as_root"], false);
+            assert_eq!(snapshot["os"], "Linux");
+        }
+        let metadata = if modern {
+            json!({"_meta": meta})
+        } else {
+            json!({})
+        };
+        process
+            .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":metadata}))
+            .await;
+        let definitions = process.response(2).await["result"].clone();
+        assert_eq!(definitions["tools"].as_array().unwrap().len(), 6);
+        assert!(serde_json::to_vec(&definitions["tools"]).unwrap().len() <= 3200);
+        for id in 3..5 {
+            let mut params = metadata.clone();
+            params["name"] = json!("shell");
+            params["arguments"] = json!({"command":"printf wire"});
+            process
+                .send(json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":params}))
+                .await;
+            let response = process.response(id).await;
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(tool_text(&response), "wire");
+        }
+        if modern {
+            process
+                .send(
+                    json!({"jsonrpc":"2.0", "id":5, "method":"server/discover", "params":metadata}),
+                )
+                .await;
+            assert_eq!(
+                process.response(5).await["result"]["instructions"],
+                instructions
+            );
+        }
+        process
+            .send(json!({"jsonrpc":"2.0", "id":6, "method":"tools/list", "params":metadata}))
+            .await;
+        assert_eq!(process.response(6).await["result"], definitions);
+        process.close_stdin().await;
+        process.assert_successful_exit().await;
     }
-    process
-        .send(json!({"jsonrpc":"2.0", "id":7, "method":"tools/list", "params":{}}))
-        .await;
-    assert_eq!(process.response(7).await["result"], definitions);
-    process.close_stdin().await;
-    process.assert_successful_exit().await;
+}
+
+#[tokio::test]
+async fn startup_environment_signals_cancel_stalled_ssh_before_mcp_serving() {
+    for signal in [Signal::SIGTERM, Signal::SIGINT] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut process =
+            McpProcess::spawn("127.0.0.1", listener.local_addr().unwrap().port()).await;
+        // Cancel while startup is awaiting the SSH greeting.
+        let (_socket, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        process.signal(signal);
+        process.assert_successful_exit().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "signal did not cancel bootstrap"
+        );
+    }
 }
 
 #[tokio::test]

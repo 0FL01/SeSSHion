@@ -1,238 +1,186 @@
-# Goal: rootless host environment snapshot
+# Goal: rootless startup environment in MCP instructions
 
-Status: complete
-Source: user request for remote environment information, the reviewed plan, and
-“делай копию плана в goal и итеративно реализовать и коммит билд, без пуша”.
+Status: active
+Source: user rejected the environment tool, approved the startup-instructions
+plan after recon, then instructed “Утверждаю реализовать и коммит билд”.
 Last updated: 2026-09-28
 
 ## Objective
 
-Ship a bounded, rootless `host_environment` MCP tool with graceful Linux
-fallbacks, a session-scoped snapshot cache, and a stable model-visible prefix;
-verify the implementation, build the release binary, and commit without pushing.
+Remove the `host_environment` MCP tool and deliver the same bounded, rootless
+environment snapshot automatically in immutable init/discovery instructions.
+Verify the change, build the release binary and commit locally without pushing.
 
 ## Execution Directive
 
 Complete the frozen Required Outcomes using the listed Change Envelope and
 Primary Evidence. Work on the smallest unresolved outcome. Do not add requirements
-from reviews, tests, tools, speculative risks, or optional source text. Finish when
+from reviews, tests, tools, speculative risks or optional source text. Finish when
 every required outcome is resolved and affected constraints remain satisfied.
 
 ## Frozen Contract
 
 ### Required Outcomes
 
-- R1: The explicit read-only `host_environment({refresh:false})` tool reports all
-  requested fields as one normalized JSON object; missing or malformed values
-  become `null`, not crashes or invented defaults.
-  - Source: original rootless/fallback request; corrected plan, sections 1 and 3.
-  - Acceptance: strict optional boolean `refresh`; fixed nullable fields; one
-    compact text JSON and identical `structuredContent`; independent fallbacks.
-  - Primary evidence: parser/source tests and real Debian, Fish, BusyBox smoke.
+- R1: Remove the environment tool and deliver all 12 nullable snapshot fields in
+  the existing MCP `instructions` via both `initialize` and `server/discover`.
+  - Source: approved plan, steps 1 and 3.
+  - Acceptance: previous 6 tools / 4 with disable-sudo, original order and 3200-byte
+    tool budget; no environment schema/handler/arguments/wrapper; compact JSON data
+    plus a short semantic note, preserving the existing user-facing error policy.
+  - Primary evidence: real stdio init/discovery and exact surface tests.
   - Status: verified
-  - Evidence: parser/strict-argument/JSON tests pass; real Debian/Fish SSH and
-    genuine Alpine/BusyBox probe smoke pass, including missing/unreadable sources.
-- R2: Collection never initiates `su`/`sudo`, including cold connect/reconnect,
-  and preserves existing callers' configured automatic elevation behavior.
-  - Source: rootless request; corrected plan, section 2.
-  - Acceptance: ordinary exec without PTY on the shared route; deferred legacy
-    auto-elevation once per route when the probe established transport first.
-  - Primary evidence: configured-elevation cold/reconnect and legacy-call tests.
+  - Evidence: library surface is 3192 bytes within 3200; real stdio tests verify
+    initialize/discover JSON, absence of the environment tool and 6/4 definitions.
+- R2: Startup collection never initiates su/sudo, including cold establishment;
+  subsequent ordinary commands preserve configured automatic elevation.
+  - Source: original rootless request; approved plan, steps 2 and 5.
+  - Acceptance: same shared manager, ordinary non-PTY POSIX probe; retain deferred
+    legacy auto-su and generation safety; root login may honestly report UID 0.
+  - Primary evidence: configured-su/sudo startup followed by a legacy command.
   - Status: verified
-  - Evidence: cold and invalidated/reconnected probes with configured su/sudo
-    leave invocation counters empty; legacy exec then initializes su exactly once
-    and executes with UID 0; a later probe still reports UID 1000.
-- R3: Bounded collection preserves completed fields on metadata timeout/flood;
-  cancellation and detected transport errors do not publish a fresh snapshot;
-  metadata failures do not break the healthy SSH session or MCP process.
-  - Source: fallback request; corrected plan, section 4.
-  - Acceptance: one absolute 3-second budget after transport establishment,
-    including gate/slot waits and cleanup; cancellation from connect onward;
-    byte caps before accumulation/parsing and complete framed records only.
-  - Primary evidence: hang/flood/partial/cancellation tests followed by a command,
-    and MCP tool-error followed by ping/tools-list.
+  - Evidence: controlled su/sudo fixture records no startup elevation; the next
+    ordinary command initializes su once and runs as UID 0.
+- R3: One 3-second bootstrap deadline includes SSH connect/auth/retries and probe
+  waits/read/cleanup; missing, malformed and unreadable sources degrade to null.
+  - Source: original fallback request; approved plan, step 2.
+  - Acceptance: bounded bytes and completed-record partials; transport failure or
+    establishment timeout yields an unknown snapshot without failing MCP startup;
+    lifecycle cancellation/signals interrupt bootstrap; healthy SSH survives
+    optional metadata timeout/flood and remains usable by the next command.
+  - Primary evidence: stalled-connect, source/partial/flood/cancellation and stdio
+    startup-recovery/lifecycle tests; existing Debian/Fish and real BusyBox smoke.
   - Status: verified
-  - Evidence: real SSH hang/stdout-flood/stderr-flood/partial, gate/slot budget,
-    cancellation and next-command tests pass; stalled TCP establishment is
-    cancellable and releases connection ownership; stdio tool error preserves ping/list.
-- R4: Cache belongs to the actual route generation; misses coalesce; refresh
-  fully replaces values, including new nulls; reconnect invalidates lazily;
-  stale producers cannot publish into a new route.
-  - Source: corrected plan, section 5.
-  - Acceptance: one collector gate and snapshot; atomic generation/cache access;
-    no session mutex during collection; failed refresh retains old cache only as
-    old cache, never as a successful refreshed result; shutdown is terminal.
-  - Primary evidence: cache/refresh/cancellation and deterministic generation-race tests.
+  - Evidence: 9 probe tests, 7 targeted startup tests and all 11 lifecycle tests
+    pass, including 3-second stalled connect, hang/flood/partial/null, signals,
+    Fish, and real auth rejection followed by command recovery with frozen nulls.
+- R4: Collect once in CLI startup and freeze the final instructions before MCP
+  serving. No SSH-session snapshot cache, refresh argument or collector gate remains.
+  - Source: approved plan, steps 2, 4 and 5.
+  - Acceptance: repeated bootstrap preparation does not recollect; init/discovery
+    only read prepared instructions. Commands/reconnect do not change them; new
+    process startup recollects. Initially unknown fields stay unknown for this run.
+  - Primary evidence: controlled probe counter and byte-stability after reconnect.
   - Status: verified
-  - Evidence: eight concurrent misses collect once; refresh replaces CPU with
-    null; cancelled refresh preserves prior cache; reconnect recollects; controlled
-    in-flight producer cannot publish after route removal; shutdown is terminal.
-- R5: Instructions and tool definitions/order are byte-stable for fixed config
-  through collection, refresh, reconnect and errors; snapshots are tool results
-  only, deterministic and free of volatile cache/monitoring metadata.
-  - Source: “важно не забыть про кеш friendly, шо бы kv кеш не ломать при работе”;
-    corrected plan, section 6.
-  - Acceptance: static appended tool and usage note, no list-changed push or
-    dynamic instructions; documented append-only delivery and client/provider limits.
-  - Primary evidence: MCP surface/result stability and measured wire-budget tests.
+  - Evidence: probe counter remains 1 after repeated preparation, commands and
+    reconnect; instructions are identical. A fresh server startup recollects.
+- R5: Preserve KV-friendly steady-state instructions and static tool definitions;
+  document startup snapshot semantics and client/provider cache boundaries.
+  - Source: user's KV-cache requirement; approved plan, steps 3, 4 and 6.
+  - Acceptance: deterministic compact JSON with no timestamps, elapsed time,
+    cache-hit or generation IDs; values labeled data, SSH-user probe context, CPU
+    estimate and potentially stale; README/AGENTS/this goal describe the new UX.
+  - Primary evidence: deterministic rendering and real init/discovery byte tests.
   - Status: verified
-  - Evidence: real stdio cached/refresh snapshots preserve JSON/text bytes and
-    definitions; both sudo configurations retain exact definitions after errors;
-    instructions unchanged across collect/refresh/reconnect/elevation. Wire surface
-    is 3513/3520 bytes. README documents append-only/client/provider limits.
-- R6: Save this plan, pass relevant gates, produce a release build and local
-  conventional commit(s), without pushing or committing generated binaries.
-  - Source: latest user implementation/build/commit request; repository commit style.
-  - Acceptance: successful fmt, clippy, all-features tests/check and release build;
-    goal complete with current evidence; intended source/docs/tests committed.
-  - Primary evidence: gate output, git diff/status and local commit log.
-  - Status: verified
-  - Evidence: plan saved; fmt, clippy, all-features tests/check and release build
-    passed. Native binary reports `ssh-mcp 5.0.1`. Implementation committed locally
-    as `8238745`; clean worktree confirmed immediately afterwards; no push performed.
+  - Evidence: prepared JSON and real discovery bytes remain stable; README/AGENTS
+    now document automatic startup data, frozen freshness and cache boundaries.
+- R6: Pass fmt, strict clippy, all-features tests/check and release build; record
+  current evidence and intended source/docs/test commits, without push or binaries.
+  - Source: user approval/build/commit request; previous no-push constraint and
+    repository commit style.
+  - Primary evidence: actual gate outputs, release version smoke, git diff/status/log.
+  - Status: in_progress
+  - Evidence: fmt check, strict all-target/all-feature clippy, full tests/check,
+    release build and version smoke passed. Commit/durable closure remain.
 
 ### Constraints
 
-- Follow KISS/YAGNI/Pareto, existing Rust types, error model and MCP behavior.
-- Rootless means no elevation above the SSH login user; root login may report UID 0.
-- Snapshot describes the probe's namespaces/rootfs and running POSIX `sh`, not
-  the physical host, login shell or elevated persistent shell.
-- SSH establishment uses its existing timeout/retry policy, outside the metadata
-  budget. Closing the probe channel is best-effort, not a descendant-kill guarantee.
-- No push; preserve unrelated work; no secrets or generated artifacts in commits.
+- KISS/YAGNI/Pareto; reuse the existing probe, parsers, byte caps and rootless seam.
+- Fixed fields: hostname, os, distribution, kernel_release, machine_architecture,
+  process_architecture, pointer_width, available_cpu_parallelism, effective_uid,
+  effective_gid, running_as_root, shell_executable. Unknown UID means unknown root.
+- Describe probe namespaces/rootfs and non-login sh, not necessarily the physical
+  host, account login shell or elevated commands. CPU is a best-effort nproc estimate.
+- Parse os-release as data, never source/eval; use /usr only when /etc is absent.
+- Preserve ordinary SSH timeout/auth/host-key policies; only optional bootstrap is
+  capped at 3 seconds. Channel close is best-effort, not guaranteed descendant kill.
+- Keep lazy library construction; the CLI prepares instructions before serving.
+- Preserve existing user edits to docker-compose.yml and opencode.jsonc.
+- No push, actual secrets, generated artifacts, dependencies or version bump.
 
 ### Non-goals
 
-No startup collection, background refresh, TTL/disk/global cache, subscriptions,
-delta/ETag protocol, XML renderer, outputSchema, additional SSH session, new
-dependency, generic scheduler/transport redesign, full cgroup quota calculation,
-legacy distro release database, or new CI job. Provider cache hits and client
-history rewriting/compaction are outside the server's control.
+No replacement tool/resource/prompt, automatic refresh, TTL/disk cache, background
+collector, provider cache settings, added CLI configuration, client configuration
+edits, general lifecycle redesign, new dependencies or CI job.
 
-## Copy of the Corrected Plan
+## Copy of the Approved Plan
 
-1. Add one static read-only tool at the end of the existing tool list, with strict
-   `refresh` validation (default false), fixed fields and `CallToolResult::structured`.
-   Add only a fixed usage note to existing instructions.
-2. Separate transport establishment from best-effort automatic `su` initialization.
-   Probe uses the same manager and an ordinary non-PTY channel; legacy callers
-   initialize deferred automatic elevation once per actual route generation.
-3. Use minimal independent sources (all unknowns are JSON null):
-
-   | Field | Source / fallback |
-   | --- | --- |
-   | hostname | `uname -n`, `/proc/sys/kernel/hostname` |
-   | os | `uname -s`, `/proc/sys/kernel/ostype` |
-   | distribution | `/etc/os-release`; `/usr/lib/os-release` only if primary absent; parse PRETTY_NAME, NAME/version, ID in Rust, never source/eval |
-   | kernel_release | `uname -r`, `/proc/sys/kernel/osrelease` |
-   | machine_architecture | `uname -m` (kernel-reported, not proven physical ISA) |
-   | process_architecture / pointer_width | bounded ELF header of `/proc/$$/exe`; small supported Linux ABI allowlist |
-   | available_cpu_parallelism | positive `nproc` estimate after clearing OMP_NUM_THREADS / OMP_THREAD_LIMIT |
-   | effective_uid / effective_gid | `id -u` / `id -g`; effective (second) ID in `/proc/$$/status` |
-   | running_as_root | derived from known UID; null if UID unknown |
-   | shell_executable | `readlink /proc/$$/exe`, not `$SHELL` or `command -v sh` |
-
-4. Run a fixed POSIX non-login probe with framed records and explicit completion
-   status; cap raw stdout/stderr and individual values/files independently of
-   max_output_tokens. Preserve valid completed records if later collection fails
-   locally. One absolute metadata budget includes gate/slot/open/exec/read/cleanup.
-   Cancellation applies from outset; real detected transport/auth failure is an
-   ordinary tool error, while optional metadata failures are channel-local.
-5. Store one snapshot on the route and use one collection mutex. Recheck false
-   misses under the gate; serialize true refreshes; replace the entire snapshot.
-   Capture generation with the opened channel and check it atomically with
-   publication under the route lock. Never lock the route throughout collection.
-   Reconnect invalidates lazily; cancellation/failed transport cannot erase or
-   falsely refresh old cache. Shutdown prevents late publication.
-6. Keep discovery/instructions/tool schemas and order immutable for fixed
-   version/config. Return only full deterministic snapshots, not timestamps,
-   generation IDs, cache-hit flags or monitoring data. New results semantically
-   supersede older results without replacing historical messages. No snapshot
-   repetition in shell responses; no tools/list_changed for environment changes.
-7. Keep production changes focused on `ssh/environment.rs`, the thin
-   `handlers/host_environment.rs`, transport/cache lifecycle in `connection.rs`,
-   tool registration/module wiring and argument validation. Change `command.rs`
-   only if needed for the narrow transport seam; no general cache framework.
-8. Verify parser/fallback/unknown/ELF behavior; timeout/flood/partial/cancellation;
-   cold/reconnect rootless collection and legacy elevation; cache concurrency,
-   refresh and stale-publication race; static MCP/KV surface and JSON compatibility.
-   Reuse Debian/Fish fixtures, add genuine BusyBox smoke, mostly synthetic failure
-   tests, and measure the necessary extension of the existing 3200-byte tool budget.
+1. Remove tool definition/schema, dispatch, arguments, handler, wrappers and the
+   usage note. Restore the original 6/4 tools, order and 3200-byte budget.
+2. After constructing the server, install lifecycle cancellation/signals, collect
+   once with one 3-second total deadline including connect/auth, then serve MCP.
+   Unknown/partial metadata does not fail startup; cancellation stops startup work.
+3. Combine the existing instructions with one short snapshot note and compact JSON;
+   store the completed instructions string. Both init and discovery read it.
+4. Freeze the string for the process lifetime, including SSH reconnect. Recollect
+   only on a new process start; no timestamp/volatile metadata or prefix rewriting.
+5. Retain HostEnvironment, probe, bounds and parsers; remove refresh/session cache,
+   collector gate/cache publication and obsolete tests. Retain transport-only
+   connection and deferred auto-su needed by startup and subsequent legacy callers.
+6. Adapt init/discovery/surface, rootless, fallback, partial/flood/cancellation,
+   lifetime-stability and Debian/Fish/BusyBox tests. Update docs/goal, run gates,
+   build release and make local conventional commits without pushing.
 
 ## Change Envelope
 
-- Target: environment snapshot tool, directly affected SSH/MCP lifecycle and tests.
-- Expected paths: `src/ssh/{environment,connection,command,mod}.rs`,
-  `src/server.rs`, `src/server/{tools,args,testing}.rs`,
-  `src/server/handlers/{host_environment,mod}.rs`, directly relevant tests and
-  fixtures, `README.md`, `AGENTS.md`, this goal.
-- Allowed: focused source/tests/documentation changes and existing local Docker
-  fixtures. Forbidden: binaries/logs/secrets, dependency/framework expansion,
-  unrelated fixes, release/version bump and push.
+- Target: bootstrap environment delivery and directly affected SSH/MCP/tests/docs.
+- Paths: src/main.rs, src/server.rs, src/server/{args,tools,testing}.rs,
+  src/server/handlers/{host_environment,mod}.rs, src/ssh/{environment,connection}.rs,
+  directly affected tests, README.md, AGENTS.md, this goal.
+- Allowed: focused production/test/documentation edits using existing fixtures.
+  Forbidden: modifying/staging existing client/Compose changes, generated binaries,
+  new dependency/framework/configuration surface, unrelated fixes, release bump, push.
 
 ## Current Checkpoint
 
-- Closed: R1–R6; frozen finish line and affected invariants verified.
-- No further substantive work. This completion record is the only follow-up to
-  the verified implementation commit; no push.
+- Closes: R6.
+- Smallest next action: stage and commit the 14 reviewed implementation/docs/test
+  files, then record the actual commit and close the goal.
+- Expected evidence: only approved files are committed; the two existing user
+  configuration changes remain unchanged and unstaged; no push occurs.
+- Replan if: hooks alter the verified source or reject the intended commit.
 
 ## Current State
 
-- Resolved: R1–R6 verified; implementation, public documentation and local build complete.
-- Last relevant evidence: `cargo fmt --all -- --check`,
-  `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test --all-features --verbose` (308 passed, 4 pre-existing ignored),
-  `cargo check --all-features --verbose`, `cargo build --release --all-features`,
-  and `target/release/ssh-mcp --version` all pass. All 80 Docker integration tests pass.
+- Resolved: R1–R5; tool/cache removed, bounded startup preparation and immutable
+  instructions installed; documentation updated.
+- Last relevant evidence: all required gates passed; 305 tests passed (197 library,
+  15 compact-response, 79 Docker, 5 integration, 3 logging, 6 doctests), 4 previous
+  ignored tests unchanged. Native release version smoke reports ssh-mcp 5.0.1.
 - Blocker: none.
-- Next: none; objective complete.
+- Next: local implementation commit and durable closure commit, without push.
 
 ## Material Decisions
 
-- 2026-09-28: Use existing `Docs/goal/` convention. “коммит билд” means commit
-  verified implementation, not ignored compiled binaries; no push.
-- 2026-09-28: Freeze the audited explicit-tool plan; unknown fields stay null,
-  CPU is explicitly an estimate, no incidental auto-elevation on probe connect.
+- 2026-09-28: User rejected explicit-tool UX after commits 8238745/c330440.
+  Their tool/refresh/cache criteria are superseded by the approved startup plan;
+  preserve the useful probe/rootless implementation and previous git history.
+- 2026-09-28: Snapshot remains frozen across SSH reconnect and may be stale or
+  unknown until process restart. This is the approved KV-friendly freshness tradeoff.
+- 2026-09-28: “коммит билд” means commit verified source/docs/tests; the ignored
+  native binary stays local and no push is performed.
 
 ## Checkpoint History
 
-- 2026-09-28: R6 started: saved contract before implementation; tooling available.
-- 2026-09-28: R1–R5 first checkpoint: six parser/source tests, two argument/JSON
-  tests and the updated static tool budget pass. Compiler required an explicit
-  internal error type; fixed without changing error semantics or dependencies.
-- 2026-09-28: R1–R4 runtime checkpoint: seven SSH/stdio scenarios pass, including
-  source fallbacks, rootless cold/reconnect, deferred elevation, cache/race and bounded
-  failures. Fixture readiness now checks the SSH greeting (TCP accept was too early
-  for Fish); legacy UID assertion accounts for existing PTY terminal prefixes.
-  Clippy identified ambiguous NUL-plus-digit test literals; disambiguated with hex.
-- 2026-09-28: R5 verified: successful real stdio structured snapshots/cache/refresh
-  leave definitions unchanged; unavailable-host errors preserve MCP ping/list in
-  both sudo configurations. All-target/all-feature clippy passes without allowances.
-- 2026-09-28: R6 validation checkpoint: mandatory full gates pass, including
-  all 80 Docker integrations. Release binary built at `target/release/ssh-mcp`
-  and version smoke passed. Diff/whitespace reviewed; no dependencies, release
-  version changes, generated binaries, actual credentials or unrelated files added.
-- 2026-09-28: Closure check identified a poll-time cancellation window between
-  the outer select and cache publication. Recheck the token under the route lock
-  before commit; a deterministic lock/poll test passes. All mandatory gates and
-  release build repeated successfully after this final code change (308 passed,
-  including all 80 Docker integrations; no failed tests or new ignored tests).
-- 2026-09-28: Closure passed against R1–R6 and the frozen change envelope.
-  Feature commit `8238745` contains only the 15 intended source/docs/test files;
-  post-commit worktree is clean. This completion record does not alter built code.
+- 2026-09-28: Saved revised approved contract before editing production code.
+- 2026-09-28: Replaced tool/cache with startup preparation. Targeted probe, rootless,
+  init/discovery, lifetime-stability, partial/fallback and signal evidence is green;
+  surface restored to 3192 bytes / 6 tools (4 without sudo). No client/Compose edits.
+- 2026-09-28: Auth-recovery fixture initially inspected Docker exec before completion
+  (exit_code=None); awaiting stdout EOF fixed the fixture. All 11 lifecycle tests
+  and strict clippy then passed; startup nulls stay frozen after successful recovery.
+- 2026-09-28: Full fmt/clippy/tests/check/release build succeeded. Diff review found
+  only the 14 approved files; client/Compose diff hash matches the initial state.
 
 ## Completion
 
-- Resolved outcomes: R1–R6 verified; no blocker.
-- Commands: fmt check, all-target/all-feature clippy with `-D warnings`,
-  all-features tests/check, release build, binary version smoke and git diff checks
-  all passed after the final implementation change.
-- Test results: 308 passed (199 library, 15 compact-response, 80 Docker, 5 integration,
-  3 logging, 6 doctests); four pre-existing ignored tests unchanged. Debian/Fish
-  real SSH and genuine Alpine/BusyBox smoke passed; static tool surface 3513/3520 bytes.
-- Artifacts: local implementation commit `8238745`; native release binary
-  `target/release/ssh-mcp` (version 5.0.1), intentionally not committed.
-- Constraint and diff-scope check: within the frozen envelope; no new dependencies,
-  framework, version bump, runtime discovery mutations, actual secrets, generated
-  artifacts or unrelated changes committed. No push performed.
-- Final status: complete.
+- Resolved outcomes: not yet complete.
+- Commands: `cargo fmt --all -- --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-features --verbose`, `cargo check --all-features --verbose`,
+  `cargo build --release --all-features`, `target/release/ssh-mcp --version` passed.
+- Artifact: `target/release/ssh-mcp`, version 5.0.1; ignored binary stays local.
+- Constraint and diff-scope check: approved envelope only; no dependency/version
+  changes, actual secrets or artifacts; original client/Compose edits untouched.
+- Final status: active.

@@ -1,9 +1,9 @@
-//! Real SSH coverage for the rootless snapshot/cache and channel-local failures.
+//! Startup-only rootless metadata, immutable instructions and bounded failures.
 
 use super::common::*;
 use rmcp::ServerHandler;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use testcontainers::{ContainerAsync, core::ExecCommand};
 use tokio::io::AsyncReadExt;
 use tokio::time::{Instant, timeout};
@@ -76,7 +76,7 @@ async fn control(container: &ContainerAsync<GenericImage>, script: &str) -> Stri
     String::from_utf8(bytes).unwrap()
 }
 
-async fn server(container: &ContainerAsync<GenericImage>, su: bool) -> SshMcpServer {
+async fn unprepared_server(container: &ContainerAsync<GenericImage>, su: bool) -> SshMcpServer {
     let mut config = config(
         container.get_host().await.unwrap().to_string(),
         container.get_host_port_ipv4(2222).await.unwrap(),
@@ -88,21 +88,9 @@ async fn server(container: &ContainerAsync<GenericImage>, su: bool) -> SshMcpSer
     SshMcpServer::new(config).await.unwrap()
 }
 
-async fn snapshot(server: &SshMcpServer, refresh: bool) -> Value {
-    let result = server
-        .test_host_environment(refresh, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(
-        result.is_error,
-        Some(false),
-        "{}",
-        extract_text_from_result(&result)
-    );
-    assert_eq!(result.content.len(), 1);
-    let text: Value = serde_json::from_str(&extract_text_from_result(&result)).unwrap();
-    assert_eq!(result.structured_content.as_ref(), Some(&text));
-    text
+fn snapshot(server: &SshMcpServer) -> Value {
+    let instructions = server.get_info().instructions.unwrap();
+    serde_json::from_str(instructions.lines().last().unwrap()).unwrap()
 }
 
 async fn working_command(server: &SshMcpServer) {
@@ -114,7 +102,6 @@ async fn working_command(server: &SshMcpServer) {
     assert_eq!(output.stdout.trim(), "OK");
 }
 
-// Test-controlled utility behavior, without adding arbitrary commands to the tool.
 const FIXTURE: &str = r#"
 set -eu
 mkdir -p /home/test/probebin
@@ -144,7 +131,6 @@ case $(cat /home/test/probe-mode) in
         printf 7;;
   hang) /bin/sleep 20;;
   flood) /usr/bin/head -c 131072 /dev/zero | /usr/bin/tr '\000' x;;
-  stderr) /usr/bin/head -c 131072 /dev/zero >&2;;
   malformed) printf bad;;
   missing) exit 127;;
   *) printf 7;;
@@ -154,27 +140,8 @@ chmod +x /home/test/probebin/*
 chown -R test:test /home/test/probebin /home/test/probe-* /home/test/.bashrc
 "#;
 
-async fn entered(container: &ContainerAsync<GenericImage>) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if control(
-                container,
-                "if [ -e /home/test/probe-entered ]; then printf yes; fi",
-            )
-            .await
-                == "yes"
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("probe did not reach controlled barrier");
-}
-
 #[tokio::test]
-async fn host_environment_smoke_rootless_cold_reconnect_and_legacy_elevation() {
+async fn startup_environment_is_rootless_once_and_frozen_across_commands_reconnect() {
     let container = container("ssh-mcp-debian-sshd").await;
     control(&container, FIXTURE).await;
     control(
@@ -195,53 +162,42 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
 "#,
     )
     .await;
-    let server = server(&container, true).await;
+    let server = unprepared_server(&container, true)
+        .await
+        .with_startup_environment(CancellationToken::new())
+        .await;
     let instructions = serde_json::to_vec(&server.get_info()).unwrap();
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    assert_eq!(
-        server
-            .test_host_environment(false, cancelled)
-            .await
-            .unwrap()
-            .is_error,
-        Some(true)
-    );
+    let value = snapshot(&server);
+    assert_eq!(value.as_object().unwrap().len(), 12);
+    assert_eq!(value["hostname"], "initial");
+    assert_eq!(value["os"], "Linux");
+    assert!(value["distribution"].as_str().unwrap().contains("Debian"));
+    assert_eq!(value["effective_uid"], 1000);
+    assert_eq!(value["effective_gid"], 1000);
+    assert_eq!(value["running_as_root"], false);
+    assert_eq!(value["pointer_width"], 64);
+    assert_eq!(value["available_cpu_parallelism"], 7);
     assert!(
-        !server.connection().is_connected().await,
-        "pre-cancelled probe must not connect"
+        value["shell_executable"]
+            .as_str()
+            .unwrap()
+            .ends_with("dash")
     );
-    for _ in 0..2 {
-        let value = snapshot(&server, false).await;
-        assert_eq!(value["hostname"], "initial");
-        assert_eq!(value["os"], "Linux");
-        assert!(value["distribution"].as_str().unwrap().contains("Debian"));
-        assert_eq!(value["effective_uid"], 1000);
-        assert_eq!(value["effective_gid"], 1000);
-        assert_eq!(value["running_as_root"], false);
-        assert_eq!(value["pointer_width"], 64);
-        assert_eq!(value["available_cpu_parallelism"], 7);
-        assert!(
-            value["shell_executable"]
-                .as_str()
-                .unwrap()
-                .ends_with("dash")
-        );
-        assert!(!server.connection().is_elevated());
-        assert_eq!(
-            control(
-                &container,
-                "test ! -e /home/test/su-calls; test ! -e /home/test/sudo-calls"
-            )
-            .await,
-            ""
-        );
-        server
-            .connection()
-            .invalidate_session("test rootless reconnect")
-            .await;
-    }
-    snapshot(&server, false).await;
+    assert!(!server.connection().is_elevated());
+    control(
+        &container,
+        "test ! -e /home/test/su-calls; test ! -e /home/test/sudo-calls",
+    )
+    .await;
+
+    control(&container, "printf changed > /home/test/probe-host").await;
+    let server = server
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    assert_eq!(
+        serde_json::to_vec(&server.get_info()).unwrap(),
+        instructions
+    );
     let output = server
         .connection()
         .exec_command("id -u", Duration::from_secs(5))
@@ -251,7 +207,7 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
         server.connection().is_elevated(),
         "legacy command must initialize deferred su"
     );
-    // PTY-backed legacy execution may retain bracketed-paste terminal prefixes.
+    // Preserve existing PTY terminal prefixes in the legacy execution contract.
     assert_eq!(output.stdout.trim_end().rsplit('\r').next(), Some("0"));
     assert_eq!(
         control(&container, "wc -c < /home/test/su-calls")
@@ -259,188 +215,118 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
             .trim(),
         "1"
     );
-    snapshot(&server, true).await;
-    assert_eq!(
-        snapshot(&server, false).await["effective_uid"],
-        1000,
-        "probe must bypass existing su channel"
-    );
+    server.connection().reconnect().await.unwrap();
     assert_eq!(
         serde_json::to_vec(&server.get_info()).unwrap(),
         instructions
     );
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn host_environment_cache_refresh_concurrency_and_generation_race() {
-    let container = container("ssh-mcp-debian-sshd").await;
-    control(&container, FIXTURE).await;
-    let server = Arc::new(server(&container, false).await);
-    let mut tasks = tokio::task::JoinSet::new();
-    let barrier = Arc::new(tokio::sync::Barrier::new(9));
-    for _ in 0..8 {
-        let server = server.clone();
-        let barrier = barrier.clone();
-        tasks.spawn(async move {
-            barrier.wait().await;
-            snapshot(&server, false).await
-        });
-    }
-    barrier.wait().await;
-    while let Some(result) = tasks.join_next().await {
-        assert_eq!(result.unwrap()["hostname"], "initial");
-    }
+    assert_eq!(snapshot(&server), value);
     assert_eq!(
         control(&container, "wc -c < /home/test/probe-calls")
             .await
             .trim(),
         "1"
     );
-    control(
-        &container,
-        "printf updated > /home/test/probe-host; printf malformed > /home/test/probe-mode",
-    )
-    .await;
-    assert_eq!(snapshot(&server, false).await["hostname"], "initial");
-    let refreshed = snapshot(&server, true).await;
-    assert_eq!(refreshed["hostname"], "updated");
-    assert!(
-        refreshed["available_cpu_parallelism"].is_null(),
-        "refresh must replace old values with null"
-    );
-    assert_eq!(snapshot(&server, false).await, refreshed);
-    server.connection().reconnect().await.unwrap();
-    control(
-        &container,
-        "printf reconnected > /home/test/probe-host; printf normal > /home/test/probe-mode",
-    )
-    .await;
-    assert_eq!(snapshot(&server, false).await["hostname"], "reconnected");
-
-    // A deterministic barrier, not a sleep, keeps the old producer in flight.
-    control(&container, "printf hold > /home/test/probe-mode").await;
-    let producer = {
-        let server = server.clone();
-        tokio::spawn(async move {
-            server
-                .test_host_environment(true, CancellationToken::new())
-                .await
-                .unwrap()
-        })
-    };
-    entered(&container).await;
-    server
-        .connection()
-        .invalidate_session("test stale producer")
-        .await;
-    control(&container, "printf newest > /home/test/probe-host; printf normal > /home/test/probe-mode; touch /home/test/probe-release").await;
-    let result = producer.await.unwrap();
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "old producer cannot publish after route removal"
-    );
-    assert_eq!(snapshot(&server, false).await["hostname"], "newest");
     server.shutdown().await;
+
+    // A new server startup recollects, without a refresh tool or a route cache.
+    let next = unprepared_server(&container, false)
+        .await
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    assert_eq!(snapshot(&next)["hostname"], "changed");
+    assert_eq!(
+        control(&container, "wc -c < /home/test/probe-calls")
+            .await
+            .trim(),
+        "2"
+    );
+    next.shutdown().await;
 }
 
 #[tokio::test]
-async fn host_environment_partial_timeout_flood_and_cancel_preserve_session_and_cache() {
+async fn startup_environment_partial_timeout_flood_and_cancellation_preserve_ssh() {
     let container = container("ssh-mcp-debian-sshd").await;
     control(&container, FIXTURE).await;
-    let server = Arc::new(server(&container, false).await);
-    let initial = snapshot(&server, false).await;
-    for mode in ["hang", "flood", "stderr", "missing"] {
+    for mode in ["hang", "flood", "malformed", "missing", "startup_stderr"] {
         control(
             &container,
             &format!("printf {mode} > /home/test/probe-mode"),
         )
         .await;
+        let unprepared = unprepared_server(&container, false).await;
         let start = Instant::now();
-        let partial = snapshot(&server, true).await;
+        let prepared = unprepared
+            .with_startup_environment(CancellationToken::new())
+            .await;
         assert!(
             start.elapsed() < Duration::from_millis(3500),
-            "{mode} exceeded metadata budget"
+            "{mode} escaped bootstrap deadline"
         );
-        assert_eq!(partial["hostname"], initial["hostname"]);
-        assert_eq!(partial["effective_uid"], 1000);
+        let partial = snapshot(&prepared);
+        if mode != "startup_stderr" {
+            assert_eq!(partial["hostname"], "initial");
+            assert_eq!(partial["effective_uid"], 1000);
+        }
         assert!(partial["available_cpu_parallelism"].is_null());
-        assert_eq!(
-            snapshot(&server, false).await,
-            partial,
-            "partial snapshots are cached"
-        );
-        assert!(server.connection().is_connected().await);
-        working_command(&server).await;
+        let instructions = prepared.get_info().instructions;
+        control(&container, "printf normal > /home/test/probe-mode").await;
+        working_command(&prepared).await;
+        assert_eq!(prepared.get_info().instructions, instructions);
+        prepared.shutdown().await;
     }
-    control(&container, "printf startup_stderr > /home/test/probe-mode").await;
-    let start = Instant::now();
-    let stderr_partial = snapshot(&server, true).await;
-    assert!(start.elapsed() < Duration::from_millis(3500));
-    assert_eq!(snapshot(&server, false).await, stderr_partial);
-    control(&container, "printf normal > /home/test/probe-mode").await;
-    working_command(&server).await;
-    let previous = snapshot(&server, true).await;
-    control(
-        &container,
-        "printf cancelled > /home/test/probe-host; printf hold > /home/test/probe-mode",
-    )
-    .await;
+
+    let unprepared = unprepared_server(&container, false).await;
+    let ct = CancellationToken::new();
+    ct.cancel();
+    let unprepared = unprepared.with_startup_environment(ct).await;
+    assert!(!unprepared.connection().is_connected().await);
+    unprepared.shutdown().await;
+
+    control(&container, "printf hold > /home/test/probe-mode").await;
+    let unprepared = unprepared_server(&container, false).await;
     let cancellation = CancellationToken::new();
     let producer = {
-        let server = server.clone();
         let ct = cancellation.clone();
-        tokio::spawn(async move { server.test_host_environment(true, ct).await.unwrap() })
+        tokio::spawn(async move { unprepared.with_startup_environment(ct).await })
     };
-    entered(&container).await;
-    // Cancel a waiter without cancelling the producer, then cancel the refresh.
-    let waiter_ct = CancellationToken::new();
-    let waiter = {
-        let server = server.clone();
-        let ct = waiter_ct.clone();
-        tokio::spawn(async move { server.test_host_environment(true, ct).await.unwrap() })
-    };
-    waiter_ct.cancel();
-    assert_eq!(waiter.await.unwrap().is_error, Some(true));
-    assert!(!producer.is_finished());
+    timeout(Duration::from_secs(2), async {
+        while control(
+            &container,
+            "if [ -e /home/test/probe-entered ]; then printf yes; fi",
+        )
+        .await
+            != "yes"
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     cancellation.cancel();
-    assert_eq!(
-        timeout(Duration::from_secs(1), producer)
-            .await
+    let cancelled = timeout(Duration::from_secs(1), producer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        snapshot(&cancelled)
+            .as_object()
             .unwrap()
-            .unwrap()
-            .is_error,
-        Some(true)
-    );
-    assert_eq!(
-        snapshot(&server, false).await,
-        previous,
-        "cancelled refresh must retain old cache"
+            .values()
+            .all(Value::is_null),
+        "cancelled bootstrap must not publish a partial prefix"
     );
     control(
         &container,
         "touch /home/test/probe-release; printf normal > /home/test/probe-mode",
     )
     .await;
-    assert_eq!(
-        snapshot(&server, true).await["hostname"],
-        "cancelled",
-        "gate and permit released"
-    );
-    working_command(&server).await;
-    server.shutdown().await;
-    assert!(
-        server
-            .connection()
-            .host_environment(false, CancellationToken::new())
-            .await
-            .is_err()
-    );
+    working_command(&cancelled).await;
+    cancelled.shutdown().await;
 }
 
 #[tokio::test]
-async fn host_environment_missing_sources_unreadable_release_and_proc_fallbacks() {
+async fn startup_environment_missing_unreadable_and_exotic_sources() {
     let container = container("ssh-mcp-debian-sshd").await;
     control(&container, FIXTURE).await;
     control(
@@ -456,14 +342,17 @@ chmod 600 /etc/os-release
 "#,
     )
     .await;
-    let server = server(&container, false).await;
-    let fallback = snapshot(&server, false).await;
+    let first = unprepared_server(&container, false)
+        .await
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    let fallback = snapshot(&first);
     assert!(fallback["hostname"].is_string());
     assert_eq!(fallback["os"], "Linux");
     assert!(fallback["kernel_release"].is_string());
     assert!(
         fallback["distribution"].is_null(),
-        "unreadable existing primary must not merge/fall back to /usr"
+        "unreadable primary must not merge/fall back to /usr"
     );
     assert_eq!(fallback["effective_uid"], 1000);
     assert_eq!(fallback["effective_gid"], 1000);
@@ -476,13 +365,19 @@ chmod 600 /etc/os-release
     ] {
         assert!(fallback[field].is_null(), "{field} is unavailable");
     }
+    first.shutdown().await;
     control(&container, "rm /etc/os-release").await;
+    let next = unprepared_server(&container, false)
+        .await
+        .with_startup_environment(CancellationToken::new())
+        .await;
     assert!(
-        snapshot(&server, true).await["distribution"]
+        snapshot(&next)["distribution"]
             .as_str()
             .unwrap()
             .contains("Debian")
     );
+    next.shutdown().await;
     control(
         &container,
         r#"
@@ -496,8 +391,12 @@ chmod +x /home/test/probebin/head
 "#,
     )
     .await;
-    let exotic = snapshot(&server, true).await;
-    assert_eq!(exotic["distribution"], "Odd Linux 42");
+    let exotic = unprepared_server(&container, false)
+        .await
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    let value = snapshot(&exotic);
+    assert_eq!(value["distribution"], "Odd Linux 42");
     for field in [
         "hostname",
         "os",
@@ -506,76 +405,20 @@ chmod +x /home/test/probebin/head
         "effective_gid",
         "running_as_root",
     ] {
-        assert!(
-            exotic[field].is_null(),
-            "{field} must remain unknown, not an invented default"
-        );
+        assert!(value[field].is_null(), "{field} must remain unknown");
     }
-    working_command(&server).await;
-    server.shutdown().await;
+    working_command(&exotic).await;
+    exotic.shutdown().await;
 }
 
 #[tokio::test]
-async fn host_environment_absolute_budget_includes_gate_and_slot_waits() {
-    let container = container("ssh-mcp-debian-sshd").await;
-    control(&container, FIXTURE).await;
-    let server = Arc::new(server(&container, false).await);
-    let previous = snapshot(&server, false).await;
-    let mut permits = Vec::new();
-    for _ in 0..8 {
-        permits.push(server.test_acquire_command_slot().await.unwrap());
-    }
-    let start = Instant::now();
-    let blocked = server
-        .test_host_environment(true, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(blocked.is_error, Some(true));
-    assert!(
-        start.elapsed() < Duration::from_millis(3500),
-        "slot wait escaped metadata deadline"
-    );
-    assert_eq!(snapshot(&server, false).await, previous);
-    drop(permits);
-    working_command(&server).await;
-
-    control(&container, "printf hold > /home/test/probe-mode").await;
-    let producer = {
-        let server = server.clone();
-        tokio::spawn(async move { snapshot(&server, true).await })
-    };
-    entered(&container).await;
-    let start = Instant::now();
-    // Waiting for the producer does not reset this caller's collection budget.
-    let waiter = server
-        .test_host_environment(true, CancellationToken::new())
-        .await
-        .unwrap();
-    assert!(
-        start.elapsed() < Duration::from_millis(3500),
-        "gate wait reset the metadata deadline"
-    );
-    // Either a partial collection or a deadline error at the boundary is valid.
-    assert!(waiter.is_error == Some(true) || waiter.structured_content.is_some());
-    assert!(producer.await.unwrap()["available_cpu_parallelism"].is_null());
-    control(
-        &container,
-        "touch /home/test/probe-release; printf normal > /home/test/probe-mode",
-    )
-    .await;
-    assert_eq!(
-        snapshot(&server, true).await["available_cpu_parallelism"],
-        7
-    );
-    working_command(&server).await;
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn host_environment_fish_uses_the_actual_posix_probe_shell() {
+async fn startup_environment_fish_describes_the_actual_posix_probe() {
     let container = container("ssh-mcp-debian-sshd-fish").await;
-    let server = server(&container, false).await;
-    let value = snapshot(&server, false).await;
+    let server = unprepared_server(&container, false)
+        .await
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    let value = snapshot(&server);
     assert_eq!(value["effective_uid"], 1000);
     assert_eq!(value["os"], "Linux");
     assert!(

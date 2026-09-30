@@ -36,11 +36,41 @@ Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, 
 Before serving MCP, the CLI automatically collects one best-effort remote snapshot
 and embeds its compact JSON in `instructions`, delivered by both `initialize` and
 `server/discover`. There is no environment tool to call. MCP clients decide how
-server instructions are included in the model's context. The fixed nullable fields are:
+server instructions are included in the model's context. The 14 fixed fields are:
 
 `hostname`, `os`, `distribution`, `kernel_release`, `machine_architecture`,
 `process_architecture`, `pointer_width`, `available_cpu_parallelism`,
-`effective_uid`, `effective_gid`, `running_as_root`, and `shell_executable`.
+`effective_uid`, `effective_gid`, `running_as_root`, `shell_executable`,
+`cpu_models`, and `virtualization`.
+
+`cpu_models` is `null` or a sorted sample of at most four unique kernel-reported
+model names (trimmed UTF-8, no control characters, at most 256 bytes per name).
+The probe reads `/proc/cpuinfo` once using POSIX builtins, considering only the
+first 128 lines within a 64 KiB **post-read processing budget**, and emits small
+summaries rather than the raw file. A crossing line is discarded. POSIX `read`
+consumes a whole line before its size can be checked; this is not a hard remote
+allocation/input-byte limit. Only `model name` is used: ARM systems reporting
+only CPU implementer/part or board `Hardware` can legitimately return `null`.
+This is neither a complete CPU inventory nor verified physical-host identification.
+
+`virtualization` always contains independent `container` and `vm` values:
+
+```json
+"virtualization":{"container":"docker","vm":null}
+```
+
+Known identifiers mean positive supported evidence; `"unknown"` means positive
+but unidentified/conflicting evidence; `null` means not determined, **never**
+confirmed absence or bare metal. A named `/run/systemd/container` declaration
+takes precedence over markers; generic `oci` can be refined by markers, with
+`/run/.containerenv` (Podman) before `/.dockerenv` (Docker). VM evidence uses
+`/sys/hypervisor/type`, narrow DMI product/vendor signatures for KVM/QEMU, VMware,
+VirtualBox, Xen and the Microsoft/Virtual Machine pair for Hyper-V, then the exact
+`hypervisor` CPU flag. `vmx`/`svm` are only capabilities. KVM refines QEMU; QEMU alone
+does not rule out KVM acceleration. Xen includes control domains: `vm` does not
+assert guest role or enumerate nesting. Container and VM may both be populated.
+These hints are not a security guarantee; cloud/physical-looking DMI and missing
+flags/markers cannot prove absence. No GPU or codec detection is performed.
 
 Collection never initiates `su` or `sudo`, even when establishing
 the shared SSH connection with elevation configured. A root SSH login can
@@ -51,7 +81,7 @@ Process architecture, pointer width and executable describe its non-login POSIX
 estimate, **not** a guarantee that every cgroup quota is accounted for.
 
 Missing utilities, unreadable files, unsupported ELF ABIs and malformed values
-become `null`; unknown UID also means `running_as_root:null`. Sources include
+become unknown; unknown UID also means `running_as_root:null`. Sources include
 `uname` with selected `/proc` fallbacks, `id` with effective IDs from proc status,
 and `os-release` parsed as data, never sourced/evaluated. `/usr/lib/os-release`
 is used only when `/etc/os-release` is absent; their contents are never merged.
@@ -61,6 +91,8 @@ connect/auth/retries, probe waits, execution and best-effort channel cleanup.
 Signals cancel bootstrap before MCP serving. Ordinary tool connections retain their
 existing timeout/retry policies. Raw stdout is capped at 64 KiB, stderr at 4 KiB; text scalars at 1 KiB,
 release/status files at 16 KiB, executable paths at 4 KiB, and ELF at 64 bytes.
+New CPU/virtualization sources use builtins without extra diagnostic utilities;
+their records precede ELF so a missing `dd` does not hide the new information.
 Completed fields survive later timeout/overflow. Metadata failures close only
 the probe channel; closing it is not a guarantee of killing all descendants.
 SSH/authentication failure or establishment timeout produces an unknown snapshot

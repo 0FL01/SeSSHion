@@ -18,6 +18,8 @@ const STDERR_LIMIT: usize = 4 * 1024;
 const SCALAR_LIMIT: usize = 1024;
 const FILE_LIMIT: usize = 16 * 1024;
 const PATH_LIMIT: usize = 4096;
+const CPU_MODEL_LIMIT: usize = 256;
+const CPU_MODEL_COUNT: usize = 4;
 
 /// A snapshot of the SSH user's probe, including its namespaces and rootfs.
 /// CPU parallelism is an estimate; process fields describe this probe's `sh`.
@@ -35,6 +37,15 @@ pub struct HostEnvironment {
     pub effective_gid: Option<u32>,
     pub running_as_root: Option<bool>,
     pub shell_executable: Option<String>,
+    pub cpu_models: Option<Vec<String>>,
+    pub virtualization: Virtualization,
+}
+
+/// Positive observed evidence, not an absence or guest-role assertion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Virtualization {
+    pub container: Option<String>,
+    pub vm: Option<String>,
 }
 
 // Each text record is id NUL payload NUL exit-status NUL. ELF is last and has
@@ -43,6 +54,7 @@ pub struct HostEnvironment {
 const PROBE: &str = r#"
 LC_ALL=C; export LC_ALL
 unset OMP_NUM_THREADS OMP_THREAD_LIMIT
+set -f
 record() {
     key=$1; shift
     printf '%s\000' "$key"
@@ -55,6 +67,52 @@ release_file() {
         head -c 16385 /etc/os-release
     else
         head -c 16385 /usr/lib/os-release
+    fi
+}
+cpu_info() {
+    model1=; model2=; model3=; model4=; hypervisor=
+    lines=0; bytes=0
+    # read consumes a whole line; these are post-read processing limits.
+    { while IFS= read -r line || [ -n "$line" ]; do
+        lines=$((lines + 1)); bytes=$((bytes + ${#line} + 1))
+        [ "$lines" -le 128 ] && [ "$bytes" -le 65536 ] || break
+        case "$line" in *:*) ;; *) continue;; esac
+        cpu_key=${line%%:*}; value=${line#*:}
+        cpu_key=${cpu_key#"${cpu_key%%[![:space:]]*}"}
+        cpu_key=${cpu_key%"${cpu_key##*[![:space:]]}"}
+        value=${value#"${value%%[![:space:]]*}"}
+        value=${value%"${value##*[![:space:]]}"}
+        case "$cpu_key" in
+            'model name')
+                [ -n "$value" ] && [ "${#value}" -le 256 ] || continue
+                case "$value" in *[[:cntrl:]]*) continue;; esac
+                [ "$value" != "$model1" ] && [ "$value" != "$model2" ] &&
+                    [ "$value" != "$model3" ] && [ "$value" != "$model4" ] || continue
+                if [ -z "$model1" ]; then model1=$value
+                elif [ -z "$model2" ]; then model2=$value
+                elif [ -z "$model3" ]; then model3=$value
+                elif [ -z "$model4" ]; then model4=$value
+                fi;;
+            flags)
+                for flag in $value; do
+                    [ "$flag" != hypervisor ] || hypervisor=1
+                done;;
+        esac
+    done; } 2>/dev/null < /proc/cpuinfo
+}
+scalar_file() {
+    # These proc/sys/runtime scalars have one line; reject extra lines or overflow.
+    value=; extra=
+    {
+        IFS= read -r value || [ -n "$value" ] || return 1
+        [ "${#value}" -le 1024 ] || return 1
+        if IFS= read -r extra || [ -n "$extra" ]; then return 1; fi
+        printf '%s' "$value"
+    } < "$1"
+}
+container_marker() {
+    if [ -e /run/.containerenv ]; then printf podman
+    elif [ -e /.dockerenv ]; then printf docker
     fi
 }
 printf 'SE1\000'
@@ -71,6 +129,17 @@ record gid id -g
 record status head -c 16385 "/proc/$$/status"
 record shell readlink "/proc/$$/exe"
 record cpu nproc
+cpu_info
+record cpu_model1 printf '%s' "$model1"
+record cpu_model2 printf '%s' "$model2"
+record cpu_model3 printf '%s' "$model3"
+record cpu_model4 printf '%s' "$model4"
+record cpu_hypervisor printf '%s' "$hypervisor"
+record container_decl scalar_file /run/systemd/container
+record container_marker container_marker
+record hypervisor_type scalar_file /sys/hypervisor/type
+record dmi_product scalar_file /sys/class/dmi/id/product_name
+record dmi_vendor scalar_file /sys/class/dmi/id/sys_vendor
 record elf dd if="/proc/$$/exe" bs=64 count=1
 printf 'done\000\0000\000'
 "#;
@@ -191,6 +260,13 @@ fn nul_value<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
 
 fn parse_snapshot(raw: &[u8]) -> HostEnvironment {
     let mut snapshot = HostEnvironment::default();
+    let mut models = Vec::with_capacity(CPU_MODEL_COUNT);
+    let mut cpu_hypervisor = false;
+    let mut container_decl = None;
+    let mut container_marker = None;
+    let mut hypervisor_type = None;
+    let mut dmi_product = None;
+    let mut dmi_vendor = None;
     let Some(mut input) = raw.strip_prefix(b"SE1\0") else {
         return snapshot;
     };
@@ -210,6 +286,16 @@ fn parse_snapshot(raw: &[u8]) -> HostEnvironment {
         "status",
         "shell",
         "cpu",
+        "cpu_model1",
+        "cpu_model2",
+        "cpu_model3",
+        "cpu_model4",
+        "cpu_hypervisor",
+        "container_decl",
+        "container_marker",
+        "hypervisor_type",
+        "dmi_product",
+        "dmi_vendor",
         "elf",
     ] {
         if nul_value(&mut input) != Some(id.as_bytes()) {
@@ -265,6 +351,17 @@ fn parse_snapshot(raw: &[u8]) -> HostEnvironment {
             "cpu" => {
                 snapshot.available_cpu_parallelism = decimal(payload).filter(|count| *count > 0)
             }
+            "cpu_model1" | "cpu_model2" | "cpu_model3" | "cpu_model4" => {
+                if let Some(model) = cpu_model(payload) {
+                    models.push(model);
+                }
+            }
+            "cpu_hypervisor" => cpu_hypervisor = payload == b"1",
+            "container_decl" => container_decl = scalar(payload, SCALAR_LIMIT),
+            "container_marker" => container_marker = scalar(payload, SCALAR_LIMIT),
+            "hypervisor_type" => hypervisor_type = scalar(payload, SCALAR_LIMIT),
+            "dmi_product" => dmi_product = scalar(payload, SCALAR_LIMIT),
+            "dmi_vendor" => dmi_vendor = scalar(payload, SCALAR_LIMIT),
             "elf" => {
                 if let Some((architecture, width)) = elf_abi(payload) {
                     snapshot.process_architecture = Some(architecture.to_owned());
@@ -275,7 +372,80 @@ fn parse_snapshot(raw: &[u8]) -> HostEnvironment {
         }
     }
     snapshot.running_as_root = snapshot.effective_uid.map(|uid| uid == 0);
+    models.sort_unstable();
+    models.dedup();
+    snapshot.cpu_models = (!models.is_empty()).then_some(models);
+    snapshot.virtualization.container =
+        container_kind(container_decl.as_deref(), container_marker.as_deref());
+    snapshot.virtualization.vm = vm_kind(
+        hypervisor_type.as_deref(),
+        dmi_product.as_deref(),
+        dmi_vendor.as_deref(),
+        cpu_hypervisor,
+    );
     snapshot
+}
+
+fn cpu_model(payload: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(payload).ok()?.trim();
+    (!value.is_empty() && value.len() <= CPU_MODEL_LIMIT && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
+}
+
+fn container_kind(declaration: Option<&str>, marker: Option<&str>) -> Option<String> {
+    let declaration = declaration.filter(|value| {
+        value.len() <= 64
+            && !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+            })
+    });
+    let known_marker = marker.filter(|value| matches!(*value, "podman" | "docker"));
+    let kind = match declaration {
+        Some("docker" | "podman" | "lxc" | "systemd-nspawn" | "openvz") => declaration,
+        Some("lxc-libvirt") => Some("lxc"),
+        Some("oci") => known_marker.or(Some("unknown")),
+        Some(_) => Some("unknown"),
+        None => known_marker,
+    };
+    kind.map(str::to_owned)
+}
+
+fn dmi_kind(value: &str) -> Option<&'static str> {
+    match value {
+        "KVM" => Some("kvm"),
+        "QEMU" => Some("qemu"),
+        "VMware" | "VMware, Inc." | "VMware Virtual Platform" => Some("vmware"),
+        "VirtualBox" | "innotek GmbH" => Some("virtualbox"),
+        "Xen" | "HVM domU" => Some("xen"),
+        _ => None,
+    }
+}
+
+fn vm_kind(
+    hypervisor_type: Option<&str>,
+    product: Option<&str>,
+    vendor: Option<&str>,
+    cpu_hypervisor: bool,
+) -> Option<String> {
+    if hypervisor_type == Some("xen") {
+        return Some("xen".into()); // Also covers dom0; no domain-role assertion.
+    }
+    let product_kind =
+        if product == Some("Virtual Machine") && vendor == Some("Microsoft Corporation") {
+            Some("hyperv")
+        } else {
+            product.and_then(dmi_kind)
+        };
+    let vendor_kind = vendor.and_then(dmi_kind);
+    let kind = match (product_kind, vendor_kind) {
+        (Some("kvm"), Some("qemu")) | (Some("qemu"), Some("kvm")) => Some("kvm"),
+        (Some(product), Some(vendor)) if product != vendor => Some("unknown"),
+        (Some(kind), _) | (_, Some(kind)) => Some(kind),
+        _ if cpu_hypervisor || hypervisor_type.is_some() => Some("unknown"),
+        _ => None,
+    };
+    kind.map(str::to_owned)
 }
 
 fn scalar(payload: &[u8], limit: usize) -> Option<String> {
@@ -422,13 +592,230 @@ mod tests {
     #[test]
     fn unknowns_are_null_and_root_is_not_invented() {
         let value = serde_json::to_value(parse_snapshot(b"malformed")).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 12);
-        assert!(
-            value
-                .as_object()
+        assert_eq!(value.as_object().unwrap().len(), 14);
+        assert_eq!(
+            value["virtualization"],
+            serde_json::json!({"container":null,"vm":null})
+        );
+        for (key, value) in value.as_object().unwrap() {
+            if key != "virtualization" {
+                assert!(value.is_null(), "{key} must be unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_names_are_trimmed_bounded_and_data_only() {
+        assert_eq!(cpu_model(b"  CPU: Model  \n"), Some("CPU: Model".into()));
+        assert_eq!(
+            cpu_model("ARM Cortex-A53".as_bytes()),
+            Some("ARM Cortex-A53".into())
+        );
+        assert_eq!(cpu_model(&vec![b'x'; 256]).unwrap().len(), 256);
+        assert_eq!(
+            cpu_model(format!("  {}  ", "x".repeat(256)).as_bytes())
                 .unwrap()
-                .values()
-                .all(serde_json::Value::is_null)
+                .len(),
+            256
+        );
+        for invalid in [
+            b"".as_slice(),
+            b" \n",
+            b"bad\tmodel",
+            b"\xff",
+            &vec![b'x'; 257],
+        ] {
+            assert!(cpu_model(invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn virtualization_uses_positive_evidence_and_source_precedence() {
+        for (declaration, marker, expected) in [
+            (Some("podman"), Some("docker"), Some("podman")),
+            (Some("unsupported-runtime"), Some("docker"), Some("unknown")),
+            (Some("oci"), Some("docker"), Some("docker")),
+            (Some("oci"), None, Some("unknown")),
+            (Some("not a runtime"), Some("podman"), Some("podman")),
+            (None, Some("podman"), Some("podman")),
+            (None, None, None),
+        ] {
+            assert_eq!(container_kind(declaration, marker).as_deref(), expected);
+        }
+        for (hypervisor, product, vendor, flag, expected) in [
+            (None, Some("KVM"), Some("QEMU"), false, Some("kvm")),
+            (None, None, Some("QEMU"), false, Some("qemu")),
+            (
+                None,
+                Some("VMware Virtual Platform"),
+                Some("VMware, Inc."),
+                false,
+                Some("vmware"),
+            ),
+            (
+                None,
+                Some("VirtualBox"),
+                Some("Oracle Corporation"),
+                false,
+                Some("virtualbox"),
+            ),
+            (
+                None,
+                Some("Virtual Machine"),
+                Some("Microsoft Corporation"),
+                false,
+                Some("hyperv"),
+            ),
+            (None, None, Some("Microsoft Corporation"), false, None),
+            (Some("xen"), Some("KVM"), Some("QEMU"), false, Some("xen")),
+            (Some("unidentified"), None, None, false, Some("unknown")),
+            (
+                None,
+                Some("KVM"),
+                Some("VMware, Inc."),
+                false,
+                Some("unknown"),
+            ),
+            (None, Some("83AR"), Some("LENOVO"), true, Some("unknown")),
+            (None, Some("83AR"), Some("LENOVO"), false, None),
+            (None, None, Some("Amazon EC2"), false, None),
+        ] {
+            assert_eq!(
+                vm_kind(hypervisor, product, vendor, flag).as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn builtin_cpu_and_virtualization_summaries_survive_missing_utilities_and_sources() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = |name| fixture.path().join(name);
+        let mut script = PROBE.to_owned();
+        for (source, name) in [
+            ("/proc/cpuinfo", "cpuinfo"),
+            ("/run/systemd/container", "container"),
+            ("/run/.containerenv", "podman"),
+            ("/.dockerenv", "docker"),
+            ("/sys/hypervisor/type", "hypervisor"),
+            ("/sys/class/dmi/id/product_name", "product"),
+            ("/sys/class/dmi/id/sys_vendor", "vendor"),
+        ] {
+            script = script.replace(source, path(name).to_str().unwrap());
+        }
+        let run = |utilities: bool| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", &script]);
+            if !utilities {
+                command.env("PATH", "/nonexistent");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.len() < STDOUT_LIMIT);
+            output.stdout
+        };
+        std::fs::write(path("cpuinfo"), b"model name : Z CPU\nmodel name\t: A: CPU\nmodel name: Z CPU\nmodel name: B CPU\nmodel name: C CPU\nmodel name: D CPU\nflags\t: vmx\thypervisor svm\n").unwrap();
+        std::fs::write(path("container"), "oci\n").unwrap();
+        std::fs::write(path("podman"), "").unwrap();
+        std::fs::write(path("docker"), "").unwrap();
+        std::fs::write(path("product"), "KVM\n").unwrap();
+        std::fs::write(path("vendor"), "QEMU\n").unwrap();
+        let raw = run(false);
+        let snapshot = parse_snapshot(&raw);
+        assert_eq!(
+            snapshot.cpu_models,
+            Some(vec![
+                "A: CPU".into(),
+                "B CPU".into(),
+                "C CPU".into(),
+                "Z CPU".into()
+            ])
+        );
+        assert_eq!(snapshot.virtualization.container.as_deref(), Some("podman"));
+        assert_eq!(snapshot.virtualization.vm.as_deref(), Some("kvm"));
+        assert!(
+            snapshot.process_architecture.is_none(),
+            "missing dd must not hide earlier summaries"
+        );
+
+        // A truncated extension retains completed model records but no later fields.
+        let end = raw
+            .windows(b"cpu_model3\0".len())
+            .position(|value| value == b"cpu_model3\0")
+            .unwrap();
+        let partial = parse_snapshot(&raw[..end + 3]);
+        assert_eq!(
+            partial.cpu_models,
+            Some(vec!["A: CPU".into(), "Z CPU".into()])
+        );
+        assert_eq!(partial.virtualization, Virtualization::default());
+
+        std::fs::remove_file(path("product")).unwrap();
+        std::fs::remove_file(path("vendor")).unwrap();
+        std::fs::write(path("container"), "unsupported-runtime\n").unwrap();
+        assert_eq!(
+            parse_snapshot(&run(false)).virtualization,
+            Virtualization {
+                container: Some("unknown".into()),
+                vm: Some("unknown".into())
+            }
+        );
+
+        // Cap the models, not the scan: a later exact hypervisor token still counts.
+        // Capability flags and substrings never manufacture positive VM evidence.
+        for flags in [
+            "vmx svm",
+            "not-hypervisor hypervisor-extra",
+            "hypervisor\tvmx",
+        ] {
+            std::fs::write(
+                path("cpuinfo"),
+                format!("Hardware: Board name\nCPU part: 0xd03\nflags: {flags}\n"),
+            )
+            .unwrap();
+            let observed = parse_snapshot(&run(false));
+            assert!(observed.cpu_models.is_none());
+            assert_eq!(
+                observed.virtualization.vm.as_deref(),
+                if flags.starts_with("hypervisor\t") {
+                    Some("unknown")
+                } else {
+                    None
+                }
+            );
+        }
+        std::fs::write(
+            path("cpuinfo"),
+            format!("{}flags: hypervisor\n", "processor: 0\n".repeat(128)),
+        )
+        .unwrap();
+        assert!(parse_snapshot(&run(false)).virtualization.vm.is_none());
+        std::fs::write(
+            path("cpuinfo"),
+            format!(
+                "model name: valid\nflags: {}hypervisor\n",
+                " ".repeat(65536)
+            ),
+        )
+        .unwrap();
+        let observed = parse_snapshot(&run(false));
+        assert_eq!(observed.cpu_models, Some(vec!["valid".into()]));
+        assert!(
+            observed.virtualization.vm.is_none(),
+            "discard a crossing line, never a truncated token"
+        );
+
+        std::fs::remove_file(path("cpuinfo")).unwrap();
+        let observed = parse_snapshot(&run(true));
+        assert!(observed.cpu_models.is_none());
+        assert!(
+            observed.process_architecture.is_some(),
+            "unreadable optional sources preserve complete framing and ELF"
         );
     }
 
@@ -581,6 +968,10 @@ mod tests {
         );
         assert!(snapshot.pointer_width.is_some());
         assert!(snapshot.available_cpu_parallelism.is_some());
+        assert_eq!(snapshot.virtualization.container.as_deref(), Some("docker"));
+        if snapshot.machine_architecture.as_deref() == Some("x86_64") {
+            assert!(!snapshot.cpu_models.as_ref().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

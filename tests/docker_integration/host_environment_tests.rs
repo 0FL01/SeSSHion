@@ -168,7 +168,7 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
         .await;
     let instructions = serde_json::to_vec(&server.get_info()).unwrap();
     let value = snapshot(&server);
-    assert_eq!(value.as_object().unwrap().len(), 12);
+    assert_eq!(value.as_object().unwrap().len(), 14);
     assert_eq!(value["hostname"], "initial");
     assert_eq!(value["os"], "Linux");
     assert!(value["distribution"].as_str().unwrap().contains("Debian"));
@@ -177,6 +177,16 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
     assert_eq!(value["running_as_root"], false);
     assert_eq!(value["pointer_width"], 64);
     assert_eq!(value["available_cpu_parallelism"], 7);
+    assert_eq!(value["virtualization"]["container"], "docker");
+    if value["machine_architecture"] == "x86_64" {
+        let models = value["cpu_models"].as_array().unwrap();
+        assert!(!models.is_empty() && models.len() <= 4);
+        assert!(
+            models
+                .iter()
+                .all(|model| model.as_str().unwrap().len() <= 256)
+        );
+    }
     assert!(
         value["shell_executable"]
             .as_str()
@@ -190,7 +200,7 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
     )
     .await;
 
-    control(&container, "printf changed > /home/test/probe-host").await;
+    control(&container, "printf changed > /home/test/probe-host; mkdir -p /run/systemd; printf podman > /run/systemd/container").await;
     let server = server
         .with_startup_environment(CancellationToken::new())
         .await;
@@ -235,6 +245,7 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
         .with_startup_environment(CancellationToken::new())
         .await;
     assert_eq!(snapshot(&next)["hostname"], "changed");
+    assert_eq!(snapshot(&next)["virtualization"]["container"], "podman");
     assert_eq!(
         control(&container, "wc -c < /home/test/probe-calls")
             .await
@@ -308,14 +319,20 @@ async fn startup_environment_partial_timeout_flood_and_cancellation_preserve_ssh
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        snapshot(&cancelled)
-            .as_object()
-            .unwrap()
-            .values()
-            .all(Value::is_null),
-        "cancelled bootstrap must not publish a partial prefix"
+    let unknown = snapshot(&cancelled);
+    assert_eq!(unknown.as_object().unwrap().len(), 14);
+    assert_eq!(
+        unknown["virtualization"],
+        serde_json::json!({"container":null,"vm":null})
     );
+    for (key, value) in unknown.as_object().unwrap() {
+        if key != "virtualization" {
+            assert!(
+                value.is_null(),
+                "cancelled bootstrap must not publish {key}"
+            );
+        }
+    }
     control(
         &container,
         "touch /home/test/probe-release; printf normal > /home/test/probe-mode",
@@ -364,6 +381,13 @@ chmod 600 /etc/os-release
         "shell_executable",
     ] {
         assert!(fallback[field].is_null(), "{field} is unavailable");
+    }
+    assert_eq!(fallback["virtualization"]["container"], "docker");
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            fallback["cpu_models"].is_array(),
+            "missing dd must not hide CPU models"
+        );
     }
     first.shutdown().await;
     control(&container, "rm /etc/os-release").await;

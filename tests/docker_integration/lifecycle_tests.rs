@@ -345,8 +345,16 @@ async fn startup_environment_unavailable_ssh_keeps_init_and_tools_working() {
         let initialized = process.initialize().await;
         let instructions = initialized["result"]["instructions"].as_str().unwrap();
         let snapshot: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
-        assert_eq!(snapshot.as_object().unwrap().len(), 12);
-        assert!(snapshot.as_object().unwrap().values().all(Value::is_null));
+        assert_eq!(snapshot.as_object().unwrap().len(), 14);
+        assert_eq!(
+            snapshot["virtualization"],
+            json!({"container":null,"vm":null})
+        );
+        for (key, value) in snapshot.as_object().unwrap() {
+            if key != "virtualization" {
+                assert!(value.is_null(), "{key} must be unknown");
+            }
+        }
         process
             .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
             .await;
@@ -422,9 +430,17 @@ async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool(
             .unwrap()
             .to_owned();
         let snapshot: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
-        assert_eq!(snapshot.as_object().unwrap().len(), 12);
+        assert_eq!(snapshot.as_object().unwrap().len(), 14);
         if failed_startup {
-            assert!(snapshot.as_object().unwrap().values().all(Value::is_null));
+            assert_eq!(
+                snapshot["virtualization"],
+                json!({"container":null,"vm":null})
+            );
+            for (key, value) in snapshot.as_object().unwrap() {
+                if key != "virtualization" {
+                    assert!(value.is_null(), "{key} must be unknown");
+                }
+            }
             let mut changed = container
                 .exec(ExecCommand::new([
                     "sh",
@@ -439,6 +455,10 @@ async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool(
             assert_eq!(snapshot["effective_uid"], 1000);
             assert_eq!(snapshot["running_as_root"], false);
             assert_eq!(snapshot["os"], "Linux");
+            assert_eq!(snapshot["virtualization"]["container"], "docker");
+            if snapshot["machine_architecture"] == "x86_64" {
+                assert!(snapshot["cpu_models"].is_array());
+            }
         }
         let metadata = if modern {
             json!({"_meta": meta})

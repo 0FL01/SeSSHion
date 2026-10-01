@@ -460,7 +460,7 @@ impl SshConnectionManager {
 
             // Parse the private key using russh::keys
             let key = Arc::new(
-                russh::keys::PrivateKey::from_openssh(key_content.as_bytes())
+                russh::keys::PrivateKey::from_openssh(key_content.trim_end().as_bytes())
                     .map_err(|e| SshMcpError::SshKey(format!("{stage} key parsing failed: {e}")))?,
             );
 

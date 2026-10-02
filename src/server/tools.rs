@@ -35,14 +35,14 @@ fn command_tool(name: &'static str, tool_description: &'static str) -> Tool {
 pub(super) fn shell_tool() -> Tool {
     command_tool(
         "shell",
-        "Run a remote command via POSIX sh; keep output and file reads bounded.",
+        "POSIX sh: use explicit paths, not {a,b}; bound output and file reads.",
     )
 }
 
 pub(super) fn sudo_shell_tool() -> Tool {
     command_tool(
         "sudo_shell",
-        "Run a remote command under sudo via POSIX sh; keep output and file reads bounded.",
+        "POSIX sh under sudo: use explicit paths, not {a,b}; bound output and file reads.",
     )
 }
 

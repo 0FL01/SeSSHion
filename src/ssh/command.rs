@@ -199,22 +199,22 @@ fn append_bounded_lossy_stderr(stderr: &mut String, chunk: &[u8], max_len: usize
 /// Errors that can occur before exec is successfully sent.
 /// These errors are retryable since the command has not started executing yet.
 enum PreExecError {
-    ChannelOpen(String),
-    ExecSend(String),
+    ChannelOpen(Option<u64>, String),
+    ExecSend(u64, String),
 }
 
 impl PreExecError {
     /// Convert the pre-exec error into an SSH connection error.
     fn into_ssh_error(self) -> SshMcpError {
         match self {
-            PreExecError::ChannelOpen(msg) => SshMcpError::connection(msg),
-            PreExecError::ExecSend(msg) => SshMcpError::connection(msg),
+            PreExecError::ChannelOpen(_, msg) => SshMcpError::connection(msg),
+            PreExecError::ExecSend(_, msg) => SshMcpError::connection(msg),
         }
     }
 }
 
 /// Errors that can occur when sending command to su shell channel.
-/// These errors are retryable since the command has not started executing yet.
+/// A failed data write may have sent a prefix, so it must never be replayed.
 enum SuSendError {
     SendFailed(String),
 }
@@ -261,9 +261,8 @@ impl SshConnectionManager {
 
     /// Execute command via the elevated su shell (PTY)
     ///
-    /// Implements deterministic one-shot retry for pre-send failures:
-    /// - If sending command to su channel fails: reset su state, re-elevate, retry once
-    /// - If failure occurs after command is sent: no retry, reset su state and invalidate session
+    /// Re-elevates only if no channel was available before sending any payload.
+    /// Send/collection failures invalidate only the borrowed channel's route.
     async fn exec_via_su_shell(
         &self,
         command: &str,
@@ -289,12 +288,12 @@ impl SshConnectionManager {
         );
 
         // Attempt #1: try to send command via existing su channel
-        let mut channel = match self.try_take_su_channel().await {
+        let (generation, mut channel) = match self.try_take_su_channel().await {
             Some(ch) => ch,
             None => {
                 // No channel available - try to elevate and retry once
                 warn!("No su channel available, attempting elevation");
-                self.reset_su_state().await;
+                self.ensure_connected().await?;
                 self.ensure_elevated().await?;
                 match self.try_take_su_channel().await {
                     Some(ch) => ch,
@@ -318,110 +317,70 @@ impl SshConnectionManager {
                     .collect_su_output(&mut channel, timeout_duration, use_wrapper)
                     .await;
 
-                // Put the channel back (even if collection failed)
-                self.restore_su_channel(channel).await;
-
                 // Handle post-send failure: reset su state and invalidate session, no retry
                 if let Err(ref e) = result {
                     warn!(error = ?e, "su channel failed after command sent");
-                    self.reset_su_state().await;
-                    self.invalidate_session("su channel failed after send")
-                        .await;
+                    self.invalidate_session_for_generation(
+                        generation,
+                        "su channel failed after send",
+                    )
+                    .await;
+                } else {
+                    self.restore_su_channel(generation, channel).await;
                 }
 
                 result
             }
             Err(SuSendError::SendFailed(e)) => {
-                // Pre-send failure: command was NOT sent
-                // Drop the bad channel (don't put it back)
+                // russh data() copies in chunks: an error does not prove that
+                // nothing reached the remote shell. Never replay this payload.
                 drop(channel);
-
-                // Reset su state and re-elevate once
-                warn!(
-                    error = ?e,
-                    "su channel send failed (pre-send), resetting and re-elevating"
-                );
-                self.reset_su_state().await;
-                self.ensure_elevated().await?;
-
-                // Attempt #2: take new channel and send
-                let mut channel = match self.try_take_su_channel().await {
-                    Some(ch) => ch,
-                    None => {
-                        return Err(SshMcpError::connection(
-                            "No su channel available after re-elevation",
-                        ));
-                    }
-                };
-
-                // Try to send again - if this fails, no more retries
-                if let Err(SuSendError::SendFailed(e2)) = self
-                    .try_send_to_su_channel(&mut channel, &wrapped_cmd)
-                    .await
-                {
-                    // Second failure - drop channel, reset state, return error
-                    drop(channel);
-                    self.reset_su_state().await;
-                    return Err(SshMcpError::connection(format!(
-                        "Failed to send command to su channel after retry: {}",
-                        e2
-                    )));
-                }
-
-                // Second attempt succeeded - collect output
-                let result = self
-                    .collect_su_output(&mut channel, timeout_duration, use_wrapper)
+                self.invalidate_session_for_generation(generation, "su channel send failed")
                     .await;
-
-                // Put the channel back
-                self.restore_su_channel(channel).await;
-
-                // Handle post-send failure: reset su state and invalidate session, no retry
-                if let Err(ref e) = result {
-                    warn!(error = ?e, "su channel failed after command sent (retry)");
-                    self.reset_su_state().await;
-                    self.invalidate_session("su channel failed after send (retry)")
-                        .await;
-                }
-
-                result
+                Err(SshMcpError::connection(format!(
+                    "Failed to send command to su channel: {e}"
+                )))
             }
         }
     }
 
     /// Try to take the su channel from the mutex
-    async fn try_take_su_channel(&self) -> Option<russh::Channel<russh::client::Msg>> {
+    pub(super) async fn try_take_su_channel(
+        &self,
+    ) -> Option<(u64, russh::Channel<russh::client::Msg>)> {
         let mut guard = self.su_channel.lock().await;
-        guard.take()
+        let session = self.session.lock().await;
+        let generation = self.su_generation.load(std::sync::atomic::Ordering::SeqCst);
+        if self.is_shutting_down()
+            || !session
+                .as_ref()
+                .is_some_and(|route| route.generation == generation && !route.is_closed())
+        {
+            return None;
+        }
+        guard.take().map(|channel| (generation, channel))
     }
 
-    async fn restore_su_channel(&self, channel: russh::Channel<russh::client::Msg>) {
+    pub(super) async fn restore_su_channel(
+        &self,
+        generation: u64,
+        channel: russh::Channel<russh::client::Msg>,
+    ) {
         let mut guard = self.su_channel.lock().await;
-        if self.is_shutting_down() {
+        let session = self.session.lock().await;
+        if self.is_shutting_down()
+            || guard.is_some()
+            || self.su_generation.load(std::sync::atomic::Ordering::SeqCst) != generation
+            || !session
+                .as_ref()
+                .is_some_and(|route| route.generation == generation && !route.is_closed())
+        {
+            drop(session);
             drop(guard);
-            let _ = channel.eof().await;
+            let _ = timeout(Duration::from_millis(100), channel.eof()).await;
         } else {
             *guard = Some(channel);
         }
-    }
-
-    /// Reset su state (clear channel and elevation flag)
-    async fn reset_su_state(&self) {
-        // Take channel out of mutex before awaiting to avoid deadlock
-        let channel = {
-            let mut guard = self.su_channel.lock().await;
-            guard.take()
-        };
-
-        // Drop lock before awaiting EOF
-        if let Some(ch) = channel {
-            // Try to close gracefully, but don't wait
-            let _ = ch.eof().await;
-        }
-
-        use std::sync::atomic::Ordering;
-        self.is_elevated.store(false, Ordering::SeqCst);
-        debug!("su state reset: channel cleared, is_elevated=false");
     }
 
     /// Try to send command to su channel
@@ -550,7 +509,7 @@ impl SshConnectionManager {
         };
 
         // Attempt #1: open channel and exec
-        let (channel, _exec_sent) = self
+        let (channel, generation) = self
             .open_and_exec_with_reconnect_retry(&wrapped_cmd)
             .await?;
 
@@ -572,9 +531,12 @@ impl SshConnectionManager {
                         "Command timed out after {}ms, attempting abort",
                         timeout_duration.as_millis()
                     );
-                    self.abort_command(command).await;
-                    self.invalidate_session("command timed out after exec")
-                        .await;
+                    self.abort_command(command, generation).await;
+                    self.invalidate_session_for_generation(
+                        generation,
+                        "command timed out after exec",
+                    )
+                    .await;
                     return Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64));
                 }
             }
@@ -586,7 +548,8 @@ impl SshConnectionManager {
                 // Failure after exec started - invalidate session, no retry
                 // Do not retry: command may have partially executed
                 if !matches!(e, SshMcpError::Timeout(_)) {
-                    self.invalidate_session("channel failed after exec").await;
+                    self.invalidate_session_for_generation(generation, "channel failed after exec")
+                        .await;
                 }
                 return Err(e);
             }
@@ -607,7 +570,7 @@ impl SshConnectionManager {
 
                 // Execute the command again using fallback method (tokio timeout + pkill)
                 // Note: This is a feature fallback, not a connection retry
-                let (channel, _) = self
+                let (channel, generation) = self
                     .open_and_exec_with_reconnect_retry(command)
                     .await
                     .map_err(|e| {
@@ -625,9 +588,12 @@ impl SshConnectionManager {
                             "Command timed out after {}ms (fallback), attempting abort",
                             timeout_duration.as_millis()
                         );
-                        self.abort_command(command).await;
-                        self.invalidate_session("fallback command timed out after exec")
-                            .await;
+                        self.abort_command(command, generation).await;
+                        self.invalidate_session_for_generation(
+                            generation,
+                            "fallback command timed out after exec",
+                        )
+                        .await;
                         Err(SshMcpError::Timeout(timeout_duration.as_millis() as u64))
                     }
                 };
@@ -646,47 +612,60 @@ impl SshConnectionManager {
 
     /// Try to open a channel and send exec command
     ///
-    /// Returns the channel and a boolean indicating exec was sent successfully.
+    /// Returns the channel and the route generation on which exec was queued.
     /// Separates pre-exec failures (which can be retried) from post-exec state.
     async fn try_open_and_exec(
         &self,
         command: &str,
-    ) -> std::result::Result<(russh::Channel<russh::client::Msg>, bool), PreExecError> {
-        let channel = self
-            .open_channel()
+    ) -> std::result::Result<(russh::Channel<russh::client::Msg>, u64), PreExecError> {
+        let (generation, channel) = self
+            .open_channel_attempt()
             .await
-            .map_err(|e| PreExecError::ChannelOpen(e.to_string()))?;
+            .map_err(|(generation, e)| PreExecError::ChannelOpen(generation, e.to_string()))?;
 
         debug!("Executing command: cmd_len={}", command.len());
         let wrapped_command = wrap_command_for_channel_exec(command);
         channel
             .exec(true, wrapped_command.as_str())
             .await
-            .map_err(|e| PreExecError::ExecSend(format!("Failed to exec command: {}", e)))?;
+            .map_err(|e| {
+                PreExecError::ExecSend(generation, format!("Failed to exec command: {}", e))
+            })?;
 
-        Ok((channel, true))
+        Ok((channel, generation))
     }
 
     async fn open_and_exec_with_reconnect_retry(
         &self,
         command: &str,
-    ) -> Result<(russh::Channel<russh::client::Msg>, bool)> {
+    ) -> Result<(russh::Channel<russh::client::Msg>, u64)> {
         match self.try_open_and_exec(command).await {
             Ok(result) => Ok(result),
             Err(pre_exec_err) => {
                 match &pre_exec_err {
-                    PreExecError::ChannelOpen(e) => {
+                    PreExecError::ChannelOpen(generation, e) => {
                         warn!(
                             error = ?e,
                             "Channel open failed, attempting reconnect and retry"
                         );
+                        if let Some(generation) = generation {
+                            self.invalidate_session_for_generation(
+                                *generation,
+                                "channel open failed",
+                            )
+                            .await;
+                        }
                     }
-                    PreExecError::ExecSend(e) => {
+                    PreExecError::ExecSend(generation, e) => {
                         warn!(error = ?e, "Exec send failed, attempting reconnect and retry");
+                        // russh exec() is one mpsc send: Err means that request
+                        // was not queued, unlike the chunked SU data write.
+                        self.invalidate_session_for_generation(*generation, "exec send failed")
+                            .await;
                     }
                 }
 
-                self.reconnect().await?;
+                self.ensure_connected().await?;
                 self.try_open_and_exec(command)
                     .await
                     .map_err(|retry_err| retry_err.into_ssh_error())
@@ -953,10 +932,14 @@ impl SshConnectionManager {
     ///
     /// Sends `timeout 3s pkill -f 'command' 2>/dev/null || true` to kill
     /// any processes matching the command pattern.
-    async fn abort_command(&self, command: &str) {
+    async fn abort_command(&self, command: &str, generation: u64) {
         // Try to open a new channel for the abort command
-        let channel = match self.open_channel().await {
-            Ok(ch) => ch,
+        let channel = match self.open_channel_with_generation().await {
+            Ok((current, ch)) if current == generation => ch,
+            Ok((_, ch)) => {
+                let _ = timeout(Duration::from_millis(100), ch.close()).await;
+                return;
+            }
             Err(e) => {
                 error!(error = ?e, "Failed to open channel for abort");
                 return;

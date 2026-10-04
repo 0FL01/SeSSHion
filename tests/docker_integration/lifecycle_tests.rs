@@ -11,18 +11,24 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use testcontainers::core::ExecCommand;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use testcontainers::{ContainerAsync, core::ExecCommand};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+// Cold readiness (10s) precedes the optional metadata probe (3s).
+const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const COLD_FAILURE_TIMEOUT: Duration = Duration::from_secs(13);
 
 struct McpProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    stderr: tokio::task::JoinHandle<String>,
+    first_response: bool,
+    started: tokio::time::Instant,
     spool_dir: PathBuf,
     _temp_dir: TempDir,
 }
@@ -47,6 +53,13 @@ impl McpProcess {
         let temp_dir = tempfile::tempdir().expect("create isolated lifecycle temp dir");
         let spool_dir = temp_dir.path().join("spool");
         let mut command = Command::new(env!("CARGO_BIN_EXE_ssh-mcp"));
+        // Inherited keys, jump credentials and timing overrides must not turn a
+        // rejected-password case into successful authentication.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("SSH_MCP_") {
+                command.env_remove(name);
+            }
+        }
         command
             .arg("--host")
             .arg(host)
@@ -57,20 +70,30 @@ impl McpProcess {
             .current_dir(current_dir.unwrap_or_else(|| temp_dir.path()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(home) = home {
             command.env("HOME", home);
         }
+        let started = tokio::time::Instant::now();
         let mut child = command.spawn().expect("spawn ssh-mcp binary");
 
         let stdin = child.stdin.take().expect("child stdin");
         let stdout = child.stdout.take().expect("child stdout");
+        let mut stderr = child.stderr.take().expect("child stderr");
+        let stderr = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.expect("read stderr");
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
 
         Self {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            stderr,
+            first_response: true,
+            started,
             spool_dir,
             _temp_dir: temp_dir,
         }
@@ -86,7 +109,13 @@ impl McpProcess {
     }
 
     async fn response(&mut self, expected_id: u64) -> Value {
-        timeout(RESPONSE_TIMEOUT, async {
+        let budget = if self.first_response {
+            STARTUP_RESPONSE_TIMEOUT
+        } else {
+            RESPONSE_TIMEOUT
+        };
+        self.first_response = false;
+        timeout(budget, async {
             loop {
                 let mut line = String::new();
                 let read = self
@@ -156,6 +185,41 @@ impl McpProcess {
             .expect("wait for ssh-mcp process");
         assert!(status.success(), "ssh-mcp exited with {status}");
     }
+
+    async fn assert_cold_failure(&mut self, reasons: &[&str], secrets: &[&str]) {
+        let (status, stdout, stderr) = timeout(
+            COLD_FAILURE_TIMEOUT.saturating_sub(self.started.elapsed()),
+            async {
+                let status = self.child.wait().await.expect("wait for cold failure");
+                let mut stdout = String::new();
+                self.stdout.read_to_string(&mut stdout).await.unwrap();
+                let stderr = (&mut self.stderr).await.expect("stderr reader");
+                (status, stdout, stderr)
+            },
+        )
+        .await
+        .expect("cold failure exceeded the readiness deadline and shutdown slack");
+        assert!(!status.success(), "cold startup unexpectedly succeeded");
+        assert!(
+            stdout.is_empty(),
+            "cold failure emitted MCP output: {stdout}"
+        );
+        assert!(
+            stderr.lines().any(|line| {
+                let line = line.to_lowercase();
+                [
+                    "error", "failed", "failure", "rejected", "refused", "deadline",
+                ]
+                .iter()
+                .any(|marker| line.contains(marker))
+                    && reasons.iter().any(|reason| line.contains(reason))
+            }),
+            "cold failure omitted its diagnostic reason: {stderr}"
+        );
+        for secret in secrets {
+            assert!(!stderr.contains(secret), "stderr disclosed credentials");
+        }
+    }
 }
 
 fn tool_text(response: &Value) -> &str {
@@ -177,9 +241,71 @@ async fn wait_for_tcp(host: &str, port: u16) {
     .expect("SSH test container did not become ready");
 }
 
+async fn ssh_fixture() -> (ContainerAsync<GenericImage>, String, u16) {
+    init_test_env().expect("initialize Docker fixtures");
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .start()
+        .await
+        .expect("start SSH fixture");
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(2222).await.unwrap();
+    wait_for_tcp(&host, port).await;
+    (container, host, port)
+}
+
+async fn control(container: &ContainerAsync<GenericImage>, script: &str) -> String {
+    let mut output = container
+        .exec(ExecCommand::new(["sh", "-c", script]))
+        .await
+        .expect("control SSH fixture");
+    let bytes = output.stdout_to_vec().await.unwrap();
+    assert_eq!(output.exit_code().await.unwrap(), Some(0), "{script}");
+    String::from_utf8(bytes).unwrap()
+}
+
+const START_SSHD: &str = "/usr/sbin/sshd -E /run/lifecycle-sshd.log -o LogLevel=VERBOSE -o PidFile=/run/lifecycle-sshd.pid";
+const STOP_SSHD: &str = r#"
+set -eu
+for file in /proc/[0-9]*/comm; do
+    name=$(cat "$file" 2>/dev/null) || continue
+    case "$name" in sshd*) pid=${file#/proc/}; pid=${pid%/comm}; kill -KILL "$pid" 2>/dev/null || true;; esac
+done
+"#;
+
+async fn controlled_ssh_fixture() -> (ContainerAsync<GenericImage>, String, u16) {
+    init_test_env().expect("initialize Docker fixtures");
+    // Keep PID 1 alive while killing the listener AND authenticated children.
+    // Restarting sshd in this container preserves mapped port and host keys.
+    let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
+        .with_exposed_port(2222u16.into())
+        .with_entrypoint("sh")
+        .with_cmd(["-c", "sleep infinity"])
+        .start()
+        .await
+        .unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(2222).await.unwrap();
+    control(&container, START_SSHD).await;
+    wait_for_tcp(&host, port).await;
+    (container, host, port)
+}
+
+async fn authenticated_sessions(container: &ContainerAsync<GenericImage>) -> usize {
+    control(
+        container,
+        "grep -c 'Accepted password for test ' /run/lifecycle-sshd.log || true",
+    )
+    .await
+    .trim()
+    .parse()
+    .expect("authenticated session counter")
+}
+
 #[tokio::test]
 async fn sigterm_stops_server_during_initialization() {
-    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    let (_container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
     process
         .send(json!({"jsonrpc": "2.0", "id": 7, "method": "ping", "params": {}}))
         .await;
@@ -196,7 +322,8 @@ async fn sigterm_stops_server_during_initialization() {
 
 #[tokio::test]
 async fn sigint_stops_initialized_server() {
-    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    let (_container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
     process.initialize().await;
 
     process.signal(Signal::SIGINT);
@@ -205,7 +332,8 @@ async fn sigint_stops_initialized_server() {
 
 #[tokio::test]
 async fn stdin_eof_stops_initialized_server() {
-    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    let (_container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
     process.initialize().await;
 
     process.close_stdin().await;
@@ -214,7 +342,8 @@ async fn stdin_eof_stops_initialized_server() {
 
 #[tokio::test]
 async fn modern_stdio_discovery_and_tool_results() {
-    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    let (_container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
     let meta = json!({
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientInfo": {
@@ -279,7 +408,8 @@ async fn modern_stdio_discovery_and_tool_results() {
 
 #[tokio::test]
 async fn default_tool_surface_is_exact_and_read_is_unknown() {
-    let mut process = McpProcess::spawn("127.0.0.1", 9).await;
+    let (_container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
     process.initialize().await;
 
     process
@@ -331,8 +461,101 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
 }
 
 #[tokio::test]
-async fn startup_environment_unavailable_ssh_keeps_init_and_tools_working() {
+async fn cold_unavailable_ssh_fails_then_fresh_launch_succeeds_on_same_endpoint() {
+    let (container, host, port) = controlled_ssh_fixture().await;
+    for modern in [false, true] {
+        control(&container, STOP_SSHD).await;
+        let mut failed = McpProcess::spawn(&host, port).await;
+        failed.send(opening_request(modern)).await;
+        failed
+            .assert_cold_failure(&["connect", "refused", "unavailable"], &["secret"])
+            .await;
+
+        control(&container, START_SSHD).await;
+        wait_for_tcp(&host, port).await;
+        let mut fresh = McpProcess::spawn(&host, port).await;
+        fresh.send(opening_request(modern)).await;
+        let response = fresh.response(1).await;
+        assert!(response.get("error").is_none(), "{response}");
+        if !modern {
+            fresh
+                .send(json!({"jsonrpc":"2.0", "method":"notifications/initialized", "params":{}}))
+                .await;
+        }
+        let mut params = opening_request(modern)["params"].clone();
+        params
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key == "_meta");
+        params["name"] = json!("shell");
+        params["arguments"] = json!({"command":"printf fresh"});
+        fresh
+            .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":params}))
+            .await;
+        let result = fresh.response(2).await;
+        assert_eq!(tool_text(&result), "fresh", "{result}");
+        fresh.close_stdin().await;
+        fresh.assert_successful_exit().await;
+    }
+}
+
+fn opening_request(modern: bool) -> Value {
+    if modern {
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/list", "params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientInfo":{"name":"cold-test", "version":"1"},
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }}})
+    } else {
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "protocolVersion":"2024-11-05", "capabilities":{},
+            "clientInfo":{"name":"cold-test", "version":"1"}
+        }})
+    }
+}
+
+#[tokio::test]
+async fn cold_rejected_password_has_no_mcp_response_or_credential_leak() {
+    let (_container, host, port) = ssh_fixture().await;
+    let password = "lifecycle-wrong-password-private";
+    let auth = [
+        OsString::from("--user=test"),
+        OsString::from(format!("--password={password}")),
+        OsString::from("--strict-host-key-checking=no"),
+    ];
+    let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
+    process.send(opening_request(false)).await;
+    process
+        .assert_cold_failure(&["auth", "credentials", "rejected"], &[password])
+        .await;
+}
+
+#[tokio::test]
+async fn cold_silent_tcp_handshake_exits_at_total_readiness_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut process = McpProcess::spawn("127.0.0.1", listener.local_addr().unwrap().port()).await;
+    process.send(opening_request(true)).await;
+    let (_silent_socket, _) = timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    process
+        .assert_cold_failure(&["timed", "timeout", "deadline"], &["secret"])
+        .await;
+    assert!(
+        process.started.elapsed() >= Duration::from_secs(9),
+        "silent SSH did not exercise the total readiness deadline"
+    );
+}
+
+#[tokio::test]
+async fn startup_environment_optional_metadata_keeps_init_and_tools_working() {
+    let (container, host, port) = ssh_fixture().await;
+    // The existing environment fixture pattern intercepts probe utilities from
+    // .bashrc. Authentication still succeeds; only optional nproc metadata hangs.
+    control(&container, METADATA_FIXTURE).await;
     for disable_sudo in [false, true] {
+        control(&container, "printf hang > /home/test/probe-mode").await;
         let mut auth = vec![
             OsString::from("--user=test"),
             OsString::from("--password=secret"),
@@ -341,20 +564,14 @@ async fn startup_environment_unavailable_ssh_keeps_init_and_tools_working() {
         if disable_sudo {
             auth.push(OsString::from("--disable-sudo"));
         }
-        let mut process = McpProcess::spawn_with_auth("127.0.0.1", 9, None, None, &auth).await;
+        let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
         let initialized = process.initialize().await;
         let instructions = initialized["result"]["instructions"].as_str().unwrap();
         let snapshot: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
         assert_eq!(snapshot.as_object().unwrap().len(), 14);
-        assert_eq!(
-            snapshot["virtualization"],
-            json!({"container":null,"vm":null})
-        );
-        for (key, value) in snapshot.as_object().unwrap() {
-            if key != "virtualization" {
-                assert!(value.is_null(), "{key} must be unknown");
-            }
-        }
+        assert_eq!(snapshot["effective_uid"], 1000);
+        assert!(snapshot["available_cpu_parallelism"].is_null());
+        control(&container, "printf normal > /home/test/probe-mode").await;
         process
             .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
             .await;
@@ -389,6 +606,228 @@ async fn startup_environment_unavailable_ssh_keeps_init_and_tools_working() {
     }
 }
 
+const METADATA_FIXTURE: &str = r#"
+set -eu
+mkdir -p /home/test/probebin
+printf 'PATH=/home/test/probebin:$PATH; export PATH\n' > /home/test/.bashrc
+printf normal > /home/test/probe-mode
+cat > /home/test/probebin/nproc <<'SCRIPT'
+#!/bin/sh
+if [ "$(cat /home/test/probe-mode)" = hang ]; then /bin/sleep 20; else printf 7; fi
+SCRIPT
+chmod +x /home/test/probebin/nproc
+chown -R test:test /home/test/probebin /home/test/probe-mode /home/test/.bashrc
+"#;
+
+#[tokio::test]
+async fn warm_outage_keeps_mcp_alive_and_authenticates_again_while_idle() {
+    let (container, host, port) = controlled_ssh_fixture().await;
+    let known_hosts = tempfile::NamedTempFile::new().unwrap();
+    let auth = [
+        OsString::from("--user=test"),
+        OsString::from("--password=secret"),
+        OsString::from("--strict-host-key-checking=accept-new"),
+        OsString::from(format!("--known-hosts={}", known_hosts.path().display())),
+        OsString::from("--reconnect-retries=2"),
+        OsString::from("--reconnect-backoff-ms=20"),
+    ];
+    let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
+    process.initialize().await;
+    let pinned_host_key = std::fs::read(known_hosts.path()).unwrap();
+    assert!(
+        !pinned_host_key.is_empty(),
+        "cold startup did not enroll its host key"
+    );
+    process.send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+        "name":"shell", "arguments":{"command":"printf x >> /home/test/lifecycle-once; printf warm"}
+    }})).await;
+    assert_eq!(tool_text(&process.response(2).await), "warm");
+    process.send(json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+        "name":"shell", "arguments":{"command":"printf x >> /home/test/lifecycle-inflight; sleep 120", "timeout_ms":10000}
+    }})).await;
+    // Witness the side effect before severing SSH, but never obtain a trustworthy
+    // terminal outcome for this operation. Recovery must not replay its payload.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if control(&container, "if [ -f /home/test/lifecycle-inflight ]; then cat /home/test/lifecycle-inflight; fi").await == "x" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("in-flight command did not reach its side effect");
+    let before = authenticated_sessions(&container).await;
+    assert!(
+        before >= 1,
+        "cold startup was not authenticated in sshd logs"
+    );
+
+    control(&container, STOP_SSHD).await;
+    control(
+        &container,
+        r#"
+set -eu
+for file in /proc/[0-9]*/comm; do
+    name=$(cat "$file" 2>/dev/null) || continue
+    case "$name" in sshd*)
+        status=${file%/comm}/status
+        grep -q '^State:.*Z' "$status" || exit 1;;
+    esac
+done
+"#,
+    )
+    .await;
+    // The listener and every session were SIGKILLed, rather than merely paused.
+    // Remain down across multiple 5s recovery ticks and finite retry bursts.
+    let outage_started = tokio::time::Instant::now();
+    let interrupted = process.response(3).await;
+    assert!(interrupted.get("error").is_none(), "{interrupted}");
+    assert_eq!(interrupted["result"]["isError"], true, "{interrupted}");
+    assert!(
+        tool_text(&interrupted).contains("exit status unavailable"),
+        "{interrupted}"
+    );
+    let mut request_id = 4;
+    while outage_started.elapsed() < Duration::from_secs(16) {
+        process
+            .send(json!({"jsonrpc":"2.0", "id":request_id, "method":"ping", "params":{}}))
+            .await;
+        assert!(process.response(request_id).await.get("error").is_none());
+        request_id += 1;
+        process
+            .send(json!({"jsonrpc":"2.0", "id":request_id, "method":"tools/list", "params":{}}))
+            .await;
+        let listed = process.response(request_id).await;
+        assert!(listed.get("error").is_none(), "{listed}");
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 6);
+        request_id += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(authenticated_sessions(&container).await, before);
+    control(&container, START_SSHD).await;
+    wait_for_tcp(&host, port).await;
+
+    // Crucially no tools/call appears between restoration and this witness:
+    // a new Accepted-password log line proves idle transport authentication.
+    let after = timeout(Duration::from_secs(20), async {
+        loop {
+            let count = authenticated_sessions(&container).await;
+            if count > before {
+                break count;
+            }
+            process
+                .send(json!({"jsonrpc":"2.0", "id":request_id, "method":"ping", "params":{}}))
+                .await;
+            assert!(process.response(request_id).await.get("error").is_none());
+            request_id += 1;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("no new authenticated SSH session appeared before an SSH tool call");
+    assert!(after > before);
+    assert_eq!(
+        std::fs::read(known_hosts.path()).unwrap(),
+        pinned_host_key,
+        "recovery changed the known host identity"
+    );
+    eprintln!(
+        "idle recovery witness: authenticated sshd sessions {before} -> {after}; no SSH tool call after restoration"
+    );
+    assert_eq!(
+        control(&container, "cat /home/test/lifecycle-once").await,
+        "x",
+        "recovery replayed a completed operation"
+    );
+    assert_eq!(
+        control(&container, "cat /home/test/lifecycle-inflight").await,
+        "x",
+        "recovery replayed an operation with an unknown terminal outcome"
+    );
+    process
+        .send(
+            json!({"jsonrpc":"2.0", "id":request_id, "method":"tools/call", "params":{
+                "name":"shell", "arguments":{"command":"printf recovered"}
+            }}),
+        )
+        .await;
+    let recovered = process.response(request_id).await;
+    assert_eq!(tool_text(&recovered), "recovered", "{recovered}");
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+
+    let shutdown_sessions = authenticated_sessions(&container).await;
+    control(&container, STOP_SSHD).await;
+    control(&container, START_SSHD).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        authenticated_sessions(&container).await,
+        shutdown_sessions,
+        "recovery continued after process shutdown"
+    );
+}
+
+#[tokio::test]
+async fn cold_strict_host_key_rejection_precedes_mcp_serving() {
+    let (_container, host, port) = ssh_fixture().await;
+    let known_hosts = tempfile::NamedTempFile::new().unwrap();
+    let auth = [
+        OsString::from("--user=test"),
+        OsString::from("--password=secret"),
+        OsString::from("--strict-host-key-checking=yes"),
+        OsString::from(format!("--known-hosts={}", known_hosts.path().display())),
+    ];
+    let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
+    process.send(opening_request(true)).await;
+    process
+        .assert_cold_failure(
+            &["host key", "hostkey", "known_hosts", "unknownkey"],
+            &["secret"],
+        )
+        .await;
+    assert_eq!(
+        std::fs::read(known_hosts.path()).unwrap(),
+        b"",
+        "strict verification enrolled an untrusted key"
+    );
+}
+
+#[tokio::test]
+async fn cold_jump_authentication_is_required_and_uses_configured_identity() {
+    let (_container, host, port) = ssh_fixture().await;
+    let wrong_password = "lifecycle-wrong-jump-password-private";
+    for password in [wrong_password, "jump-secret"] {
+        let auth = [
+            OsString::from("--user=test"),
+            OsString::from("--password=secret"),
+            OsString::from("--strict-host-key-checking=no"),
+            OsString::from(format!("--jump=jump@{host}:{port}")),
+            OsString::from(format!("--jump-password={password}")),
+        ];
+        let mut process = McpProcess::spawn_with_auth("127.0.0.1", 2222, None, None, &auth).await;
+        if password == wrong_password {
+            process.send(opening_request(false)).await;
+            process
+                .assert_cold_failure(
+                    &["auth", "credentials", "rejected"],
+                    &[wrong_password, "secret"],
+                )
+                .await;
+        } else {
+            process.initialize().await;
+            process
+                .send(
+                    json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+                        "name":"shell", "arguments":{"command":"id -un"}
+                    }}),
+                )
+                .await;
+            assert_eq!(tool_text(&process.response(2).await).trim(), "test");
+            process.close_stdin().await;
+            process.assert_successful_exit().await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool() {
     init_test_env().unwrap();
@@ -405,18 +844,10 @@ async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool(
         "io.modelcontextprotocol/clientInfo": {"name":"snapshot-test", "version":"1"},
         "io.modelcontextprotocol/clientCapabilities": {}
     });
-    for (modern, failed_startup) in [(false, false), (true, false), (true, true)] {
-        if failed_startup {
-            let mut changed = container
-                .exec(ExecCommand::new([
-                    "sh",
-                    "-c",
-                    "printf 'test:temporarily-unavailable\\n' | chpasswd",
-                ]))
-                .await
-                .unwrap();
-            changed.stdout_to_vec().await.unwrap();
-            assert_eq!(changed.exit_code().await.unwrap(), Some(0));
+    control(&container, METADATA_FIXTURE).await;
+    for (modern, failed_metadata) in [(false, false), (true, false), (true, true)] {
+        if failed_metadata {
+            control(&container, "printf hang > /home/test/probe-mode").await;
         }
         let mut process = McpProcess::spawn(&host, port).await;
         let initial = if modern {
@@ -431,26 +862,10 @@ async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool(
             .to_owned();
         let snapshot: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
         assert_eq!(snapshot.as_object().unwrap().len(), 14);
-        if failed_startup {
-            assert_eq!(
-                snapshot["virtualization"],
-                json!({"container":null,"vm":null})
-            );
-            for (key, value) in snapshot.as_object().unwrap() {
-                if key != "virtualization" {
-                    assert!(value.is_null(), "{key} must be unknown");
-                }
-            }
-            let mut changed = container
-                .exec(ExecCommand::new([
-                    "sh",
-                    "-c",
-                    "printf 'test:secret\\n' | chpasswd",
-                ]))
-                .await
-                .unwrap();
-            changed.stdout_to_vec().await.unwrap();
-            assert_eq!(changed.exit_code().await.unwrap(), Some(0));
+        if failed_metadata {
+            assert_eq!(snapshot["effective_uid"], 1000);
+            assert!(snapshot["available_cpu_parallelism"].is_null());
+            control(&container, "printf normal > /home/test/probe-mode").await;
         } else {
             assert_eq!(snapshot["effective_uid"], 1000);
             assert_eq!(snapshot["running_as_root"], false);
@@ -520,6 +935,9 @@ async fn startup_environment_signals_cancel_stalled_ssh_before_mcp_serving() {
             started.elapsed() < Duration::from_millis(2500),
             "signal did not cancel bootstrap"
         );
+        let mut stdout = String::new();
+        process.stdout.read_to_string(&mut stdout).await.unwrap();
+        assert!(stdout.is_empty(), "cancelled startup served MCP: {stdout}");
     }
 }
 

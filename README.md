@@ -31,6 +31,30 @@ Full parameter schemas are served to the client at runtime; deeper references li
 
 Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, `tail -n 200 -- /path`, or `sed -n '801,1600p' -- /path`. Use `transfer` with `operation=get` to retrieve files instead of printing large content into the MCP response.
 
+### SSH startup and automatic recovery
+
+Before serving **any MCP request**, the CLI requires an authenticated SSH route
+within a **10-second total readiness deadline**, including any configured jump
+host and host-key verification. Unreachable SSH, rejected credentials or a stalled
+handshake cause a nonzero process exit with a stderr diagnostic, without a
+successful MCP response. This applies to legacy `initialize` and modern clients
+that open with another RPC. The harness chooses the displayed failure label.
+Once the remote is restored, a new server process can connect successfully;
+whether a failed process is relaunched automatically is up to the harness.
+
+After initial authentication, SSH outages **do not close MCP/stdio**. One background
+task checks and restores the shared transport without requiring a tool call or
+harness restart. It waits five seconds between bounded recovery cycles, repeating
+the configured finite retry/backoff bursts until shutdown. Transport acquisition
+and channel opening each have a 30-second total budget, including lock/connection
+owner waits. These are not whole-operation tool deadlines. Failed tools retain
+their existing error and background handoff semantics.
+
+Readiness and background recovery never initiate `su` or `sudo`; existing elevation
+is deferred until a consumer requires it. Recovery does not replay commands,
+patches or transfers. After a lost response the operation's outcome may be unknown;
+check remote state before retrying a side-effecting operation yourself.
+
 ### Rootless startup environment
 
 Before serving MCP, the CLI automatically collects one best-effort remote snapshot
@@ -86,29 +110,32 @@ become unknown; unknown UID also means `running_as_root:null`. Sources include
 and `os-release` parsed as data, never sourced/evaluated. `/usr/lib/os-release`
 is used only when `/etc/os-release` is absent; their contents are never merged.
 
-After server construction, one **3-second total bootstrap budget** covers SSH
-connect/auth/retries, probe waits, execution and best-effort channel cleanup.
-Signals cancel bootstrap before MCP serving. Ordinary tool connections retain their
-existing timeout/retry policies. Raw stdout is capped at 64 KiB, stderr at 4 KiB; text scalars at 1 KiB,
+After mandatory readiness, a separate **3-second total metadata budget** covers
+probe transport checks/retries, waits, execution and best-effort channel cleanup.
+Signals cancel both startup stages before MCP serving. Raw stdout is capped at
+64 KiB, stderr at 4 KiB; text scalars at 1 KiB,
 release/status files at 16 KiB, executable paths at 4 KiB, and ELF at 64 bytes.
 New CPU/virtualization sources use builtins without extra diagnostic utilities;
 their records precede ELF so a missing `dd` does not hide the new information.
 Completed fields survive later timeout/overflow. Metadata failures close only
 the probe channel; closing it is not a guarantee of killing all descendants.
-SSH/authentication failure or establishment timeout produces an unknown snapshot
-instead of failing MCP startup. Normal tools can retry connecting afterwards.
+Missing metadata or a probe timeout does not fail MCP startup. An SSH outage after
+initial authentication likewise becomes partial/unknown metadata and is recovered
+in the background; authentication success is the cold/warm boundary.
 
 The final instructions are frozen for the lifetime of the server process, including
 partial/unknown values. Commands and SSH reconnect do not recollect or rewrite them.
 A new process startup obtains a new snapshot. There is no refresh API, session
 snapshot cache, TTL, polling or background collection. Library construction stays
 lazy; programmatic consumers can use `with_startup_environment` before serving.
+That library hook remains best-effort, including connection failure; mandatory
+readiness and the tracked background recovery task belong to the CLI lifecycle.
 
 **Prompt/KV-cache friendly:** each run's prepared instructions, tool schemas and
 order remain byte-stable through commands and SSH reconnect. Snapshot values are
 labeled data and include no timestamps, elapsed time or cache-hit/session metadata.
 The tradeoff is that this startup snapshot may become stale, or stay unknown after
-an initial connection failure. A new process can produce different instructions;
+an optional probe failure. A new process can produce different instructions;
 provider cache hits and client serialization/history compaction remain outside the
 server's control.
 
@@ -383,7 +410,7 @@ Command jobs return PID, command, log path/tail, and exit state. Transfer jobs r
 
 Cancelling `check_process` stops only its passive local wait. Cancelling the request that created a background job after handoff does not stop that job. Foreground transfer cancellation stops its owned writer and prevents commit; call `check_process` again for authoritative background state.
 
-On SIGINT or SIGTERM, the server cancels the MCP service and performs its bounded request drain before closing SSH. Shutdown prevents new SSH connections and reconnects, but closing the session may terminate channel-bound remote commands; no explicit remote kill or survival guarantee is made.
+On SIGINT or SIGTERM, the server cancels the MCP service and performs its bounded request drain, then cancels and joins background recovery before closing SSH. Shutdown prevents new SSH connections and reconnects, but closing the session may terminate channel-bound remote commands; no explicit remote kill or survival guarantee is made.
 
 For command jobs, the returned state is one of `running`, `completed`, `failed`, or `state_lost`, plus the log tail. `completed` and `failed` include an `exit_code`; `state_lost` means the server no longer has a trustworthy terminal outcome.
 

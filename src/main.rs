@@ -9,14 +9,16 @@ use std::time::Duration;
 use clap::Parser;
 use rmcp::service::ServiceExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use ssh_mcp::config::{Args, Config};
-use ssh_mcp::error::Result;
+use ssh_mcp::error::{Result, SshMcpError};
 use ssh_mcp::logging::init_logging;
 use ssh_mcp::server::SshMcpServer;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+const SSH_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
@@ -113,37 +115,83 @@ async fn run() -> Result<()> {
         signal_lifecycle.cancel();
     });
 
-    // Prepare immutable instructions once, with signals already active. Optional
-    // metadata collection has one total deadline, including SSH establishment.
-    let server = server.with_startup_environment(lifecycle.clone()).await;
     let server_for_shutdown = server.clone();
-    info!("SeSSHion running on stdio");
+    let connection = server.connection().clone();
+    let mut recovery_handle = None;
+    // Keep all startup failures inside this block so signals and SSH always get
+    // the same cleanup. Gate the transport itself, not only legacy initialize.
+    let service_result = async {
+        let readiness = tokio::select! {
+            biased;
+            _ = lifecycle.cancelled() => return Ok(()),
+            result = tokio::time::timeout(
+                STARTUP_READINESS_TIMEOUT,
+                connection.ensure_connected_transport_only(),
+            ) => result.map_err(|_| SshMcpError::connection(
+                "Initial SSH readiness timed out after 10000ms",
+            ))?,
+        };
+        if let Err(e) = readiness {
+            error!(error = ?e, "Initial SSH readiness failed; refusing MCP startup");
+            return Err(e);
+        }
 
-    // Start the MCP server on stdio transport
-    // Note: rmcp's stdio() returns a transport that connects stdin/stdout for JSON-RPC
-    let service_result = match server
-        .serve_with_ct(rmcp::transport::io::stdio(), lifecycle.clone())
-        .await
-    {
-        Ok(running_server) => {
-            // Wait for the server to finish (it will run until the transport closes)
-            info!("MCP server is serving...");
-            if let Err(e) = running_server.waiting().await {
-                error!(error = ?e, "Server error");
+        // Readiness is mandatory; environment collection remains rootless,
+        // optional and frozen, with its own three-second budget.
+        let server = server.with_startup_environment(lifecycle.clone()).await;
+        if lifecycle.is_cancelled() {
+            return Ok(());
+        }
+        let recovery_lifecycle = lifecycle.clone();
+        recovery_handle = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = recovery_lifecycle.cancelled() => break,
+                    _ = tokio::time::sleep(SSH_RECOVERY_INTERVAL) => {}
+                }
+                tokio::select! {
+                    biased;
+                    _ = recovery_lifecycle.cancelled() => break,
+                    result = connection.ensure_connected_transport_only() => {
+                        if let Err(e) = result {
+                            warn!(error = ?e, "SSH unavailable; retaining MCP and retrying in background");
+                        }
+                    }
+                }
             }
-            Ok(())
+        }));
+        info!("SeSSHion running on stdio");
+        match server
+            .serve_with_ct(rmcp::transport::io::stdio(), lifecycle.clone())
+            .await
+        {
+            Ok(running_server) => {
+                info!("MCP server is serving...");
+                if let Err(e) = running_server.waiting().await {
+                    error!(error = ?e, "Server error");
+                }
+                Ok(())
+            }
+            Err(_e) if lifecycle.is_cancelled() => {
+                info!("MCP server initialization cancelled");
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = ?e, "Failed to start MCP server");
+                Err(SshMcpError::connection(e.to_string()))
+            }
         }
-        Err(_e) if lifecycle.is_cancelled() => {
-            info!("MCP server initialization cancelled");
-            Ok(())
-        }
-        Err(e) => {
-            error!(error = ?e, "Failed to start MCP server");
-            Err(ssh_mcp::SshMcpError::connection(e.to_string()))
-        }
-    };
+    }
+    .await;
 
     lifecycle.cancel();
+    if let Some(handle) = recovery_handle {
+        // Both sleeps and in-flight transport acquisition observe lifecycle.
+        if let Err(e) = handle.await {
+            error!(error = ?e, "SSH recovery task failed");
+        }
+    }
     signal_handle.abort();
     if let Err(e) = signal_handle.await
         && !e.is_cancelled()

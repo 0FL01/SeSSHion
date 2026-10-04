@@ -47,6 +47,12 @@ impl Drop for ConnectAttemptGuard<'_> {
     }
 }
 
+impl ActiveRoute {
+    pub(super) fn is_closed(&self) -> bool {
+        self.target.is_closed() || self.jump.as_ref().is_some_and(Handle::is_closed)
+    }
+}
+
 /// SSH Connection Manager
 ///
 /// Manages a persistent SSH connection with the following features:
@@ -80,6 +86,9 @@ pub struct SshConnectionManager {
     /// Made pub(crate) to allow access from command.rs
     pub(crate) su_channel: Arc<Mutex<Option<Channel<client::Msg>>>>,
 
+    // Protected by su_channel's mutex, including while its channel is taken.
+    pub(super) su_generation: AtomicU64,
+
     /// Flag indicating whether we're running as root via su
     /// Made pub(crate) to allow access from command.rs for su state reset
     pub(crate) is_elevated: AtomicBool,
@@ -92,7 +101,7 @@ pub struct SshConnectionManager {
     pub(crate) channel_semaphore: Arc<Semaphore>,
 
     /// Last successful active health probe timestamp
-    last_health_probe_ok_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+    last_health_probe_ok_at: Arc<Mutex<Option<(u64, tokio::time::Instant)>>>,
 
     /// Lock to avoid concurrent active health probes
     health_probe_lock: Arc<Mutex<()>>,
@@ -115,6 +124,7 @@ impl SshConnectionManager {
             shutting_down: AtomicBool::new(false),
             connect_notify: Arc::new(Notify::new()),
             su_channel: Arc::new(Mutex::new(None)),
+            su_generation: AtomicU64::new(0),
             is_elevated: AtomicBool::new(false),
             has_timeout_cmd: AtomicBool::new(false),
             channel_semaphore: Arc::new(Semaphore::new(CHANNEL_SEMAPHORE_CAPACITY)),
@@ -154,7 +164,11 @@ impl SshConnectionManager {
     /// If already connected, returns immediately. If another task is currently
     /// connecting, waits for that connection attempt to complete.
     pub async fn connect(&self) -> Result<()> {
-        self.connect_transport_only().await?;
+        self.bounded_transport(
+            Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+            self.connect_transport_only(),
+        )
+        .await?;
         self.initialize_auto_elevation().await;
         Ok(())
     }
@@ -181,8 +195,7 @@ impl SshConnectionManager {
             .is_err()
         {
             debug!("Another connection attempt in progress, waiting...");
-            // Every establishment phase has its own timeout. Waiting for the
-            // guarded owner avoids a shorter guessed timeout for multi-hop routes.
+            // The caller's total transport budget also bounds this owner wait.
             notified.await;
             return if self.is_shutting_down() {
                 self.ensure_not_shutting_down()
@@ -199,6 +212,22 @@ impl SshConnectionManager {
             connect_notify: self.connect_notify.as_ref(),
         };
 
+        // The first check may precede another owner's publication. Never replace
+        // the route that owner established while this task was waiting to run.
+        self.ensure_not_shutting_down()?;
+        if self.is_connected().await {
+            return Ok(());
+        }
+        let stale_generation = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .map(|route| route.generation);
+        if let Some(generation) = stale_generation {
+            self.invalidate_session_for_generation(generation, "closed route before connect")
+                .await;
+        }
         self.do_connect().await
     }
 
@@ -380,16 +409,14 @@ impl SshConnectionManager {
         {
             let mut session_guard = self.session.lock().await;
             if !self.is_shutting_down() {
+                let mut probe_guard = self.last_health_probe_ok_at.lock().await;
                 *session_guard = route.take();
+                *probe_guard = None;
             }
         }
         if let Some(route) = route {
             Self::disconnect_route(route).await;
             return self.ensure_not_shutting_down();
-        }
-        {
-            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
-            *probe_guard = None;
         }
 
         info!(
@@ -506,10 +533,14 @@ impl SshConnectionManager {
     }
 
     async fn disconnect_handle(session: Handle<SshHandler>) {
-        let _ = session
-            .disconnect(russh::Disconnect::ByApplication, "", "")
-            .await;
-        let _ = timeout(Duration::from_millis(500), session).await;
+        // Bound both enqueueing the disconnect and waiting for its completion.
+        let _ = timeout(Duration::from_millis(500), async {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+            let _ = session.await;
+        })
+        .await;
     }
 
     async fn disconnect_route(route: ActiveRoute) {
@@ -522,7 +553,9 @@ impl SshConnectionManager {
     /// Check if the connection is active
     pub async fn is_connected(&self) -> bool {
         let session_guard = self.session.lock().await;
-        session_guard.is_some()
+        session_guard
+            .as_ref()
+            .is_some_and(|route| !route.is_closed())
     }
 
     /// Ensure connection is established, reconnecting if necessary
@@ -532,47 +565,75 @@ impl SshConnectionManager {
         Ok(())
     }
 
-    pub(super) async fn ensure_connected_transport_only(&self) -> Result<()> {
+    /// Acquire a healthy authenticated route without initiating su/sudo.
+    /// The total budget includes locks, owner waits, retries and teardown.
+    pub async fn ensure_connected_transport_only(&self) -> Result<()> {
+        self.bounded_transport(
+            Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+            self.ensure_transport_inner(),
+        )
+        .await
+    }
+
+    async fn bounded_transport<T>(
+        &self,
+        budget: Duration,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
         self.ensure_not_shutting_down()?;
-
-        let transport_closed = self
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|route| route.target.is_closed());
-        if transport_closed {
-            self.invalidate_session("SSH transport closed").await;
+        tokio::select! {
+            biased;
+            _ = self.shutdown_token.cancelled() => Err(SshMcpError::connection("SSH connection manager is shutting down")),
+            result = timeout(budget, operation) => result.map_err(|_| {
+                SshMcpError::connection(format!("SSH transport acquisition timed out after {}ms", budget.as_millis()))
+            })?,
         }
+    }
 
-        if !self.is_connected().await {
-            return self
-                .connect_with_retry("no active session found during ensure_connected")
-                .await;
+    async fn ensure_transport_inner(&self) -> Result<()> {
+        loop {
+            self.ensure_not_shutting_down()?;
+            let current = self
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .map(|route| (route.generation, route.is_closed()));
+            let Some((generation, closed)) = current else {
+                return self
+                    .connect_with_retry("no active session found during ensure_connected")
+                    .await;
+            };
+            if closed {
+                self.invalidate_session_for_generation(generation, "SSH transport closed")
+                    .await;
+                continue;
+            }
+            if self.is_health_probe_fresh(generation).await {
+                return Ok(());
+            }
+
+            let probe_guard = self.health_probe_lock.lock().await;
+            if self.is_health_probe_fresh(generation).await {
+                return Ok(());
+            }
+            if let Err(probe_error) = self.run_health_probe(generation).await {
+                warn!(error = ?probe_error, "SSH health probe failed");
+                self.invalidate_session_for_generation(generation, "health probe failed")
+                    .await;
+                drop(probe_guard);
+                // A newer owner may already have recovered; recheck that route.
+                if self.is_connected().await {
+                    continue;
+                }
+                return self
+                    .connect_with_retry("health probe failed during ensure_connected")
+                    .await;
+            }
+            if self.mark_health_probe_ok(generation).await {
+                return Ok(());
+            }
         }
-
-        if self.is_health_probe_fresh().await {
-            return Ok(());
-        }
-
-        let _probe_guard = self.health_probe_lock.lock().await;
-        if self.is_health_probe_fresh().await {
-            return Ok(());
-        }
-
-        if let Err(probe_error) = self.run_health_probe().await {
-            warn!(
-                error = ?probe_error,
-                "SSH health probe failed, invalidating session before reconnect"
-            );
-            self.invalidate_session("health probe failed").await;
-            self.connect_with_retry("health probe failed during ensure_connected")
-                .await?;
-        } else {
-            self.mark_health_probe_ok().await;
-        }
-
-        Ok(())
     }
 
     fn health_probe_ttl(&self) -> Duration {
@@ -584,32 +645,62 @@ impl SshConnectionManager {
         Duration::from_millis(ttl_ms)
     }
 
-    async fn is_health_probe_fresh(&self) -> bool {
+    async fn is_health_probe_fresh(&self, generation: u64) -> bool {
+        let session = self.session.lock().await;
+        if !session
+            .as_ref()
+            .is_some_and(|route| route.generation == generation && !route.is_closed())
+        {
+            return false;
+        }
         let guard = self.last_health_probe_ok_at.lock().await;
-        if let Some(last_ok_at) = guard.as_ref() {
-            return last_ok_at.elapsed() < self.health_probe_ttl();
+        if let Some((cached_generation, last_ok_at)) = guard.as_ref() {
+            return *cached_generation == generation
+                && last_ok_at.elapsed() < self.health_probe_ttl();
         }
 
         false
     }
 
-    async fn mark_health_probe_ok(&self) {
+    async fn mark_health_probe_ok(&self, generation: u64) -> bool {
+        let session = self.session.lock().await;
+        if !session
+            .as_ref()
+            .is_some_and(|route| route.generation == generation && !route.is_closed())
+        {
+            return false;
+        }
         let mut guard = self.last_health_probe_ok_at.lock().await;
-        *guard = Some(tokio::time::Instant::now());
+        *guard = Some((generation, tokio::time::Instant::now()));
+        true
     }
 
-    async fn run_health_probe(&self) -> Result<()> {
+    async fn run_health_probe(&self, generation: u64) -> Result<()> {
         let ping_result = {
             let session_guard = self.session.lock().await;
             let route = session_guard
                 .as_ref()
                 .ok_or_else(|| SshMcpError::connection("SSH connection not established"))?;
 
-            timeout(
+            if route.generation != generation || route.is_closed() {
+                return Err(SshMcpError::connection(
+                    "SSH route changed or closed before health probe",
+                ));
+            }
+
+            let result = timeout(
                 Duration::from_millis(self.config.health_probe_timeout_ms),
                 route.target.send_ping(),
             )
-            .await
+            .await;
+            // russh 0.61.2 ignores a lost ping oneshot receiver and returns Ok.
+            // The handle's sender closure must also be checked after the ping.
+            if route.is_closed() {
+                return Err(SshMcpError::connection(
+                    "SSH transport closed during health probe",
+                ));
+            }
+            result
         };
 
         match ping_result {
@@ -704,19 +795,35 @@ impl SshConnectionManager {
     }
 
     pub(super) async fn open_channel_with_generation(&self) -> Result<(u64, Channel<client::Msg>)> {
-        self.ensure_not_shutting_down()?;
-        let session_guard = self.session.lock().await;
-        let route = session_guard
-            .as_ref()
-            .ok_or_else(|| SshMcpError::connection("SSH connection not established"))?;
-
-        let channel = route
-            .target
-            .channel_open_session()
+        self.open_channel_attempt()
             .await
-            .map_err(|e| SshMcpError::connection(format!("Failed to open channel: {}", e)))?;
+            .map_err(|(_, error)| error)
+    }
 
-        Ok((route.generation, channel))
+    pub(crate) async fn open_channel_attempt(
+        &self,
+    ) -> std::result::Result<(u64, Channel<client::Msg>), (Option<u64>, SshMcpError)> {
+        let mut generation = None;
+        let result = self
+            .bounded_transport(Duration::from_secs(CONNECTION_TIMEOUT_SECS), async {
+                let session_guard = self.session.lock().await;
+                let route = session_guard
+                    .as_ref()
+                    .ok_or_else(|| SshMcpError::connection("SSH connection not established"))?;
+                generation = Some(route.generation);
+                if route.is_closed() {
+                    return Err(SshMcpError::connection(
+                        "SSH transport closed before channel open",
+                    ));
+                }
+                let channel =
+                    route.target.channel_open_session().await.map_err(|e| {
+                        SshMcpError::connection(format!("Failed to open channel: {e}"))
+                    })?;
+                Ok((route.generation, channel))
+            })
+            .await;
+        result.map_err(|error| (generation, error))
     }
 
     /// Check if currently elevated to root via su
@@ -823,7 +930,27 @@ impl SshConnectionManager {
     /// Check if an elevated su channel is available
     pub async fn has_su_channel(&self) -> bool {
         let channel_guard = self.su_channel.lock().await;
+        let session = self.session.lock().await;
         channel_guard.is_some()
+            && session.as_ref().is_some_and(|route| {
+                route.generation == self.su_generation.load(Ordering::SeqCst) && !route.is_closed()
+            })
+    }
+
+    pub(super) async fn reset_su_state_for_generation(&self, generation: u64) {
+        let channel = {
+            let mut guard = self.su_channel.lock().await;
+            let session = self.session.lock().await;
+            if session.as_ref().map(|route| route.generation) != Some(generation) {
+                return;
+            }
+            self.is_elevated.store(false, Ordering::SeqCst);
+            self.su_generation.store(0, Ordering::SeqCst);
+            guard.take()
+        };
+        if let Some(channel) = channel {
+            let _ = timeout(Duration::from_millis(100), channel.eof()).await;
+        }
     }
 
     /// Execute a closure with access to the su channel
@@ -938,12 +1065,13 @@ impl SshConnectionManager {
                     ));
                 }
                 *channel_guard = Some(elevated_channel);
+                self.su_generation.store(generation, Ordering::SeqCst);
                 self.is_elevated.store(true, Ordering::SeqCst);
                 info!("Successfully elevated to root via su");
                 Ok(())
             }
             Err(e) => {
-                self.is_elevated.store(false, Ordering::SeqCst);
+                self.reset_su_state_for_generation(generation).await;
                 Err(e)
             }
         }
@@ -1069,8 +1197,9 @@ impl SshConnectionManager {
             let mut channel_guard = self.su_channel.lock().await;
             if let Some(ch) = channel_guard.take() {
                 // Try to close the channel gracefully
-                let _ = ch.eof().await;
+                let _ = timeout(Duration::from_millis(100), ch.eof()).await;
             }
+            self.su_generation.store(0, Ordering::SeqCst);
             self.is_elevated.store(false, Ordering::SeqCst);
         }
 
@@ -1086,20 +1215,18 @@ impl SshConnectionManager {
         let (su_channel, route) = {
             let mut channel_guard = self.su_channel.lock().await;
             let mut session_guard = self.session.lock().await;
+            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
             self.is_elevated.store(false, Ordering::SeqCst);
+            self.su_generation.store(0, Ordering::SeqCst);
+            *probe_guard = None;
             (channel_guard.take(), session_guard.take())
         };
         if let Some(ch) = su_channel {
-            let _ = ch.eof().await;
+            let _ = timeout(Duration::from_millis(100), ch.eof()).await;
         }
         // Close target first, then the jump session that carries it.
         if let Some(route) = route {
             Self::disconnect_route(route).await;
-        }
-
-        {
-            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
-            *probe_guard = None;
         }
 
         info!("SSH connection closed");
@@ -1110,29 +1237,41 @@ impl SshConnectionManager {
     /// This clears the session handle, su_channel, and resets elevation state.
     /// Used when a connection is detected as broken and needs reconnection.
     pub async fn invalidate_session(&self, reason: &str) {
-        warn!(reason = ?reason, "Invalidating SSH session");
+        self.invalidate_session_inner(None, reason).await;
+    }
 
+    /// An old operation may only remove the route on which it ran.
+    pub(crate) async fn invalidate_session_for_generation(&self, generation: u64, reason: &str) {
+        self.invalidate_session_inner(Some(generation), reason)
+            .await;
+    }
+
+    async fn invalidate_session_inner(&self, expected: Option<u64>, reason: &str) {
         // Take channel out of mutex before awaiting to avoid deadlock
         let (channel, route) = {
             let mut channel_guard = self.su_channel.lock().await;
             let mut session_guard = self.session.lock().await;
+            if expected.is_some()
+                && session_guard.as_ref().map(|route| route.generation) != expected
+            {
+                return;
+            }
+            warn!(reason = ?reason, "Invalidating SSH session");
+            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
             self.is_elevated.store(false, Ordering::SeqCst);
+            self.su_generation.store(0, Ordering::SeqCst);
+            *probe_guard = None;
             (channel_guard.take(), session_guard.take())
         };
 
         // Drop lock before awaiting EOF
         if let Some(ch) = channel {
-            let _ = ch.eof().await;
+            let _ = timeout(Duration::from_millis(100), ch.eof()).await;
         }
         // Attempt best-effort graceful disconnect with short timeout.
 
         if let Some(route) = route {
             Self::disconnect_route(route).await;
-        }
-
-        {
-            let mut probe_guard = self.last_health_probe_ok_at.lock().await;
-            *probe_guard = None;
         }
 
         debug!(reason = ?reason, "Session invalidated");
@@ -1144,11 +1283,13 @@ impl SshConnectionManager {
     /// connection is required. It clears all session state and performs
     /// a new connection attempt.
     pub async fn reconnect(&self) -> Result<()> {
-        self.ensure_not_shutting_down()?;
-        self.invalidate_session("explicit reconnect requested")
-            .await;
-        self.connect_with_retry("explicit reconnect requested")
-            .await?;
+        self.bounded_transport(Duration::from_secs(CONNECTION_TIMEOUT_SECS), async {
+            self.invalidate_session("explicit reconnect requested")
+                .await;
+            self.connect_with_retry("explicit reconnect requested")
+                .await
+        })
+        .await?;
         self.initialize_auto_elevation().await;
         Ok(())
     }
@@ -1174,6 +1315,315 @@ impl std::fmt::Debug for SshConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestPeer {
+        stall_channel_open: bool,
+        channel_opened: Arc<Notify>,
+    }
+
+    impl russh::server::Handler for TestPeer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: Channel<russh::server::Msg>,
+            _: &mut russh::server::Session,
+        ) -> std::result::Result<bool, Self::Error> {
+            self.channel_opened.notify_one();
+            if self.stall_channel_open {
+                std::future::pending::<()>().await;
+            }
+            Ok(true)
+        }
+    }
+
+    // Real russh handles over an in-memory transport; no Docker or SSH daemon.
+    async fn test_route(stall_channel_open: bool, channel_opened: Arc<Notify>) -> ActiveRoute {
+        let key = russh::keys::PrivateKey::new(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
+            "unit-test",
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            ..Default::default()
+        });
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let session = russh::server::run_stream(
+                config,
+                server_stream,
+                TestPeer {
+                    stall_channel_open,
+                    channel_opened,
+                },
+            )
+            .await
+            .unwrap();
+            let _ = session.await;
+        });
+        let handler = SshHandler::new(
+            "unit-test",
+            22,
+            super::super::config::HostKeyCheckMode::No,
+            None,
+        );
+        let mut target =
+            client::connect_stream(Arc::new(client::Config::default()), client_stream, handler)
+                .await
+                .unwrap();
+        assert!(
+            target
+                .authenticate_password("test", "test")
+                .await
+                .unwrap()
+                .success()
+        );
+        ActiveRoute {
+            target,
+            jump: None,
+            generation: 1,
+            auto_elevation_attempted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_owner_rechecks_route_after_first_check() {
+        let manager =
+            SshConnectionManager::new(SshConfig::new("127.0.0.1", "test").with_port(9)).await;
+        let route = test_route(false, Arc::new(Notify::new())).await;
+        let guard = manager.session.lock().await;
+        let connect = manager.connect_transport_only();
+        tokio::pin!(connect);
+        // Queue the first connection check, then a publication, on the route lock.
+        tokio::select! {
+            biased;
+            _ = &mut connect => panic!("connection should wait on the route lock"),
+            _ = std::future::ready(()) => {},
+        }
+        let publish = async {
+            *manager.session.lock().await = Some(route);
+        };
+        tokio::pin!(publish);
+        tokio::select! {
+            biased;
+            _ = &mut publish => panic!("publication should wait on the route lock"),
+            _ = std::future::ready(()) => {},
+        }
+        drop(guard);
+        let (result, ()) = tokio::join!(connect, publish);
+        result.expect("reuse the route published after the first connection check");
+        assert_eq!(manager.session.lock().await.as_ref().unwrap().generation, 1);
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_old_generation_cannot_reset_health_or_restore_su() {
+        let manager = SshConnectionManager::new(SshConfig::new("unit-test", "test")).await;
+        *manager.session.lock().await = Some(test_route(false, Arc::new(Notify::new())).await);
+        let (old_generation, channel) = manager.open_channel_with_generation().await.unwrap();
+        *manager.su_channel.lock().await = Some(channel);
+        manager
+            .su_generation
+            .store(old_generation, Ordering::SeqCst);
+        manager.is_elevated.store(true, Ordering::SeqCst);
+        let (generation, borrowed) = manager.try_take_su_channel().await.unwrap();
+        let (_, spare_old_channel) = manager.open_channel_with_generation().await.unwrap();
+        manager
+            .invalidate_session_for_generation(generation, "test replacement")
+            .await;
+        let mut route = test_route(false, Arc::new(Notify::new())).await;
+        route.generation = 2;
+        *manager.session.lock().await = Some(route);
+        manager.restore_su_channel(generation, borrowed).await;
+        assert!(
+            manager.su_channel.lock().await.is_none(),
+            "old shell must not populate the new route's empty SU slot"
+        );
+        let (_, new_channel) = manager.open_channel_with_generation().await.unwrap();
+        *manager.su_channel.lock().await = Some(new_channel);
+        manager.su_generation.store(2, Ordering::SeqCst);
+        manager.is_elevated.store(true, Ordering::SeqCst);
+        assert!(manager.mark_health_probe_ok(2).await);
+
+        manager
+            .restore_su_channel(generation, spare_old_channel)
+            .await;
+        manager.reset_su_state_for_generation(generation).await;
+        manager
+            .invalidate_session_for_generation(generation, "late old failure")
+            .await;
+        assert!(!manager.mark_health_probe_ok(generation).await);
+        assert!(!manager.is_health_probe_fresh(generation).await);
+        assert!(manager.is_health_probe_fresh(2).await);
+        assert!(manager.is_elevated());
+        assert!(manager.has_su_channel().await);
+        assert_eq!(manager.su_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(manager.session.lock().await.as_ref().unwrap().generation, 2);
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_transport_readiness_is_rootless_and_closed_route_bypasses_cache() {
+        let manager = SshConnectionManager::new(
+            SshConfig::new("unit-test", "test").with_su_password("unused"),
+        )
+        .await;
+        *manager.session.lock().await = Some(test_route(false, Arc::new(Notify::new())).await);
+        timeout(
+            Duration::from_secs(2),
+            manager.ensure_connected_transport_only(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(manager.is_health_probe_fresh(1).await);
+        assert!(!manager.is_elevated());
+        {
+            let session = manager.session.lock().await;
+            let route = session.as_ref().unwrap();
+            assert!(!route.auto_elevation_attempted);
+            route
+                .target
+                .disconnect(russh::Disconnect::ByApplication, "test", "")
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while manager.is_connected().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!manager.is_health_probe_fresh(1).await);
+        assert!(!manager.mark_health_probe_ok(1).await);
+        assert!(manager.run_health_probe(1).await.is_err());
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_transport_budget_includes_route_lock_owner_wait_and_backoff() {
+        let mut config = SshConfig::new("127.0.0.1", "test").with_port(9);
+        config.reconnect_backoff_ms = 30_000;
+        let manager = SshConnectionManager::new(config).await;
+        let budget = Duration::from_millis(30);
+        let guard = manager.session.lock().await;
+        assert!(
+            manager
+                .bounded_transport(budget, manager.ensure_transport_inner())
+                .await
+                .is_err()
+        );
+        drop(guard);
+        manager.is_connecting.store(true, Ordering::SeqCst);
+        let owner = ConnectAttemptGuard {
+            is_connecting: &manager.is_connecting,
+            connect_notify: &manager.connect_notify,
+        };
+        assert!(
+            manager
+                .bounded_transport(budget, manager.ensure_transport_inner())
+                .await
+                .is_err()
+        );
+        drop(owner);
+        let error = manager
+            .bounded_transport(budget, manager.ensure_transport_inner())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transport acquisition timed out")
+        );
+        assert!(!manager.is_connecting.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_channel_open_blackhole_releases_route_lock_at_budget() {
+        let manager =
+            Arc::new(SshConnectionManager::new(SshConfig::new("unit-test", "test")).await);
+        let opened = Arc::new(Notify::new());
+        *manager.session.lock().await = Some(test_route(true, opened.clone()).await);
+        let task_manager = manager.clone();
+        let open = tokio::spawn(async move { task_manager.open_channel_attempt().await });
+        timeout(Duration::from_secs(5), opened.notified())
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(20), manager.session.lock())
+                .await
+                .is_err()
+        );
+        let (generation, error) = timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS + 2), open)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(generation, Some(1));
+        assert!(
+            error
+                .to_string()
+                .contains("transport acquisition timed out")
+        );
+        let guard = timeout(Duration::from_millis(100), manager.session.lock())
+            .await
+            .unwrap();
+        assert!(guard.is_some());
+        drop(guard);
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_cancels_connect_owner_and_waiter() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let manager = Arc::new(
+            SshConnectionManager::new(
+                SshConfig::new("127.0.0.1", "test")
+                    .with_port(listener.local_addr().unwrap().port())
+                    .with_password("test"),
+            )
+            .await,
+        );
+        let owner_manager = manager.clone();
+        let owner =
+            tokio::spawn(async move { owner_manager.ensure_connected_transport_only().await });
+        let (_stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let waiter_manager = manager.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_manager.ensure_connected_transport_only().await });
+        manager.close().await;
+        assert!(
+            timeout(Duration::from_millis(100), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(100), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(!manager.is_connecting.load(Ordering::SeqCst));
+        assert!(!manager.is_connected().await);
+    }
 
     #[tokio::test]
     async fn test_connection_manager_creation() {

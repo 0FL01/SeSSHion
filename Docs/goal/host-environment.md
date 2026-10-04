@@ -43,6 +43,9 @@ every required outcome is resolved and affected constraints remain satisfied.
     ordinary command initializes su once and runs as UID 0.
 - R3: One 3-second bootstrap deadline includes SSH connect/auth/retries and probe
   waits/read/cleanup; missing, malformed and unreadable sources degrade to null.
+  - Current CLI contract: the successful MCP startup on initial SSH failure below
+    is superseded by [cold readiness and idle recovery](cold-start-readiness-and-idle-recovery.md).
+    The library's best-effort hook and optional 3-second metadata budget remain.
   - Source: original fallback request; approved plan, step 2.
   - Acceptance: bounded bytes and completed-record partials; transport failure or
     establishment timeout yields an unknown snapshot without failing MCP startup;

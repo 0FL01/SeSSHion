@@ -393,17 +393,24 @@ impl SshMcpServer {
     async fn try_open_and_exec_background_wrapper(
         &self,
         wrapped_wrapper: &str,
-    ) -> std::result::Result<russh::Channel<russh::client::Msg>, String> {
-        let channel = self
-            .connection
-            .open_channel()
-            .await
-            .map_err(|e| format!("failed to open background channel: {e}"))?;
+    ) -> std::result::Result<russh::Channel<russh::client::Msg>, (Option<u64>, String)> {
+        let (generation, channel) =
+            self.connection
+                .open_channel_attempt()
+                .await
+                .map_err(|(generation, e)| {
+                    (
+                        generation,
+                        format!("failed to open background channel: {e}"),
+                    )
+                })?;
 
-        channel
-            .exec(true, wrapped_wrapper)
-            .await
-            .map_err(|e| format!("failed to send background exec request: {e}"))?;
+        channel.exec(true, wrapped_wrapper).await.map_err(|e| {
+            (
+                Some(generation),
+                format!("failed to send background exec request: {e}"),
+            )
+        })?;
 
         Ok(channel)
     }
@@ -417,13 +424,20 @@ impl SshMcpServer {
             .await
         {
             Ok(channel) => Ok(channel),
-            Err(first_err) => {
+            Err((generation, first_err)) => {
                 warn!(
                     error = ?first_err,
                     "Background wrapper pre-exec failed, reconnecting once"
                 );
 
-                if let Err(reconnect_err) = self.connection.reconnect().await {
+                // These failures precede atomic exec enqueueing. Remove only
+                // the failed route, never an independently recovered replacement.
+                if let Some(generation) = generation {
+                    self.connection
+                        .invalidate_session_for_generation(generation, "background pre-exec failed")
+                        .await;
+                }
+                if let Err(reconnect_err) = self.connection.ensure_connected().await {
                     return Err(format!(
                         "background pre-exec failed ({first_err}); reconnect failed: {reconnect_err}"
                     ));
@@ -431,7 +445,7 @@ impl SshMcpServer {
 
                 self.try_open_and_exec_background_wrapper(wrapped_wrapper)
                     .await
-                    .map_err(|retry_err| {
+                    .map_err(|(_, retry_err)| {
                         format!(
                             "background pre-exec failed ({first_err}); retry failed: {retry_err}"
                         )

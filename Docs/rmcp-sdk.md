@@ -18,6 +18,9 @@ Tool failures remain completed results with `isError: true`, not JSON-RPC errors
 `ProtocolVersion::LATEST` is MCP `2026-07-28`. The SDK handles discovery and
 per-request metadata for the modern lifecycle, as well as version negotiation
 for clients using `initialize`. There is no application compatibility layer.
+The CLI gates authenticated SSH readiness before starting the stdio service, so
+cold failures also reject modern opening RPCs without `initialize`. Once ready,
+SSH recovery does not restart MCP or repeat initialization.
 Background jobs remain SeSSHion's `job_id` / `check_process` contract; upgrading
 the SDK does not enable MCP Tasks, MRTR, subscriptions, caching, or HTTP transport.
 

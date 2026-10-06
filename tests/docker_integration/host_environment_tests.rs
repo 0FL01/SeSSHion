@@ -1,4 +1,4 @@
-//! Startup-only rootless metadata, immutable instructions and bounded failures.
+//! Startup-only rootless metadata/transfer advice, immutable instructions and bounded failures.
 
 use super::common::*;
 use rmcp::ServerHandler;
@@ -62,7 +62,7 @@ async fn container(image: &str) -> ContainerAsync<GenericImage> {
     container
 }
 
-async fn control(container: &ContainerAsync<GenericImage>, script: &str) -> String {
+async fn control_bytes(container: &ContainerAsync<GenericImage>, script: &str) -> Vec<u8> {
     let mut output = container
         .exec(ExecCommand::new(["sh", "-c", script]))
         .await
@@ -73,7 +73,19 @@ async fn control(container: &ContainerAsync<GenericImage>, script: &str) -> Stri
         Some(0),
         "fixture script failed: {script}"
     );
-    String::from_utf8(bytes).unwrap()
+    bytes
+}
+
+async fn control(container: &ContainerAsync<GenericImage>, script: &str) -> String {
+    String::from_utf8(control_bytes(container, script).await).unwrap()
+}
+
+async fn startup_files(container: &ContainerAsync<GenericImage>) -> String {
+    control(
+        container,
+        "find /home/test /tmp -mindepth 1 -printf '%p\\n' | LC_ALL=C sort",
+    )
+    .await
 }
 
 async fn unprepared_server(container: &ContainerAsync<GenericImage>, su: bool) -> SshMcpServer {
@@ -90,8 +102,24 @@ async fn unprepared_server(container: &ContainerAsync<GenericImage>, su: bool) -
 
 fn snapshot(server: &SshMcpServer) -> Value {
     let instructions = server.get_info().instructions.unwrap();
-    serde_json::from_str(instructions.lines().last().unwrap()).unwrap()
+    let value: Value = serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 14);
+    value
 }
+
+fn transfer_hint(server: &SshMcpServer) -> String {
+    let instructions = server.get_info().instructions.unwrap();
+    let hints: Vec<_> = instructions
+        .lines()
+        .filter(|line| line.starts_with("Transfer: "))
+        .collect();
+    assert_eq!(hints.len(), 1, "one frozen, single-line transfer hint");
+    // Keep the compact 14-field JSON as the final instruction line.
+    snapshot(server);
+    hints[0].to_owned()
+}
+
+const PASSWORD_TRANSFER_HINT: &str = "Transfer: prefer exec-raw; startup preflight (may be stale): ok=exec-raw; blocked=rsync,sftp,scp.";
 
 async fn working_command(server: &SshMcpServer) {
     let output = server
@@ -162,12 +190,15 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
 "#,
     )
     .await;
+    let files_before = startup_files(&container).await;
     let server = unprepared_server(&container, true)
         .await
         .with_startup_environment(CancellationToken::new())
         .await;
     let instructions = serde_json::to_vec(&server.get_info()).unwrap();
     let value = snapshot(&server);
+    assert_eq!(transfer_hint(&server), PASSWORD_TRANSFER_HINT);
+    assert_eq!(startup_files(&container).await, files_before);
     assert_eq!(value.as_object().unwrap().len(), 14);
     assert_eq!(value["hostname"], "initial");
     assert_eq!(value["os"], "Linux");
@@ -244,6 +275,7 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
         .await
         .with_startup_environment(CancellationToken::new())
         .await;
+    assert_eq!(transfer_hint(&next), PASSWORD_TRANSFER_HINT);
     assert_eq!(snapshot(&next)["hostname"], "changed");
     assert_eq!(snapshot(&next)["virtualization"]["container"], "podman");
     assert_eq!(
@@ -253,6 +285,122 @@ chmod +x /home/test/probebin/su /home/test/probebin/sudo
         "2"
     );
     next.shutdown().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn startup_transfer_key_sftp_success_keeps_unprobed_transports_unknown() {
+    if !check_sftp() || !check_openssh_client("ssh") {
+        tracing::warn!("skipping: local OpenSSH ssh/sftp clients unavailable");
+        return;
+    }
+    let container = container("ssh-mcp-debian-sshd").await;
+    control(&container, FIXTURE).await;
+    let (_key_dir, key_path) = setup_test_key();
+    let mut config = config(
+        container.get_host().await.unwrap().to_string(),
+        container.get_host_port_ipv4(2222).await.unwrap(),
+    );
+    config.password = None;
+    config.key = Some(key_path);
+    let files_before = startup_files(&container).await;
+    let unprepared = SshMcpServer::new(config).await.unwrap();
+    let start = Instant::now();
+    let server = unprepared
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    assert!(start.elapsed() < Duration::from_millis(3500));
+    assert_eq!(
+        transfer_hint(&server),
+        "Transfer: prefer sftp; startup preflight (may be stale): ok=sftp,exec-raw; unknown=rsync,scp."
+    );
+    let value = snapshot(&server);
+    assert_eq!(value["hostname"], "initial");
+    assert_eq!(value["effective_uid"], 1000);
+    assert_eq!(startup_files(&container).await, files_before);
+    working_command(&server).await;
+    server.shutdown().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn startup_transfer_closed_sftp_is_unknown_and_recommended_raw_file_put_works() {
+    if !check_sftp() || !check_openssh_client("ssh") {
+        tracing::warn!("skipping: local OpenSSH ssh/sftp clients unavailable");
+        return;
+    }
+    let container = container("ssh-mcp-debian-sshd").await;
+    control(&container, FIXTURE).await;
+    // Only this disposable container is changed. Validate before asking the
+    // foreground sshd to re-exec; leave shell/exec channels and key auth enabled.
+    control(
+        &container,
+        r#"
+set -eu
+sed -i 's|^[[:space:]]*Subsystem[[:space:]][[:space:]]*sftp[[:space:]].*$|Subsystem sftp /bin/false|' /etc/ssh/sshd_config
+/usr/sbin/sshd -t
+kill -HUP "$(cat /run/sshd.pid)"
+"#,
+    )
+    .await;
+    let (_key_dir, key_path) = setup_test_key();
+    let mut config = config(
+        container.get_host().await.unwrap().to_string(),
+        container.get_host_port_ipv4(2222).await.unwrap(),
+    );
+    config.password = None;
+    config.key = Some(key_path);
+    // The metadata fixture deliberately limits ordinary command output to one
+    // token. This test also transfers a file, whose existing HOME/staging
+    // commands need their normal output budget; startup probes stay bounded
+    // independently of that setting.
+    config.max_output_tokens = Some(1000);
+    let files_before = startup_files(&container).await;
+    let unprepared = SshMcpServer::new(config).await.unwrap();
+    let start = Instant::now();
+    let server = unprepared
+        .with_startup_environment(CancellationToken::new())
+        .await;
+    assert!(start.elapsed() < Duration::from_millis(3500));
+    assert_eq!(
+        transfer_hint(&server),
+        "Transfer: prefer exec-raw; startup preflight (may be stale): ok=exec-raw; unknown=rsync,sftp,scp."
+    );
+    let value = snapshot(&server);
+    assert_eq!(value["hostname"], "initial");
+    assert_eq!(value["effective_uid"], 1000);
+    assert_eq!(startup_files(&container).await, files_before);
+    working_command(&server).await;
+
+    // The server's transfer root is the current directory; keep the payload
+    // inside it, with TempDir owning cleanup even if an assertion fails.
+    let local_root = std::env::current_dir().unwrap();
+    assert!(local_root.is_dir());
+    let local_dir = tempfile::tempdir_in(&local_root).unwrap();
+    let local_file = local_dir.path().join("hint-transfer.bin");
+    let payload = b"hint-directed exec-raw transfer\0\xff\r\n";
+    std::fs::write(&local_file, payload).unwrap();
+    let instructions = server.get_info().instructions;
+    let response = server
+        .test_transfer(TransferParams {
+            operation: TransferOperation::Put,
+            local_path: local_file.to_string_lossy().into_owned(),
+            remote_path: "/home/test/hint-transfer.bin".into(),
+            transport: TransferTransport::ExecRaw,
+            kind: Some(TransferKind::File),
+            overwrite: false,
+            timeout_ms: Some(5000),
+            ..Default::default()
+        })
+        .await;
+    assert!(response.ok, "one explicit raw PUT: {:?}", response.error);
+    assert_eq!(response.transport_used, TransferTransport::ExecRaw);
+    assert_eq!(
+        control_bytes(&container, "cat /home/test/hint-transfer.bin").await,
+        payload
+    );
+    assert_eq!(server.get_info().instructions, instructions);
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -280,6 +428,13 @@ async fn startup_environment_partial_timeout_flood_and_cancellation_preserve_ssh
             assert_eq!(partial["effective_uid"], 1000);
         }
         assert!(partial["available_cpu_parallelism"].is_null());
+        if mode == "hang" {
+            assert_eq!(
+                transfer_hint(&prepared),
+                PASSWORD_TRANSFER_HINT,
+                "metadata timeout must not erase the completed raw preflight"
+            );
+        }
         let instructions = prepared.get_info().instructions;
         control(&container, "printf normal > /home/test/probe-mode").await;
         working_command(&prepared).await;
@@ -340,6 +495,43 @@ async fn startup_environment_partial_timeout_flood_and_cancellation_preserve_ssh
     .await;
     working_command(&cancelled).await;
     cancelled.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_raw_preflight_requires_exact_binary_output_and_zero_exit() {
+    let container = container("ssh-mcp-debian-sshd").await;
+    control(
+        &container,
+        "mkdir -p /home/test/probebin; printf 'PATH=/home/test/probebin:$PATH; export PATH\n' > /home/test/.bashrc; chown test:test /home/test/.bashrc",
+    )
+    .await;
+    for script in [
+        "/bin/cat >/dev/null; printf wrong",
+        "/bin/cat; exit 7",
+        "/bin/sleep 20",
+    ] {
+        control(
+            &container,
+            &format!(
+                "printf '#!/bin/sh\\n%s\\n' '{script}' > /home/test/probebin/cat; chmod +x /home/test/probebin/cat"
+            ),
+        )
+        .await;
+        let unprepared = unprepared_server(&container, false).await;
+        let start = Instant::now();
+        let server = unprepared
+            .with_startup_environment(CancellationToken::new())
+            .await;
+        assert!(start.elapsed() < Duration::from_millis(3500));
+        assert_eq!(
+            transfer_hint(&server),
+            "Transfer: prefer auto; startup preflight (may be stale): blocked=rsync,sftp,scp; unknown=exec-raw.",
+            "inconclusive raw channel must not be recommended: {script}"
+        );
+        assert_eq!(snapshot(&server)["effective_uid"], 1000);
+        working_command(&server).await;
+        server.shutdown().await;
+    }
 }
 
 #[tokio::test]

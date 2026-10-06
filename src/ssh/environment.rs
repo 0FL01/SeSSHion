@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::{SshConnectionManager, sanitize::wrap_in_posix_shell};
 use crate::error::{Result, SshMcpError};
 
-const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(3);
+pub(crate) const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(3);
 const CLEANUP_RESERVE: Duration = Duration::from_millis(50);
 const STDOUT_LIMIT: usize = 64 * 1024;
 const STDERR_LIMIT: usize = 4 * 1024;
@@ -161,8 +161,8 @@ impl SshConnectionManager {
     pub(crate) async fn collect_startup_environment(
         &self,
         cancellation: CancellationToken,
+        deadline: Instant,
     ) -> Result<HostEnvironment> {
-        let deadline = Instant::now() + BOOTSTRAP_BUDGET;
         let operation = async {
             self.ensure_connected_transport_only().await?;
             let _permit = self.acquire_command_slot().await?;
@@ -199,6 +199,86 @@ impl SshConnectionManager {
                 .map_err(|_| SshMcpError::Timeout(BOOTSTRAP_BUDGET.as_millis() as u64))?,
         }
     }
+
+    /// Check the binary file channel without PTY, auto-su, or transfer payload files.
+    /// It shares the optional startup deadline with metadata and external probes.
+    pub(crate) async fn probe_startup_exec_raw(
+        &self,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let operation = async {
+            self.ensure_connected_transport_only().await?;
+            let _permit = self.acquire_command_slot().await?;
+            let (generation, channel) = self.open_channel_with_generation().await?;
+            let mut channel = ProbeChannel(Some(channel));
+            let passed =
+                collect_binary_echo(channel.0.as_mut().expect("live probe channel"), deadline)
+                    .await?;
+            let session = self.session.lock().await;
+            Ok(passed
+                && !cancellation.is_cancelled()
+                && session.as_ref().is_some_and(|route| {
+                    route.generation == generation
+                        && !route.target.is_closed()
+                        && !self.is_shutting_down()
+                }))
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(SshMcpError::connection("Startup raw preflight cancelled")),
+            _ = self.shutdown_token.cancelled() => Err(SshMcpError::connection("SSH connection manager is shutting down")),
+            result = timeout_at(deadline, operation) => result
+                .map_err(|_| SshMcpError::Timeout(BOOTSTRAP_BUDGET.as_millis() as u64))?,
+        }
+    }
+}
+
+async fn collect_binary_echo(
+    channel: &mut Channel<client::Msg>,
+    deadline: Instant,
+) -> Result<bool> {
+    const PAYLOAD: &[u8] = b"SeSSHion\0\xff\x80\r\n";
+    let operation = async {
+        channel
+            .exec(true, wrap_in_posix_shell("exec cat", false))
+            .await
+            .map_err(|error| {
+                SshMcpError::connection(format!("Raw preflight exec failed: {error}"))
+            })?;
+        channel.data(PAYLOAD).await.map_err(|error| {
+            SshMcpError::connection(format!("Raw preflight stdin failed: {error}"))
+        })?;
+        channel.eof().await.map_err(|error| {
+            SshMcpError::connection(format!("Raw preflight EOF failed: {error}"))
+        })?;
+        let mut stdout = Vec::with_capacity(PAYLOAD.len());
+        let mut stderr_bytes = 0usize;
+        let mut exit_code = None;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    if append_bounded(&mut stdout, &data, PAYLOAD.len()) {
+                        return Ok(false);
+                    }
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    stderr_bytes = stderr_bytes.saturating_add(data.len());
+                    if stderr_bytes > STDERR_LIMIT {
+                        return Ok(false);
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
+                Some(ChannelMsg::Failure | ChannelMsg::ExitSignal { .. }) => return Ok(false),
+                Some(ChannelMsg::Close) | None => break,
+                _ => {}
+            }
+        }
+        Ok(stdout == PAYLOAD && exit_code == Some(0))
+    };
+    let result = timeout_at(deadline - CLEANUP_RESERVE, operation).await;
+    let _ = timeout_at(deadline, channel.close()).await;
+    result.unwrap_or(Ok(false))
 }
 
 async fn collect(
@@ -992,7 +1072,14 @@ mod tests {
             let call = {
                 let manager = manager.clone();
                 let cancellation = cancellation.clone();
-                tokio::spawn(async move { manager.collect_startup_environment(cancellation).await })
+                tokio::spawn(async move {
+                    manager
+                        .collect_startup_environment(
+                            cancellation,
+                            Instant::now() + BOOTSTRAP_BUDGET,
+                        )
+                        .await
+                })
             };
             // A real TCP connection with no SSH greeting stalls establishment.
             let (_socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
@@ -1026,7 +1113,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(
             manager
-                .collect_startup_environment(CancellationToken::new())
+                .collect_startup_environment(CancellationToken::new(), started + BOOTSTRAP_BUDGET)
                 .await,
             Err(SshMcpError::Timeout(3000))
         ));

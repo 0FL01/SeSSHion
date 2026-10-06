@@ -110,8 +110,9 @@ become unknown; unknown UID also means `running_as_root:null`. Sources include
 and `os-release` parsed as data, never sourced/evaluated. `/usr/lib/os-release`
 is used only when `/etc/os-release` is absent; their contents are never merged.
 
-After mandatory readiness, a separate **3-second total metadata budget** covers
-probe transport checks/retries, waits, execution and best-effort channel cleanup.
+After mandatory readiness, one optional **3-second total budget** is shared by
+the snapshot and startup transfer preflight, including transport checks/retries,
+waits, execution and best-effort cleanup.
 Signals cancel both startup stages before MCP serving. Raw stdout is capped at
 64 KiB, stderr at 4 KiB; text scalars at 1 KiB,
 release/status files at 16 KiB, executable paths at 4 KiB, and ELF at 64 bytes.
@@ -122,6 +123,25 @@ the probe channel; closing it is not a guarantee of killing all descendants.
 Missing metadata or a probe timeout does not fail MCP startup. An SSH outage after
 initial authentication likewise becomes partial/unknown metadata and is recovered
 in the background; authentication success is the cold/warm boundary.
+
+One compact `Transfer:` advice line appears before the final snapshot JSON. It
+uses actual rootless probes: a direct raw SSH channel round-trips a small binary
+payload through `cat`, while the external OpenSSH `sftp` client opens the configured
+route and sends only `quit`. Neither creates transfer payload files or initiates
+`su`/`sudo`. External transports require a target key and, with a jump host, a
+separate jump key plus Unix support; password-only routes mark them blocked.
+SCP and rsync stay unknown unless an existing configuration/availability gate
+blocks them. Probe errors, a closed SFTP subsystem and timeouts stay unknown;
+successful SFTP is preferred, otherwise a successful raw probe recommends
+explicit `transport="exec-raw"`. Completed results survive another probe's timeout.
+The external startup probe runs on Linux/macOS; elsewhere it stays unknown when
+eligible, without changing runtime transport support.
+
+This frozen, potentially stale advice is only a basic preflight: it does not
+guarantee path permissions, staging or directory/tar support. It does not change
+`auto`, the default or explicit transport behavior, tool-error narration, or add
+a runtime transport cache. Host-key policy remains unchanged; `accept-new` may
+update `known_hosts` during probing.
 
 The final instructions are frozen for the lifetime of the server process, including
 partial/unknown values. Commands and SSH reconnect do not recollect or rewrite them.

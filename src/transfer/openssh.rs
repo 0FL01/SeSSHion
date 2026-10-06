@@ -103,7 +103,7 @@ fn null_known_hosts_path() -> &'static str {
     "NUL"
 }
 
-fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
+pub(super) fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
     let mut opts = vec![
         "-i".to_string(),
         endpoint.key_path.display().to_string(),

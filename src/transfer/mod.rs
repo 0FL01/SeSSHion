@@ -13,6 +13,7 @@ mod process;
 mod rsync;
 mod skeleton;
 mod staging;
+pub(crate) mod startup;
 mod tar;
 mod types;
 mod walk;

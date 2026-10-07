@@ -4,7 +4,6 @@ pub mod auth_tests;
 pub mod check_process_tests;
 pub mod common;
 pub mod exec_raw_tests;
-pub mod fallback_tests;
 pub mod fish_tests;
 pub mod host_environment_tests;
 pub mod jump_tests;

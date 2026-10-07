@@ -25,9 +25,16 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 | `check_process` | Poll a command or transfer background job by `job_id`. |
 | `apply_patch` | Create, update, or delete remote UTF-8 files with one exact patch (atomic per file, conflict-checked). |
 | `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
-| `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. `auto` falls back through `rsync` → `sftp` → `scp` → `exec-raw` only when a transport is unavailable before writing. |
+| `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. Requires an explicit transport; no automatic fallback. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
+
+Every `transfer` call must set `transport` to `rsync`, `sftp`, `scp`, or `exec-raw`.
+There is no wire default: `auto`, an omitted field, and `null` are rejected as invalid
+parameters before dispatch or background job creation. A call attempts only the
+selected transport; missing prerequisites and runtime errors are terminal. For a
+manual fallback, the agent must choose another explicit transport in a new call
+after checking the error and destination state.
 
 Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, `tail -n 200 -- /path`, or `sed -n '801,1600p' -- /path`. Use `transfer` with `operation=get` to retrieve files instead of printing large content into the MCP response.
 
@@ -132,8 +139,10 @@ route and sends only `quit`. Neither creates transfer payload files or initiates
 separate jump key plus Unix support; password-only routes mark them blocked.
 SCP and rsync stay unknown unless an existing configuration/availability gate
 blocks them. Probe errors, a closed SFTP subsystem and timeouts stay unknown;
-successful SFTP is preferred, otherwise a successful raw probe recommends
-explicit `transport="exec-raw"`. Completed results survive another probe's timeout.
+successful SFTP recommends explicit `transport="sftp"`, otherwise a successful raw
+probe recommends explicit `transport="exec-raw"`. If neither is confirmed, the agent
+must still choose a transport explicitly. Completed results survive another
+probe's timeout.
 The external startup probe runs on Linux/macOS; elsewhere it stays unknown when
 eligible, without changing runtime transport support.
 
@@ -143,9 +152,10 @@ preflight statuses remain in `instructions`.
 
 This frozen, potentially stale advice is only a basic preflight: it does not
 guarantee path permissions, staging or directory/tar support. It does not change
-`auto`, the default or explicit transport behavior, tool-error narration, or add
-a runtime transport cache. Host-key policy remains unchanged; `accept-new` may
-update `known_hosts` during probing.
+the requested transport, tool-error narration, or add a runtime transport cache.
+The selected transport is attempted once without automatic fallback.
+Host-key policy remains unchanged; `accept-new` may update `known_hosts` during
+probing.
 
 The final instructions are frozen for the lifetime of the server process, including
 partial/unknown values. Commands and SSH reconnect do not recollect or rewrite them.
@@ -244,7 +254,7 @@ cargo build --release
 
 ### OpenCode
 
-Add to `opencode.jsonc` (SSH key recommended; password auth uses the `exec-raw` transfer transport):
+Add to `opencode.jsonc` (SSH key recommended; for password auth, explicitly choose `transport="exec-raw"`):
 
 ```jsonc
 {
@@ -326,8 +336,8 @@ Transfer behavior through a jump host:
 
 - `exec-raw` uses the persistent nested SSH session and supports key or password authentication on either hop.
 - `rsync`, `sftp`, and `scp` require keys for both target and jump; `ssh-mcp` supplies the target key to the outer client and generates a jump ProxyCommand with the jump key.
-- `auto` safely falls back to `exec-raw` when either hop uses a password. An explicitly requested unsupported local transport returns an error.
-- Jump-backed local OpenSSH transports are currently Unix-only; `auto` still uses `exec-raw` on other platforms.
+- When either hop uses a password, explicitly choose `exec-raw`. Requesting `rsync`, `sftp`, or `scp` returns an error; the server never switches transports.
+- Jump-backed local OpenSSH transports are currently Unix-only; on other platforms explicitly choose `exec-raw`.
 
 <details>
 <summary><b>Claude Code</b> — .mcp.json or ~/.claude.json</summary>
@@ -416,7 +426,7 @@ With a jump host, the same policy and `known_hosts` file are applied independent
 
 ## Long-running jobs
 
-Start potentially long commands or transfers with `background=true`. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier even when the server-side timeout is longer. Background mode returns a `job_id` before SSH connection or transfer preflight. Poll it with `check_process`:
+Start potentially long commands or transfers with `background=true`. MCP does not expose the client's deadline to the server, so the client may stop waiting earlier even when the server-side timeout is longer. After parameter validation, background mode returns a `job_id` before SSH connection or transfer preflight. Poll it with `check_process`:
 
 ```json
 {"job_id": "abc123", "tail_lines": 50}
@@ -428,7 +438,7 @@ For a scheduled one-shot observation, set a local wait in seconds:
 {"job_id": "abc123", "wait_for": 600, "tail_lines": 10}
 ```
 
-Command jobs return PID, command, log path/tail, and exit state. Transfer jobs return `job_type="transfer"`, coarse phase, elapsed time, current transport, reliable file staging bytes when available, and the compact transfer result at completion. Transfer jobs are in-memory only. Their `timeout_ms` is one whole-operation deadline including connection, preflight, and safe fallback; cleanup gets a short separate grace period.
+Command jobs return PID, command, log path/tail, and exit state. Transfer jobs return `job_type="transfer"`, coarse phase, elapsed time, current transport, reliable file staging bytes when available, and the compact transfer result at completion. Transfer jobs are in-memory only. Their `timeout_ms` is one whole-operation deadline including connection, preflight, the selected transport, and finalization; cleanup gets a short separate grace period.
 
 `check_process` first validates and snapshots the job. Errors and terminal states return immediately. A running job waits locally for the full `wait_for` interval without polling, then returns one fresh snapshot; completion during the interval does not wake the call early.
 

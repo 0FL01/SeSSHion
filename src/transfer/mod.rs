@@ -4,7 +4,7 @@
 //! - `sftp`: OpenSSH `sftp` client (batch mode)
 //! - `scp`: OpenSSH `scp` client
 //! - `exec-raw`: stdin/stdout streaming over the existing SSH session
-//! - `auto`: fallback chain `sftp -> scp -> exec-raw`
+//! - `rsync`: local `rsync` client over SSH
 
 mod exec_raw;
 mod local_root;
@@ -38,10 +38,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SshMcpError};
 use crate::ssh::{HostKeyCheckMode, SshConnectionManager, escape_for_shell};
-
-fn io_to_transport_attempt(err: std::io::Error) -> TransportAttemptError {
-    TransportAttemptError::Other(SshMcpError::Io(err))
-}
 
 struct StepCtx<'a> {
     conn: &'a SshConnectionManager,
@@ -85,8 +81,7 @@ struct ExecRawOperation<'a> {
 
 /// Core transfer engine.
 ///
-/// For now this selects the EXEC-RAW transport, but it is structured so that
-/// SFTP/SCP can be added as additional implementations.
+/// Runs the selected transport without changing transports on failure.
 #[derive(Clone, Debug)]
 pub struct TransferEngine {
     local_root: Arc<PathBuf>,
@@ -179,7 +174,7 @@ async fn check_local_ssh(
     transport: TransferTransport,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<(), TransportAttemptError> {
+) -> Result<()> {
     let mut command = Command::new("ssh");
     command
         .arg("-V")
@@ -198,10 +193,9 @@ async fn check_local_ssh(
     if output.status.success() {
         Ok(())
     } else {
-        Err(TransportAttemptError::FallbackSafe {
-            transport,
-            reason: "local 'ssh -V' failed".to_string(),
-        })
+        Err(SshMcpError::config(format!(
+            "transport {transport:?} unsupported: local 'ssh -V' failed"
+        )))
     }
 }
 
@@ -364,12 +358,9 @@ impl TransferEngine {
             }
         };
 
-        let mut response = TransferResponse::ok_stub(
-            params,
-            TransferTransport::ExecRaw,
-            &remote_home,
-            self.local_root(),
-        );
+        let transport = params.transport;
+        let mut response =
+            TransferResponse::ok_stub(params, transport, &remote_home, self.local_root());
 
         let kind = match resolve_kind(
             conn,
@@ -398,146 +389,93 @@ impl TransferEngine {
             }
         };
 
-        let transports = match response.params.transport {
-            TransferTransport::Auto => {
-                vec![
-                    TransferTransport::Rsync,   // Try rsync first (most efficient)
-                    TransferTransport::Sftp,    // Fallback to sftp
-                    TransferTransport::Scp,     // Fallback to scp
-                    TransferTransport::ExecRaw, // Last resort
-                ]
+        let id = match self.next_attempt_token() {
+            Ok(id) => id,
+            Err(error) => {
+                response.set_error(&error.to_string());
+                response.elapsed_ms = Some(started_at.elapsed().as_millis() as u64);
+                return response;
             }
-            other => vec![other],
         };
-
-        let mut attempted_transports: Vec<TransferTransport> = Vec::new();
-        let mut unsupported_reasons: Vec<String> = Vec::new();
-
-        for transport in transports {
-            let id = match self.next_attempt_token() {
-                Ok(id) => id,
-                Err(error) => {
-                    response.set_error(&error.to_string());
-                    break;
-                }
-            };
-            attempted_transports.push(transport);
-            response.transport_used = transport;
-            if let Some(progress) = &ctx.progress {
-                progress.emit(types::TransferEvent::Transferring(transport));
+        if let Some(progress) = &ctx.progress {
+            progress.emit(types::TransferEvent::Transferring(transport));
+        }
+        let result = match transport {
+            TransferTransport::ExecRaw => {
+                self.run_exec_raw(ExecRawOperation {
+                    conn,
+                    remote_home: &remote_home,
+                    id: &id,
+                    kind,
+                    timeout: ctx.timeout,
+                    cancellation: &ctx.cancellation,
+                    progress: ctx.progress.as_ref(),
+                    response: &mut response,
+                })
+                .await
             }
-            let attempt = match transport {
-                TransferTransport::ExecRaw => self
-                    .run_exec_raw(ExecRawOperation {
+            TransferTransport::Sftp => {
+                self.run_openssh(
+                    OpenSshContext {
                         conn,
                         remote_home: &remote_home,
+                        key_path: key_path_opt.as_deref(),
+                        ssh: &ctx.ssh,
                         id: &id,
-                        kind,
                         timeout: ctx.timeout,
                         cancellation: &ctx.cancellation,
                         progress: ctx.progress.as_ref(),
-                        response: &mut response,
-                    })
-                    .await
-                    .map_err(TransportAttemptError::Other),
-                TransferTransport::Sftp => {
-                    self.run_openssh(
-                        OpenSshContext {
-                            conn,
-                            remote_home: &remote_home,
-                            key_path: key_path_opt.as_deref(),
-                            ssh: &ctx.ssh,
-                            id: &id,
-                            timeout: ctx.timeout,
-                            cancellation: &ctx.cancellation,
-                            progress: ctx.progress.as_ref(),
-                        },
-                        OpenSshOperation {
-                            transport: openssh::OpenSshTransport::Sftp,
-                            kind,
-                            response: &mut response,
-                        },
-                    )
-                    .await
-                }
-                TransferTransport::Scp => {
-                    self.run_openssh(
-                        OpenSshContext {
-                            conn,
-                            remote_home: &remote_home,
-                            key_path: key_path_opt.as_deref(),
-                            ssh: &ctx.ssh,
-                            id: &id,
-                            timeout: ctx.timeout,
-                            cancellation: &ctx.cancellation,
-                            progress: ctx.progress.as_ref(),
-                        },
-                        OpenSshOperation {
-                            transport: openssh::OpenSshTransport::Scp,
-                            kind,
-                            response: &mut response,
-                        },
-                    )
-                    .await
-                }
-                TransferTransport::Auto => {
-                    Err(TransportAttemptError::Other(SshMcpError::connection(
-                        "internal error: transport=auto should have been expanded",
-                    )))
-                }
-                TransferTransport::Rsync => {
-                    self.run_rsync(
-                        OpenSshContext {
-                            conn,
-                            remote_home: &remote_home,
-                            key_path: key_path_opt.as_deref(),
-                            ssh: &ctx.ssh,
-                            id: &id,
-                            timeout: ctx.timeout,
-                            cancellation: &ctx.cancellation,
-                            progress: ctx.progress.as_ref(),
-                        },
+                    },
+                    OpenSshOperation {
+                        transport: openssh::OpenSshTransport::Sftp,
                         kind,
-                        &mut response,
-                    )
-                    .await
-                }
-            };
-
-            match attempt {
-                Ok(()) => {
-                    response.ok = true;
-                    break;
-                }
-                Err(TransportAttemptError::FallbackSafe { transport, reason }) => {
-                    unsupported_reasons.push(format!("{transport:?}: {reason}"));
-                    continue;
-                }
-                Err(e) => {
-                    response.set_error(&e.to_string());
-                    break;
-                }
+                        response: &mut response,
+                    },
+                )
+                .await
             }
-        }
-
-        // Only populate fallback_chain when the original transport was Auto
-        if response.params.transport == TransferTransport::Auto {
-            response.fallback_chain = attempted_transports;
-        }
-
-        if !response.ok && response.error.is_none() {
-            let all_reasons = unsupported_reasons;
-
-            if all_reasons.is_empty() {
-                response.set_error("transfer transport failed");
-            } else if response.params.transport == TransferTransport::Auto {
-                response.set_error(&format!(
-                    "all auto transports failed: {}",
-                    all_reasons.join("; ")
-                ));
-            } else {
-                response.set_error(&all_reasons.join("; "));
+            TransferTransport::Scp => {
+                self.run_openssh(
+                    OpenSshContext {
+                        conn,
+                        remote_home: &remote_home,
+                        key_path: key_path_opt.as_deref(),
+                        ssh: &ctx.ssh,
+                        id: &id,
+                        timeout: ctx.timeout,
+                        cancellation: &ctx.cancellation,
+                        progress: ctx.progress.as_ref(),
+                    },
+                    OpenSshOperation {
+                        transport: openssh::OpenSshTransport::Scp,
+                        kind,
+                        response: &mut response,
+                    },
+                )
+                .await
             }
+            TransferTransport::Rsync => {
+                self.run_rsync(
+                    OpenSshContext {
+                        conn,
+                        remote_home: &remote_home,
+                        key_path: key_path_opt.as_deref(),
+                        ssh: &ctx.ssh,
+                        id: &id,
+                        timeout: ctx.timeout,
+                        cancellation: &ctx.cancellation,
+                        progress: ctx.progress.as_ref(),
+                    },
+                    kind,
+                    &mut response,
+                )
+                .await
+            }
+        };
+
+        match result {
+            Ok(()) => response.ok = true,
+            Err(error) => response.set_error(&error.to_string()),
         }
 
         response.elapsed_ms = Some(started_at.elapsed().as_millis() as u64);
@@ -682,21 +620,17 @@ impl TransferEngine {
         }
     }
 
-    async fn run_openssh(
-        &self,
-        ctx: OpenSshContext<'_>,
-        op: OpenSshOperation<'_>,
-    ) -> std::result::Result<(), TransportAttemptError> {
+    async fn run_openssh(&self, ctx: OpenSshContext<'_>, op: OpenSshOperation<'_>) -> Result<()> {
+        let transport = match op.transport {
+            openssh::OpenSshTransport::Sftp => TransferTransport::Sftp,
+            openssh::OpenSshTransport::Scp => TransferTransport::Scp,
+        };
         let key_path = match ctx.key_path {
             Some(p) => p,
             None => {
-                return Err(TransportAttemptError::FallbackSafe {
-                    transport: match op.transport {
-                        openssh::OpenSshTransport::Sftp => TransferTransport::Sftp,
-                        openssh::OpenSshTransport::Scp => TransferTransport::Scp,
-                    },
-                    reason: "SSH key required for OpenSSH transports (sftp/scp)".to_string(),
-                });
+                return Err(SshMcpError::config(format!(
+                    "transport {transport:?} unsupported: SSH key required for OpenSSH transports (sftp/scp)"
+                )));
             }
         };
 
@@ -704,18 +638,14 @@ impl TransferEngine {
             let unsupported = if !cfg!(unix) {
                 Some("jump-backed OpenSSH transfers are unsupported on this platform")
             } else if jump.key_path.is_none() {
-                Some("jump host key required for OpenSSH transports; use auto or exec-raw")
+                Some("jump host key required for OpenSSH transports")
             } else {
                 None
             };
             if let Some(reason) = unsupported {
-                return Err(TransportAttemptError::FallbackSafe {
-                    transport: match op.transport {
-                        openssh::OpenSshTransport::Sftp => TransferTransport::Sftp,
-                        openssh::OpenSshTransport::Scp => TransferTransport::Scp,
-                    },
-                    reason: reason.to_string(),
-                });
+                return Err(SshMcpError::config(format!(
+                    "transport {transport:?} unsupported: {reason}"
+                )));
             }
         }
 
@@ -724,8 +654,7 @@ impl TransferEngine {
 
         let resolved = self
             .resolve_and_validate_local_paths(&response.params, kind)
-            .await
-            .map_err(TransportAttemptError::Other)?;
+            .await?;
         response.resolved_paths = Some(resolved.clone());
 
         // If the client explicitly provided a kind for get, validate the remote path kind
@@ -746,17 +675,14 @@ impl TransferEngine {
                 },
                 remote_path: &remote_path,
             })
-            .await
-            .map_err(TransportAttemptError::Other)?;
+            .await?;
 
             if remote_kind != kind {
                 let msg = match kind {
                     TransferKind::File => "remote_path is not a file",
                     TransferKind::Directory => "remote_path is not a directory",
                 };
-                return Err(TransportAttemptError::Other(SshMcpError::invalid_params(
-                    msg,
-                )));
+                return Err(SshMcpError::invalid_params(msg));
             }
         }
 
@@ -805,33 +731,30 @@ impl TransferEngine {
         ctx: OpenSshContext<'_>,
         kind: TransferKind,
         response: &mut TransferResponse,
-    ) -> std::result::Result<(), TransportAttemptError> {
+    ) -> Result<()> {
         if ctx.key_path.is_none() {
-            return Err(TransportAttemptError::FallbackSafe {
-                transport: TransferTransport::Rsync,
-                reason: "SSH key required for rsync transport".to_string(),
-            });
+            return Err(SshMcpError::config(
+                "transport Rsync unsupported: SSH key required for rsync transport",
+            ));
         }
         if let Some(jump) = &ctx.ssh.jump {
             let unsupported = if !cfg!(unix) {
                 Some("jump-backed rsync is unsupported on this platform")
             } else if jump.key_path.is_none() {
-                Some("jump host key required for rsync; use auto or exec-raw")
+                Some("jump host key required for rsync")
             } else {
                 None
             };
             if let Some(reason) = unsupported {
-                return Err(TransportAttemptError::FallbackSafe {
-                    transport: TransferTransport::Rsync,
-                    reason: reason.to_string(),
-                });
+                return Err(SshMcpError::config(format!(
+                    "transport Rsync unsupported: {reason}"
+                )));
             }
         }
 
         let resolved = self
             .resolve_and_validate_local_paths(&response.params, kind)
-            .await
-            .map_err(TransportAttemptError::Other)?;
+            .await?;
         response.resolved_paths = Some(resolved.clone());
 
         // If the client explicitly provided a kind for get, validate the remote path kind
@@ -852,17 +775,14 @@ impl TransferEngine {
                 },
                 remote_path: &remote_path,
             })
-            .await
-            .map_err(TransportAttemptError::Other)?;
+            .await?;
 
             if remote_kind != kind {
                 let msg = match kind {
                     TransferKind::File => "remote_path is not a file",
                     TransferKind::Directory => "remote_path is not a directory",
                 };
-                return Err(TransportAttemptError::Other(SshMcpError::invalid_params(
-                    msg,
-                )));
+                return Err(SshMcpError::invalid_params(msg));
             }
         }
 
@@ -959,28 +879,6 @@ fn normalize_remote_path(path: &str) -> String {
     }
 }
 
-#[derive(Debug)]
-enum TransportAttemptError {
-    FallbackSafe {
-        transport: TransferTransport,
-        reason: String,
-    },
-    Other(SshMcpError),
-}
-
-impl std::fmt::Display for TransportAttemptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::FallbackSafe { transport, reason } => {
-                write!(f, "transport {transport:?} unsupported: {reason}")
-            }
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for TransportAttemptError {}
-
 async fn resolve_kind(
     conn: &SshConnectionManager,
     local_root: &Path,
@@ -1027,10 +925,12 @@ mod tests {
         let engine = TransferEngine::new(PathBuf::from("/tmp/local-root"));
         let first = TransferParams {
             remote_path: "/tmp/a/../target".to_string(),
+            transport: TransferTransport::ExecRaw,
             ..TransferParams::default()
         };
         let second = TransferParams {
             remote_path: "/tmp/target".to_string(),
+            transport: TransferTransport::ExecRaw,
             ..TransferParams::default()
         };
 

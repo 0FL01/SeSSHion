@@ -16,7 +16,7 @@ fn sample_params() -> TransferParams {
         operation: TransferOperation::Put,
         local_path: "config.yml".to_string(),
         remote_path: "/etc/app/config.yml".to_string(),
-        transport: TransferTransport::Auto,
+        transport: TransferTransport::ExecRaw,
         kind: Some(TransferKind::File),
         overwrite: true,
         timeout_ms: Some(30000),
@@ -42,11 +42,6 @@ fn sample_success_response() -> TransferResponse {
         params: sample_params(),
         kind: Some(TransferKind::File),
         transport_used: TransferTransport::ExecRaw,
-        fallback_chain: vec![
-            TransferTransport::Rsync,
-            TransferTransport::Sftp,
-            TransferTransport::ExecRaw,
-        ],
         remote_home: Some("/home/user".to_string()),
         local_root: "/tmp/test".to_string(),
         resolved_paths: Some(ResolvedPaths {
@@ -79,7 +74,6 @@ fn sample_error_response() -> TransferResponse {
         params: sample_params(),
         kind: None,
         transport_used: TransferTransport::ExecRaw,
-        fallback_chain: vec![TransferTransport::ExecRaw],
         remote_home: None,
         local_root: "/tmp/test".to_string(),
         resolved_paths: None,
@@ -112,6 +106,7 @@ fn test_compact_response_success_fields() {
     assert!(compact.ok);
     assert_eq!(compact.error, None);
     assert_eq!(compact.kind, Some(TransferKind::File));
+    assert_eq!(compact.transport_used, TransferTransport::ExecRaw);
     assert_eq!(compact.local_path, "config.yml");
     assert_eq!(compact.remote_path, "/etc/app/config.yml");
 
@@ -133,6 +128,7 @@ fn test_compact_response_error_fields() {
     assert!(!compact.ok);
     assert_eq!(compact.error, Some("Permission denied".to_string()));
     assert_eq!(compact.kind, None);
+    assert_eq!(compact.transport_used, TransferTransport::ExecRaw);
 
     // Paths should still be present even on error
     assert_eq!(compact.local_path, "config.yml");
@@ -178,12 +174,6 @@ fn test_to_json_false_excludes_verbose_fields() {
         Some("exec-raw"),
         "transport_used should be present in compact JSON"
     );
-    // fallback_chain should be present if non-empty
-    assert!(
-        json.get("fallback_chain").is_some(),
-        "fallback_chain should be present when non-empty"
-    );
-
     // Verify verbose fields are NOT present in non-verbose mode
     assert!(
         json.get("staging").is_none(),
@@ -237,6 +227,7 @@ fn test_to_json_false_includes_error_on_failure() {
     // Error field should be present when set
     assert_eq!(json["error"].as_str(), Some("Permission denied"));
     assert_eq!(json["ok"].as_bool(), Some(false));
+    assert_eq!(json["transport_used"].as_str(), Some("exec-raw"));
 }
 
 #[test]
@@ -282,7 +273,7 @@ fn test_to_json_true_includes_all_fields() {
     assert_eq!(params["local_path"].as_str(), Some("config.yml"));
     assert_eq!(params["remote_path"].as_str(), Some("/etc/app/config.yml"));
     assert_eq!(params["operation"].as_str(), Some("put"));
-    assert_eq!(params["transport"].as_str(), Some("auto"));
+    assert_eq!(params["transport"].as_str(), Some("exec-raw"));
 
     // Verify resolved_paths is present
     assert!(
@@ -333,6 +324,8 @@ fn test_to_json_true_error_response() {
     // Verify error fields in verbose mode
     assert_eq!(json["ok"].as_bool(), Some(false));
     assert_eq!(json["error"].as_str(), Some("Permission denied"));
+    assert_eq!(json["transport_used"].as_str(), Some("exec-raw"));
+    assert_eq!(json["params"]["transport"].as_str(), Some("exec-raw"));
 
     // params should still be present
     assert!(
@@ -374,89 +367,23 @@ fn test_compact_response_counts_skipped_when_none() {
 }
 
 #[test]
-fn test_fallback_chain_absent_for_explicit_transport() {
-    // Create a response with an explicit transport (not Auto)
-    let mut params = sample_params();
-    params.transport = TransferTransport::ExecRaw;
+fn test_fallback_chain_absent_from_all_response_formats() {
+    for response in [sample_success_response(), sample_error_response()] {
+        for verbose in [false, true] {
+            let json_str = response
+                .to_json(verbose)
+                .expect("JSON serialization should succeed");
+            let json: serde_json::Value =
+                serde_json::from_str(&json_str).expect("Should parse as JSON");
 
-    let response = TransferResponse {
-        ok: true,
-        error: None,
-        params,
-        kind: Some(TransferKind::File),
-        transport_used: TransferTransport::ExecRaw,
-        fallback_chain: vec![], // Should remain empty for explicit transport
-        remote_home: Some("/home/user".to_string()),
-        local_root: "/tmp/test".to_string(),
-        resolved_paths: Some(ResolvedPaths {
-            local_path: PathBuf::from("/tmp/test/config.yml"),
-        }),
-        staging: None,
-        counts: Some(sample_counts()),
-        elapsed_ms: Some(100),
-        semantics: None,
-    };
-
-    let compact = response.to_compact();
-    let json_str = response
-        .to_json(false)
-        .expect("JSON serialization should succeed");
-    let json: serde_json::Value = serde_json::from_str(&json_str).expect("Should parse as JSON");
-
-    // fallback_chain should be absent when empty (skip_serializing_if)
-    assert!(
-        json.get("fallback_chain").is_none(),
-        "fallback_chain should be absent for explicit transport"
-    );
-    assert!(
-        compact.fallback_chain.is_empty(),
-        "fallback_chain should be empty for explicit transport"
-    );
-}
-
-#[test]
-fn test_fallback_chain_present_for_auto_transport() {
-    // Create a response with Auto transport
-    let mut params = sample_params();
-    params.transport = TransferTransport::Auto;
-
-    let response = TransferResponse {
-        ok: true,
-        error: None,
-        params,
-        kind: Some(TransferKind::File),
-        transport_used: TransferTransport::Rsync,
-        fallback_chain: vec![
-            TransferTransport::Rsync,
-            TransferTransport::Sftp,
-            TransferTransport::Scp,
-            TransferTransport::ExecRaw,
-        ],
-        remote_home: Some("/home/user".to_string()),
-        local_root: "/tmp/test".to_string(),
-        resolved_paths: Some(ResolvedPaths {
-            local_path: PathBuf::from("/tmp/test/config.yml"),
-        }),
-        staging: None,
-        counts: Some(sample_counts()),
-        elapsed_ms: Some(100),
-        semantics: None,
-    };
-
-    let json_str = response
-        .to_json(false)
-        .expect("JSON serialization should succeed");
-    let json: serde_json::Value = serde_json::from_str(&json_str).expect("Should parse as JSON");
-
-    // fallback_chain should be present when non-empty (Auto transport)
-    assert!(
-        json.get("fallback_chain").is_some(),
-        "fallback_chain should be present for Auto transport"
-    );
-    let chain = json["fallback_chain"]
-        .as_array()
-        .expect("fallback_chain should be an array");
-    assert!(!chain.is_empty(), "fallback_chain should not be empty");
+            assert!(
+                json.get("fallback_chain").is_none(),
+                "fallback_chain should be absent for ok={}, verbose={verbose}",
+                response.ok
+            );
+            assert_eq!(json["transport_used"].as_str(), Some("exec-raw"));
+        }
+    }
 }
 
 #[test]
@@ -496,7 +423,6 @@ fn test_to_json_invalid_utf8_paths() {
         params,
         kind: Some(TransferKind::File),
         transport_used: TransferTransport::ExecRaw,
-        fallback_chain: vec![TransferTransport::ExecRaw],
         remote_home: None,
         local_root: "/tmp".to_string(),
         resolved_paths: None,
@@ -544,7 +470,6 @@ fn test_compact_serialization_roundtrip() {
     assert_eq!(deserialized.error, compact.error);
     assert_eq!(deserialized.kind, compact.kind);
     assert_eq!(deserialized.transport_used, compact.transport_used);
-    assert_eq!(deserialized.fallback_chain, compact.fallback_chain);
     assert_eq!(deserialized.local_path, compact.local_path);
     assert_eq!(deserialized.remote_path, compact.remote_path);
     assert_eq!(deserialized.elapsed_ms, compact.elapsed_ms);

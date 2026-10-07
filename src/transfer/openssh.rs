@@ -53,7 +53,7 @@ pub struct OpenSshTransferArgs<'a> {
 pub async fn run_transfer(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     preflight(&endpoint, args.transport, args.timeout, &args.cancellation).await?;
 
     skeleton::dispatch_transfer(skeleton::DispatchTransferArgs {
@@ -161,7 +161,7 @@ async fn run_sftp_batch(
     batch: &str,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
+) -> Result<ProcessOutput> {
     let mut cmd = Command::new("sftp");
     cmd.arg("-P").arg(endpoint.port.to_string());
     for opt in common_ssh_options(endpoint) {
@@ -182,13 +182,9 @@ async fn run_sftp_batch(
         let write = stdin.write_all(batch.as_bytes());
         tokio::pin!(write);
         let write_result = tokio::select! {
-            result = &mut write => result.map_err(super::io_to_transport_attempt),
-            _ = tokio::time::sleep(timeout) => Err(super::TransportAttemptError::Other(
-                SshMcpError::Timeout(timeout.as_millis() as u64),
-            )),
-            _ = cancellation.cancelled() => Err(super::TransportAttemptError::Other(
-                SshMcpError::connection("transfer cancelled"),
-            )),
+            result = &mut write => result.map_err(SshMcpError::Io),
+            _ = tokio::time::sleep(timeout) => Err(SshMcpError::Timeout(timeout.as_millis() as u64)),
+            _ = cancellation.cancelled() => Err(SshMcpError::connection("transfer cancelled")),
         };
         if let Err(error) = write_result {
             process::terminate_child(&mut child).await;
@@ -205,7 +201,7 @@ async fn run_scp(
     args: &[String],
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
+) -> Result<ProcessOutput> {
     let mut cmd = Command::new("scp");
     cmd.arg("-P").arg(endpoint.port.to_string());
     for opt in common_ssh_options(endpoint) {
@@ -242,25 +238,20 @@ async fn remove_remote_dir(
     conn: &SshConnectionManager,
     timeout: Duration,
     path: &str,
-) -> std::result::Result<(), super::TransportAttemptError> {
-    super::exec_raw::validate_remote_user_path(path, "remote_stage")
-        .map_err(super::TransportAttemptError::Other)?;
+) -> Result<()> {
+    super::exec_raw::validate_remote_user_path(path, "remote_stage")?;
 
     let escaped = escape_for_shell(path);
     let cmd = format!(r#"sh -c 'set -eu; rm -rf -- "$1"' sh '{escaped}'"#);
-    let out = conn
-        .exec_command(&cmd, timeout)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
+    let out = conn.exec_command(&cmd, timeout).await?;
     super::staging::ensure_remote_exec_success("reset scp remote directory", &out)
-        .map_err(super::TransportAttemptError::Other)
 }
 
-async fn remove_local_dir(path: &Path) -> std::result::Result<(), super::TransportAttemptError> {
+async fn remove_local_dir(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path).await {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(super::TransportAttemptError::Other(SshMcpError::Io(err))),
+        Err(err) => Err(SshMcpError::Io(err)),
     }
 }
 
@@ -275,7 +266,7 @@ async fn wait_child_with_timeout(
     child: tokio::process::Child,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
+) -> Result<ProcessOutput> {
     let captured = process::wait_child_with_timeout(child, timeout, cancellation).await?;
     Ok(ProcessOutput {
         status: captured.status,
@@ -288,7 +279,7 @@ async fn preflight(
     transport: OpenSshTransport,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<(), super::TransportAttemptError> {
+) -> Result<()> {
     if endpoint.jump.is_some() {
         super::check_local_ssh(
             match transport {
@@ -305,18 +296,6 @@ async fn preflight(
             let out = run_sftp_batch(endpoint, "quit\n", timeout, cancellation).await?;
             if out.status.success() {
                 return Ok(());
-            }
-            let stderr = out.stderr.as_str();
-            if out.status.code() == Some(255)
-                && (stderr.contains("subsystem request failed")
-                    || stderr.contains("Subsystem request failed")
-                    || stderr.contains("Unknown subsystem")
-                    || stderr.contains("unknown subsystem"))
-            {
-                return Err(super::TransportAttemptError::FallbackSafe {
-                    transport: super::TransferTransport::Sftp,
-                    reason: stderr.trim().to_string(),
-                });
             }
             Err(classify_openssh_failure(OpenSshTransport::Sftp, &out))
         }
@@ -337,10 +316,7 @@ async fn preflight(
     }
 }
 
-fn classify_spawn_error(
-    transport: OpenSshTransport,
-    err: std::io::Error,
-) -> super::TransportAttemptError {
+fn classify_spawn_error(transport: OpenSshTransport, err: std::io::Error) -> SshMcpError {
     let (bin, transfer_transport) = match transport {
         OpenSshTransport::Sftp => ("sftp", super::TransferTransport::Sftp),
         OpenSshTransport::Scp => ("scp", super::TransferTransport::Scp),
@@ -353,18 +329,15 @@ fn classify_spawn_error(
     )
 }
 
-fn classify_openssh_failure(
-    _transport: OpenSshTransport,
-    out: &ProcessOutput,
-) -> super::TransportAttemptError {
+fn classify_openssh_failure(_transport: OpenSshTransport, out: &ProcessOutput) -> SshMcpError {
     let exit_code = out.status.code();
 
     let stderr = out.stderr.as_str();
 
-    super::TransportAttemptError::Other(SshMcpError::connection(format!(
+    SshMcpError::connection(format!(
         "OpenSSH transport failed: exit_code={exit_code:?}; stderr={}",
         stderr.trim()
-    )))
+    ))
 }
 
 // Remote staging helpers are implemented in `super::staging`.
@@ -372,7 +345,7 @@ fn classify_openssh_failure(
 async fn put_file(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let OpenSshTransferArgs {
         transport,
         conn,
@@ -434,7 +407,7 @@ async fn put_file(
 async fn get_file(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let OpenSshTransferArgs {
         transport,
         conn: _,
@@ -499,7 +472,7 @@ async fn count_dir_no_symlinks(root: &Path) -> Result<TransferCounts> {
 async fn put_dir(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let OpenSshTransferArgs {
         transport,
         conn,
@@ -514,14 +487,10 @@ async fn put_dir(
         ..
     } = args;
 
-    let local_path_for_scp = fs::canonicalize(&local_path)
-        .await
-        .map_err(super::io_to_transport_attempt)?;
+    let local_path_for_scp = fs::canonicalize(&local_path).await?;
     let local_path_for_scp = local_path_for_scp.display().to_string();
 
-    let counts = count_dir_no_symlinks(&local_path)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
+    let counts = count_dir_no_symlinks(&local_path).await?;
 
     skeleton::put_dir_with_remote_staging(
         skeleton::PutDirWithRemoteStagingArgs {
@@ -572,7 +541,7 @@ async fn put_dir(
 async fn get_dir(
     endpoint: OpenSshEndpoint,
     args: OpenSshTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let OpenSshTransferArgs {
         transport,
         conn,

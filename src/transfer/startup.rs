@@ -63,9 +63,12 @@ impl StartupTransferPreflight {
             ("exec-raw", self.exec_raw),
         ];
         if transports.iter().all(|(_, status)| *status == Unknown) {
-            return "Transfer: startup preflight unknown; default auto.".to_string();
+            return "Transfer: startup preflight unknown; choose transport explicitly.".to_string();
         }
-        let preferred = self.preferred_transport().unwrap_or("auto");
+        let advice = match self.preferred_transport() {
+            Some(transport) => format!("prefer {transport}"),
+            None => "choose transport explicitly".to_string(),
+        };
         let mut lists = Vec::new();
         for (label, status) in [
             ("ok", Ok),
@@ -81,7 +84,7 @@ impl StartupTransferPreflight {
             }
         }
         format!(
-            "Transfer: prefer {preferred}; startup preflight (may be stale): {}.",
+            "Transfer: {advice}; startup preflight (may be stale): {}.",
             lists.join("; ")
         )
     }
@@ -363,10 +366,10 @@ mod tests {
     }
 
     #[test]
-    fn hint_all_unknown_defaults_to_auto() {
+    fn hint_all_unknown_requires_explicit_choice() {
         assert_eq!(
             StartupTransferPreflight::default().hint(),
-            "Transfer: startup preflight unknown; default auto."
+            "Transfer: startup preflight unknown; choose transport explicitly."
         );
     }
 
@@ -399,7 +402,7 @@ mod tests {
         assert_external(&preflight, StartupProbeStatus::Blocked);
         assert_eq!(
             preflight.hint(),
-            "Transfer: prefer auto; startup preflight (may be stale): blocked=rsync,sftp,scp; unknown=exec-raw."
+            "Transfer: choose transport explicitly; startup preflight (may be stale): blocked=rsync,sftp,scp; unknown=exec-raw."
         );
         preflight.exec_raw = StartupProbeStatus::Ok;
         assert_eq!(

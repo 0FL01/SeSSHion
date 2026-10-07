@@ -4,19 +4,17 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::SshMcpError;
-
-use super::TransportAttemptError;
+use crate::error::{Result, SshMcpError};
 
 pub(super) fn classify_spawn_error_with_reason(
     err: std::io::Error,
     transport: super::TransferTransport,
     reason: String,
-) -> TransportAttemptError {
+) -> SshMcpError {
     if err.kind() == std::io::ErrorKind::NotFound {
-        return TransportAttemptError::FallbackSafe { transport, reason };
+        return SshMcpError::config(format!("transport {transport:?} unsupported: {reason}"));
     }
-    TransportAttemptError::Other(SshMcpError::Io(err))
+    SshMcpError::Io(err)
 }
 
 #[derive(Debug)]
@@ -48,13 +46,15 @@ pub(super) async fn wait_child_with_timeout(
     mut child: tokio::process::Child,
     timeout: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<CapturedOutput, TransportAttemptError> {
-    let mut stdout_pipe = child.stdout.take().ok_or_else(|| {
-        TransportAttemptError::Other(SshMcpError::connection("missing stdout pipe"))
-    })?;
-    let mut stderr_pipe = child.stderr.take().ok_or_else(|| {
-        TransportAttemptError::Other(SshMcpError::connection("missing stderr pipe"))
-    })?;
+) -> Result<CapturedOutput> {
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| SshMcpError::connection("missing stdout pipe"))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| SshMcpError::connection("missing stderr pipe"))?;
 
     let stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -73,45 +73,37 @@ pub(super) async fn wait_child_with_timeout(
 
     let status = tokio::select! {
         res = child.wait() => {
-            res.map_err(super::io_to_transport_attempt)?
+            res?
         }
         _ = &mut sleep => {
             stdout_task.abort();
             stderr_task.abort();
             terminate_child(&mut child).await;
             let _ = tokio::join!(stdout_task, stderr_task);
-            return Err(TransportAttemptError::Other(SshMcpError::Timeout(
-                timeout.as_millis() as u64,
-            )));
+            return Err(SshMcpError::Timeout(timeout.as_millis() as u64));
         }
         _ = cancellation.cancelled() => {
             stdout_task.abort();
             stderr_task.abort();
             terminate_child(&mut child).await;
             let _ = tokio::join!(stdout_task, stderr_task);
-            return Err(TransportAttemptError::Other(SshMcpError::connection(
-                "transfer cancelled",
-            )));
+            return Err(SshMcpError::connection("transfer cancelled"));
         }
     };
 
     let stdout = match stdout_task.await {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(TransportAttemptError::Other(SshMcpError::Io(e))),
+        Ok(Err(e)) => return Err(SshMcpError::Io(e)),
         Err(_) => {
-            return Err(TransportAttemptError::Other(SshMcpError::connection(
-                "stdout task join failed",
-            )));
+            return Err(SshMcpError::connection("stdout task join failed"));
         }
     };
 
     let stderr = match stderr_task.await {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(TransportAttemptError::Other(SshMcpError::Io(e))),
+        Ok(Err(e)) => return Err(SshMcpError::Io(e)),
         Err(_) => {
-            return Err(TransportAttemptError::Other(SshMcpError::connection(
-                "stderr task join failed",
-            )));
+            return Err(SshMcpError::connection("stderr task join failed"));
         }
     };
 
@@ -122,12 +114,51 @@ pub(super) async fn wait_child_with_timeout(
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::process::Stdio;
 
     use super::*;
 
+    #[test]
+    fn missing_client_is_config_error_for_selected_transport() {
+        for transport in [
+            super::super::TransferTransport::Sftp,
+            super::super::TransferTransport::Scp,
+            super::super::TransferTransport::Rsync,
+        ] {
+            let error = classify_spawn_error_with_reason(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "client unavailable"),
+                transport,
+                "missing selected client".to_string(),
+            );
+            let SshMcpError::Config(reason) = error else {
+                panic!("missing client must report a configuration error");
+            };
+            assert!(reason.contains(&format!("{transport:?}")));
+            assert!(reason.contains("missing selected client"));
+        }
+    }
+
+    #[test]
+    fn other_spawn_errors_preserve_io_error() {
+        let error = classify_spawn_error_with_reason(
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "client not executable",
+            ),
+            super::super::TransferTransport::Sftp,
+            "missing selected client".to_string(),
+        );
+        let SshMcpError::Io(error) = error else {
+            panic!("non-missing client spawn errors must remain IO errors");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "client not executable");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_and_reaps_process_group() {
         let mut command = Command::new("sh");

@@ -62,9 +62,8 @@ pub(super) fn transfer_tool(preferred: Option<&'static str>) -> Tool {
             },
             "transport": {
                 "type": "string",
-                "enum": ["auto", "exec-raw", "sftp", "scp", "rsync"],
-                "default": "auto",
-                "description": "auto: rsync>sftp>scp>exec-raw; rsync/sftp/scp need keys on target+jump; exec-raw supports passwords."
+                "enum": ["exec-raw", "sftp", "scp", "rsync"],
+                "description": "Explicit; no fallback. rsync/sftp/scp need keys on target+jump; exec-raw supports passwords."
             },
             "kind": {
                 "type": "string",
@@ -84,7 +83,7 @@ pub(super) fn transfer_tool(preferred: Option<&'static str>) -> Tool {
                 "description": "Return job_id; poll."
             }
         },
-        "required": ["operation", "local_path", "remote_path"]
+        "required": ["operation", "local_path", "remote_path", "transport"]
     });
 
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
@@ -92,7 +91,7 @@ pub(super) fn transfer_tool(preferred: Option<&'static str>) -> Tool {
         Some(transport) => {
             format!("Files/dirs. Prefer transport={transport} (startup; may be stale).")
         }
-        None => "Files/dirs. Startup unverified; default transport=auto.".to_string(),
+        None => "Files/dirs. Choose transport explicitly (startup unverified).".to_string(),
     };
     Tool::new("transfer", description, Arc::new(schema_obj))
 }
@@ -214,13 +213,24 @@ mod tests {
     }
 
     #[test]
-    fn transfer_describes_fallback_and_key_requirements() {
+    fn transfer_requires_explicit_transport_and_describes_key_requirements() {
         let tool = transfer_tool(None);
-        let transport_description = tool.input_schema["properties"]["transport"]["description"]
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        let transport = &schema["properties"]["transport"];
+        let transport_description = transport["description"]
             .as_str()
             .expect("transport description");
 
-        assert!(transport_description.contains("rsync>sftp>scp>exec-raw"));
+        assert_eq!(
+            transport["enum"],
+            serde_json::json!(["exec-raw", "sftp", "scp", "rsync"])
+        );
+        assert!(transport.get("default").is_none());
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["operation", "local_path", "remote_path", "transport"])
+        );
+        assert!(transport_description.contains("Explicit; no fallback"));
         assert!(transport_description.contains("rsync/sftp/scp need keys on target+jump"));
         assert!(transport_description.contains("exec-raw supports passwords"));
     }
@@ -231,7 +241,7 @@ mod tests {
         for (preferred, description) in [
             (
                 None,
-                "Files/dirs. Startup unverified; default transport=auto.",
+                "Files/dirs. Choose transport explicitly (startup unverified).",
             ),
             (
                 Some("sftp"),

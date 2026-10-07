@@ -140,20 +140,24 @@ async fn password_jump_uses_exec_raw_and_rejects_explicit_sftp() {
     assert_eq!(extract_text_from_result(&whoami).trim(), "test");
 
     let (local_dir, local_path) = unique_local_file("password", "password jump\n");
-    let auto = server
+    let exec_raw = server
         .test_transfer(TransferParams {
             operation: TransferOperation::Put,
             local_path: local_path.clone(),
-            remote_path: "/home/test/jump-password-auto.txt".to_string(),
-            transport: TransferTransport::Auto,
+            remote_path: "/home/test/jump-password-exec-raw.txt".to_string(),
+            transport: TransferTransport::ExecRaw,
             kind: Some(TransferKind::File),
             overwrite: true,
             timeout_ms: Some(30_000),
             ..Default::default()
         })
         .await;
-    assert!(auto.ok, "jump auto transfer failed: {:?}", auto.error);
-    assert_eq!(auto.transport_used, TransferTransport::ExecRaw);
+    assert!(
+        exec_raw.ok,
+        "jump exec-raw transfer failed: {:?}",
+        exec_raw.error
+    );
+    assert_eq!(exec_raw.transport_used, TransferTransport::ExecRaw);
 
     let explicit = server
         .test_transfer(TransferParams {
@@ -168,6 +172,7 @@ async fn password_jump_uses_exec_raw_and_rejects_explicit_sftp() {
         })
         .await;
     assert!(!explicit.ok);
+    assert_eq!(explicit.transport_used, TransferTransport::Sftp);
     assert!(
         explicit
             .error

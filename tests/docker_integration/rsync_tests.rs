@@ -4,6 +4,7 @@
 use super::common::*;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use testcontainers::core::ExecCommand;
 
 #[tokio::test]
 async fn test_rsync_file_put_with_key_auth() {
@@ -532,7 +533,7 @@ async fn test_rsync_directory_get_with_key_auth() {
 }
 
 #[tokio::test]
-async fn test_auto_transport_prefers_rsync() {
+async fn test_explicit_rsync_missing_remote_binary_is_terminal() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter("ssh_mcp=debug,info")
@@ -543,10 +544,9 @@ async fn test_auto_transport_prefers_rsync() {
         return;
     }
 
-    // Build the custom Debian SSH image if needed
+    // Reuse the standard SSH image and its existing key authentication setup.
     init_test_env().expect("Failed to build test image");
 
-    // Start SSH container using custom Debian image with password auth
     let container = GenericImage::new("ssh-mcp-debian-sshd", "latest")
         .with_exposed_port(2222u16.into())
         .start()
@@ -562,6 +562,29 @@ async fn test_auto_transport_prefers_rsync() {
         .await
         .expect("Failed to get mapped SSH port");
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Docker exec controls only this test's container as root, outside the SSH user.
+    let mut disable_rsync = container
+        .exec(ExecCommand::new([
+            "sh",
+            "-c",
+            "set -eu; test \"$(id -u)\" = 0; mv /usr/bin/rsync /usr/bin/rsync.disabled; ! command -v rsync",
+        ]))
+        .await
+        .expect("disable rsync in the owned test container");
+    let setup_stdout = disable_rsync
+        .stdout_to_vec()
+        .await
+        .expect("read rsync fixture setup output");
+    assert_eq!(
+        disable_rsync
+            .exit_code()
+            .await
+            .expect("rsync setup exit code"),
+        Some(0),
+        "rsync fixture setup failed: {}",
+        String::from_utf8_lossy(&setup_stdout)
+    );
 
     // Generate test key
     let (_key_dir, key_path) = setup_test_key();
@@ -601,28 +624,32 @@ async fn test_auto_transport_prefers_rsync() {
 
     // Create local file
     let unique = format!(
-        "{}-{}-rsync-auto",
+        "{}-{}-rsync-missing-remote",
         std::process::id(),
         SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let local_base = PathBuf::from("target/tmp").join(format!("rsync-auto-{unique}"));
+    let local_base = PathBuf::from("target/tmp").join(format!("rsync-missing-remote-{unique}"));
     std::fs::create_dir_all(&local_base).expect("create local base");
 
-    let local_file = local_base.join("auto-test.txt");
-    std::fs::write(&local_file, "auto transport test via rsync\n").expect("write local file");
+    let local_file = local_base.join("terminal-test.txt");
+    std::fs::write(
+        &local_file,
+        "explicit rsync must not start another writer\n",
+    )
+    .expect("write local file");
 
     let local_path_param = local_file.to_string_lossy().to_string();
-    let remote_file = format!("{}/auto-transport-test.txt", remote_home);
+    let remote_file = format!("{remote_home}/rsync-missing-remote-{unique}.txt");
 
     let resp = server
         .test_transfer(TransferParams {
             operation: TransferOperation::Put,
             local_path: local_path_param,
             remote_path: remote_file.clone(),
-            transport: TransferTransport::Auto,
+            transport: TransferTransport::Rsync,
             kind: Some(TransferKind::File),
             overwrite: true,
             timeout_ms: Some(30000),
@@ -632,26 +659,37 @@ async fn test_auto_transport_prefers_rsync() {
         .await;
 
     assert!(
-        resp.ok,
-        "auto transport file PUT should succeed: {:?}",
+        !resp.ok,
+        "explicit rsync must fail when the remote binary is missing: {:?}",
         resp.error
     );
     assert_eq!(
         resp.transport_used,
         TransferTransport::Rsync,
-        "auto should prefer Rsync transport when available"
+        "a failed explicit rsync request must retain its selected transport"
+    );
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|error| error.contains("rsync not found on remote host")),
+        "unexpected missing-rsync error: {:?}",
+        resp.error
     );
 
-    // Verify content on remote
+    // Neither SFTP nor exec-raw may write automatically after the rsync failure.
     let verify = server
         .test_execute_command(&format!(
-            "sh -c 'cat < {}'",
+            "test ! -e '{}' && test ! -L '{}' && printf absent",
+            ssh_mcp::escape_for_shell(&remote_file),
             ssh_mcp::escape_for_shell(&remote_file)
         ))
         .await
-        .expect("verify remote file");
-    let verify_text = extract_text_from_result(&verify);
-    assert!(verify_text.contains("auto transport test via rsync"));
+        .expect("verify destination remains absent");
+    assert_eq!(
+        extract_text_from_result(&verify),
+        "absent",
+        "a terminal rsync failure must not create the destination"
+    );
 
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(&local_base);

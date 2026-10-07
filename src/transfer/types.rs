@@ -13,7 +13,6 @@ pub enum TransferOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransferTransport {
-    Auto,
     ExecRaw,
     Sftp,
     Scp,
@@ -78,7 +77,7 @@ pub struct TransferParams {
     /// - For `get`: remote source path
     pub remote_path: String,
 
-    #[serde(default = "default_transport")]
+    /// Explicit transport; required on the wire and never selected by the server.
     pub transport: TransferTransport,
 
     /// Optional explicit kind. If omitted, the server auto-detects.
@@ -119,10 +118,6 @@ fn default_false() -> bool {
     false
 }
 
-fn default_transport() -> TransferTransport {
-    TransferTransport::Auto
-}
-
 fn default_overwrite() -> bool {
     false
 }
@@ -133,7 +128,8 @@ impl Default for TransferParams {
             operation: TransferOperation::Put,
             local_path: String::new(),
             remote_path: String::new(),
-            transport: default_transport(),
+            // Rust construction convenience only, not a serde/wire default.
+            transport: TransferTransport::ExecRaw,
             kind: None,
             overwrite: default_overwrite(),
             timeout_ms: None,
@@ -232,8 +228,6 @@ pub struct TransferResponse {
     pub kind: Option<TransferKind>,
 
     pub transport_used: TransferTransport,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub fallback_chain: Vec<TransferTransport>,
     pub remote_home: Option<String>,
     pub local_root: String,
 
@@ -258,7 +252,6 @@ impl TransferResponse {
             params,
             kind: None,
             transport_used,
-            fallback_chain: Vec::new(),
             remote_home: Some(remote_home.to_string()),
             local_root: local_root.display().to_string(),
             resolved_paths: None,
@@ -274,7 +267,6 @@ impl TransferResponse {
             ok: false,
             error: Some(msg.to_string()),
             transport_used: params.transport,
-            fallback_chain: Vec::new(),
             remote_home: None,
             local_root: local_root.display().to_string(),
             params,
@@ -302,8 +294,6 @@ pub struct CompactTransferResponse {
     pub error: Option<String>,
     pub kind: Option<TransferKind>,
     pub transport_used: TransferTransport,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub fallback_chain: Vec<TransferTransport>,
     // Paths are always included for DevOps context
     pub local_path: String,
     pub remote_path: String,
@@ -321,7 +311,6 @@ impl TransferResponse {
             error: self.error.clone(),
             kind: self.kind,
             transport_used: self.transport_used,
-            fallback_chain: self.fallback_chain.clone(),
             local_path: self.params.local_path.clone(),
             remote_path: self.params.remote_path.clone(),
             counts: self.counts.clone(),
@@ -335,6 +324,67 @@ impl TransferResponse {
             serde_json::to_string(self)
         } else {
             serde_json::to_string(&self.to_compact())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{TransferParams, TransferTransport};
+
+    fn wire_params() -> Value {
+        json!({
+            "operation": "put",
+            "local_path": "payload.bin",
+            "remote_path": "/home/test/payload.bin"
+        })
+    }
+
+    #[test]
+    fn transfer_requires_an_explicit_wire_transport() {
+        assert_eq!(
+            TransferParams::default().transport,
+            TransferTransport::ExecRaw
+        );
+        for transport in [
+            None,
+            Some(Value::Null),
+            Some(json!("auto")),
+            Some(json!("unknown")),
+            Some(json!("")),
+            Some(json!(17)),
+            Some(json!(false)),
+            Some(json!([])),
+        ] {
+            let mut params = wire_params();
+            if let Some(transport) = transport {
+                params["transport"] = transport;
+            }
+            assert!(
+                serde_json::from_value::<TransferParams>(params.clone()).is_err(),
+                "invalid transport must not be defaulted: {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_explicit_transports_round_trip_without_implicit_selection() {
+        for (name, expected) in [
+            ("exec-raw", TransferTransport::ExecRaw),
+            ("sftp", TransferTransport::Sftp),
+            ("scp", TransferTransport::Scp),
+            ("rsync", TransferTransport::Rsync),
+        ] {
+            let mut wire = wire_params();
+            wire["transport"] = json!(name);
+            let params: TransferParams = serde_json::from_value(wire).unwrap();
+            assert_eq!(params.transport, expected);
+            let serialized = serde_json::to_value(&params).unwrap();
+            assert_eq!(serialized["transport"], name);
+            let round_trip: TransferParams = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round_trip.transport, expected);
         }
     }
 }

@@ -47,7 +47,7 @@ pub struct RsyncTransferArgs<'a> {
 pub async fn run_transfer(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     if endpoint.jump.is_some() {
         super::check_local_ssh(
             super::TransferTransport::Rsync,
@@ -60,17 +60,10 @@ pub async fn run_transfer(
     check_local_rsync(args.timeout, &args.cancellation).await?;
 
     // Check remote rsync availability via SSH
-    match check_remote_rsync(args.conn, args.timeout).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(super::TransportAttemptError::FallbackSafe {
-                transport: super::TransferTransport::Rsync,
-                reason: "rsync not found on remote host".to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(super::TransportAttemptError::Other(e));
-        }
+    if !check_remote_rsync(args.conn, args.timeout).await? {
+        return Err(SshMcpError::config(
+            "transport Rsync unsupported: rsync not found on remote host",
+        ));
     }
 
     skeleton::dispatch_transfer(skeleton::DispatchTransferArgs {
@@ -86,10 +79,7 @@ pub async fn run_transfer(
     .await
 }
 
-async fn check_local_rsync(
-    timeout: Duration,
-    cancellation: &CancellationToken,
-) -> std::result::Result<(), super::TransportAttemptError> {
+async fn check_local_rsync(timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
     let mut command = Command::new("rsync");
     command
         .arg("--version")
@@ -102,9 +92,7 @@ async fn check_local_rsync(
     if output.status.success() {
         Ok(())
     } else {
-        Err(super::TransportAttemptError::Other(
-            SshMcpError::connection("rsync --version failed"),
-        ))
+        Err(SshMcpError::connection("rsync --version failed"))
     }
 }
 
@@ -201,7 +189,7 @@ async fn run_rsync(
     dst: &str,
     timeout_duration: Duration,
     cancellation: &CancellationToken,
-) -> std::result::Result<TransferCounts, super::TransportAttemptError> {
+) -> Result<TransferCounts> {
     let ssh_opts = build_ssh_options(endpoint);
     let mut cmd = Command::new("rsync");
 
@@ -280,7 +268,7 @@ fn parse_rsync_stats(stdout: &str) -> TransferCounts {
     }
 }
 
-fn classify_spawn_error(err: std::io::Error) -> super::TransportAttemptError {
+fn classify_spawn_error(err: std::io::Error) -> SshMcpError {
     process::classify_spawn_error_with_reason(
         err,
         super::TransferTransport::Rsync,
@@ -288,7 +276,7 @@ fn classify_spawn_error(err: std::io::Error) -> super::TransportAttemptError {
     )
 }
 
-fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> super::TransportAttemptError {
+fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> SshMcpError {
     let stderr_lower = stderr.to_lowercase();
 
     // Check for rsync not found on remote
@@ -296,9 +284,7 @@ fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> super::Transp
         || stderr_lower.contains("rsync: command not found")
         || stderr_lower.contains("could not find rsync")
     {
-        return super::TransportAttemptError::Other(SshMcpError::connection(
-            "rsync not found on remote host after preflight",
-        ));
+        return SshMcpError::connection("rsync not found on remote host after preflight");
     }
 
     // Check for SSH connection issues
@@ -307,24 +293,24 @@ fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> super::Transp
         || stderr_lower.contains("no route to host")
         || stderr_lower.contains("network is unreachable")
     {
-        return super::TransportAttemptError::Other(SshMcpError::connection(format!(
+        return SshMcpError::connection(format!(
             "rsync failed: network error; stderr={}",
             stderr.trim()
-        )));
+        ));
     }
 
     // Check for permission denied
     if stderr_lower.contains("permission denied") || stderr_lower.contains("access denied") {
-        return super::TransportAttemptError::Other(SshMcpError::connection(format!(
+        return SshMcpError::connection(format!(
             "rsync failed: permission denied; stderr={}",
             stderr.trim()
-        )));
+        ));
     }
 
-    super::TransportAttemptError::Other(SshMcpError::connection(format!(
+    SshMcpError::connection(format!(
         "rsync failed: exit_code={exit_code:?}; stderr={}",
         stderr.trim()
-    )))
+    ))
 }
 
 // Remote staging helpers are implemented in `super::staging`.
@@ -332,7 +318,7 @@ fn classify_rsync_failure(exit_code: Option<i32>, stderr: &str) -> super::Transp
 async fn put_file(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let RsyncTransferArgs {
         conn,
         remote_home,
@@ -383,7 +369,7 @@ async fn put_file(
 async fn get_file(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let RsyncTransferArgs {
         conn: _,
         remote_home: _,
@@ -434,7 +420,7 @@ async fn count_local_dir_no_symlinks(root: &Path) -> Result<TransferCounts> {
 async fn put_dir(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let RsyncTransferArgs {
         conn,
         remote_home,
@@ -449,9 +435,7 @@ async fn put_dir(
         ..
     } = args;
 
-    let counts = count_local_dir_no_symlinks(local_path)
-        .await
-        .map_err(super::TransportAttemptError::Other)?;
+    let counts = count_local_dir_no_symlinks(local_path).await?;
 
     let remote_path = remote_path.to_string();
 
@@ -487,7 +471,7 @@ async fn put_dir(
 async fn get_dir(
     endpoint: RsyncEndpoint,
     args: RsyncTransferArgs<'_>,
-) -> std::result::Result<(TransferStaging, TransferCounts), super::TransportAttemptError> {
+) -> Result<(TransferStaging, TransferCounts)> {
     let RsyncTransferArgs {
         conn,
         remote_home: _,
@@ -538,6 +522,21 @@ async fn get_dir(
 mod tests {
     use super::*;
     use crate::ssh::escape_for_shell;
+
+    #[test]
+    fn test_missing_remote_rsync_after_preflight_preserves_connection_error() {
+        for stderr in [
+            "sh: rsync: not found",
+            "bash: rsync: command not found",
+            "Could not find rsync",
+        ] {
+            let error = classify_rsync_failure(Some(127), stderr);
+            let SshMcpError::Connection(reason) = error else {
+                panic!("post-preflight failure must remain a connection error");
+            };
+            assert!(reason.contains("rsync not found on remote host after preflight"));
+        }
+    }
 
     #[test]
     fn test_parse_rsync_stats() {

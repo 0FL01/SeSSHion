@@ -329,6 +329,10 @@ async fn startup_transfer_closed_sftp_is_unknown_and_recommended_raw_file_put_wo
         tracing::warn!("skipping: local OpenSSH ssh/sftp clients unavailable");
         return;
     }
+    assert!(
+        check_scp(),
+        "terminal SFTP failure coverage requires an available local SCP client"
+    );
     let container = container("ssh-mcp-debian-sshd").await;
     control(&container, FIXTURE).await;
     // Only this disposable container is changed. Validate before asking the
@@ -343,6 +347,7 @@ kill -HUP "$(cat /run/sshd.pid)"
 "#,
     )
     .await;
+    control(&container, "test -x /usr/bin/scp").await;
     let (_key_dir, key_path) = setup_test_key();
     let mut config = config(
         container.get_host().await.unwrap().to_string(),
@@ -381,20 +386,90 @@ kill -HUP "$(cat /run/sshd.pid)"
     let payload = b"hint-directed exec-raw transfer\0\xff\r\n";
     std::fs::write(&local_file, payload).unwrap();
     let instructions = server.get_info().instructions;
+    let absent = "test ! -e /home/test/hint-transfer.bin && test ! -L /home/test/hint-transfer.bin";
+    control(&container, absent).await;
+    let params = TransferParams {
+        operation: TransferOperation::Put,
+        local_path: local_file.to_string_lossy().into_owned(),
+        remote_path: "/home/test/hint-transfer.bin".into(),
+        transport: TransferTransport::Sftp,
+        kind: Some(TransferKind::File),
+        overwrite: false,
+        timeout_ms: Some(5000),
+        ..Default::default()
+    };
+    // Kind resolution fails before dispatch; even then the response must name
+    // the requested transport rather than an implicit raw transport.
+    for transport in [
+        TransferTransport::ExecRaw,
+        TransferTransport::Sftp,
+        TransferTransport::Scp,
+        TransferTransport::Rsync,
+    ] {
+        let early = server
+            .test_transfer(TransferParams {
+                local_path: local_dir
+                    .path()
+                    .join("missing-source.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+                transport,
+                kind: None,
+                ..params.clone()
+            })
+            .await;
+        assert!(!early.ok);
+        assert_eq!(early.params.transport, transport);
+        assert_eq!(early.transport_used, transport);
+        assert!(early.elapsed_ms.is_some());
+        assert!(early.staging.is_none());
+        assert!(
+            early
+                .error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("failed to resolve transfer kind")),
+            "unexpected early {transport:?} error: {early:?}"
+        );
+    }
+    control(&container, absent).await;
+    // Raw is preferred and key-authenticated exec/SCP remain available, but a
+    // failed explicit SFTP selection must stay terminal rather than fall back.
+    let rejected = server.test_transfer(params.clone()).await;
+    assert!(!rejected.ok, "closed SFTP must reject the explicit PUT");
+    assert_eq!(rejected.params.transport, TransferTransport::Sftp);
+    assert_eq!(rejected.transport_used, TransferTransport::Sftp);
+    assert!(
+        rejected
+            .error
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty()),
+        "terminal SFTP failure must include its reason: {rejected:?}"
+    );
+    assert!(
+        serde_json::to_value(&rejected)
+            .unwrap()
+            .get("fallback_chain")
+            .is_none(),
+        "terminal SFTP failure must not expose a fallback chain"
+    );
+    control(&container, absent).await;
+    assert_eq!(server.get_info().instructions, instructions);
+
     let response = server
         .test_transfer(TransferParams {
-            operation: TransferOperation::Put,
-            local_path: local_file.to_string_lossy().into_owned(),
-            remote_path: "/home/test/hint-transfer.bin".into(),
             transport: TransferTransport::ExecRaw,
-            kind: Some(TransferKind::File),
-            overwrite: false,
-            timeout_ms: Some(5000),
-            ..Default::default()
+            ..params
         })
         .await;
     assert!(response.ok, "one explicit raw PUT: {:?}", response.error);
     assert_eq!(response.transport_used, TransferTransport::ExecRaw);
+    assert!(
+        serde_json::to_value(&response)
+            .unwrap()
+            .get("fallback_chain")
+            .is_none(),
+        "explicit raw PUT result must not expose a fallback chain"
+    );
     assert_eq!(
         control_bytes(&container, "cat /home/test/hint-transfer.bin").await,
         payload
@@ -447,6 +522,10 @@ async fn startup_environment_partial_timeout_flood_and_cancellation_preserve_ssh
     ct.cancel();
     let unprepared = unprepared.with_startup_environment(ct).await;
     assert!(!unprepared.connection().is_connected().await);
+    assert_eq!(
+        transfer_hint(&unprepared),
+        "Transfer: startup preflight unknown; choose transport explicitly."
+    );
     unprepared.shutdown().await;
 
     control(&container, "printf hold > /home/test/probe-mode").await;
@@ -525,7 +604,7 @@ async fn startup_raw_preflight_requires_exact_binary_output_and_zero_exit() {
         assert!(start.elapsed() < Duration::from_millis(3500));
         assert_eq!(
             transfer_hint(&server),
-            "Transfer: prefer auto; startup preflight (may be stale): blocked=rsync,sftp,scp; unknown=exec-raw.",
+            "Transfer: choose transport explicitly; startup preflight (may be stale): blocked=rsync,sftp,scp; unknown=exec-raw.",
             "inconclusive raw channel must not be recommended: {script}"
         );
         assert_eq!(snapshot(&server)["effective_uid"], 1000);

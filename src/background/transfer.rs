@@ -191,7 +191,10 @@ mod tests {
         assert_eq!(queued.phase, TransferJobPhase::Queued);
 
         let response = TransferResponse::error(
-            TransferParams::default(),
+            TransferParams {
+                transport: TransferTransport::ExecRaw,
+                ..Default::default()
+            },
             Path::new("/tmp"),
             "expected failure",
         );

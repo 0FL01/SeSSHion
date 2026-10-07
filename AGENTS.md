@@ -2,6 +2,8 @@
 
 SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM agents. It provides persistent connections, command execution, and explicit root elevation for remote Linux systems.
 
+Transfer calls require explicit `rsync`, `sftp`, `scp`, or `exec-raw`; reject missing/`null`/`auto` before dispatch or job creation. Never select or retry another transport. Rust `TransferParams::default()` uses `ExecRaw` only for construction, not as a serde/schema wire default.
+
 ## Repository Structure
 
 ```text
@@ -36,7 +38,6 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   │   ├── rsync_tests.rs        # Rsync transfer tests
 │   │   ├── rsync_timeout_tests.rs # Rsync timeout and process cleanup tests
 │   │   ├── overwrite_tests.rs    # File overwrite behavior tests
- │   │   ├── fallback_tests.rs     # Transport fallback chain tests
  │   │   ├── auth_tests.rs         # Authentication method tests
  │   │   ├── timeout_tests.rs      # Command timeout behavior tests
  │   │   ├── oom_tests.rs          # Output truncation and OOM protection tests
@@ -47,8 +48,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
  │       │   └── README.md         # Build and usage instructions
  │       ├── debian-sshd-fish/     # Debian SSHD with Fish shell
  │       │   └── Dockerfile        # Fish shell testing image
- │       ├── debian-sshd-keyauth/  # Debian SSHD with key auth only
- │       └── debian-sshd-norsync/  # Debian SSHD without rsync
+ │       └── debian-sshd-keyauth/  # Debian SSHD with key auth only
 ├── src/                        # Source code
 │   ├── main.rs                 # Application entry point
 │   ├── lib.rs                  # Library root

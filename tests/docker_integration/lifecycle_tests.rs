@@ -248,6 +248,30 @@ fn assert_six_tool_budget(definitions: &Value) {
         bytes <= 3200,
         "six-tool definitions exceeded 3200 bytes: {bytes}"
     );
+    let transfer = definitions["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "transfer")
+        .expect("transfer tool");
+    let schema = &transfer["inputSchema"];
+    let transport = &schema["properties"]["transport"];
+    assert_eq!(transport["type"], "string");
+    assert_eq!(
+        transport["enum"],
+        json!(["exec-raw", "sftp", "scp", "rsync"])
+    );
+    assert!(
+        schema["required"]
+            .as_array()
+            .expect("required transfer arguments")
+            .contains(&json!("transport")),
+        "transfer transport must be required: {schema}"
+    );
+    assert!(
+        transport.get("default").is_none(),
+        "transfer transport must not have a schema default: {transport}"
+    );
 }
 
 async fn wait_for_tcp(host: &str, port: u16) {
@@ -404,6 +428,7 @@ async fn modern_stdio_discovery_and_tool_results() {
     let response = process.response(2).await;
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["resultType"], "complete");
+    assert_six_tool_budget(&response["result"]);
     let tools = response["result"]["tools"].as_array().expect("tools");
     assert_eq!(tools.len(), 6);
     assert!(tools.iter().any(|tool| tool["name"] == "check_process"));
@@ -443,6 +468,8 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
         }))
         .await;
     let response = process.response(2).await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_six_tool_budget(&response["result"]);
     let tools = response["result"]["tools"]
         .as_array()
         .expect("tools/list result");
@@ -480,6 +507,72 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
 
     process.close_stdin().await;
     process.assert_successful_exit().await;
+}
+
+#[tokio::test]
+async fn transfer_rejects_missing_auto_null_and_unknown_transport_before_dispatch() {
+    let (container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
+    // McpProcess sets its current directory to this owned temp directory, so
+    // this otherwise valid PUT source is inside the server's transfer root.
+    let local_file = process._temp_dir.path().join("transport-required.bin");
+    let payload = b"invalid transport must not dispatch\0\xff\r\n";
+    std::fs::write(&local_file, payload).expect("write valid transfer payload");
+    let remote_path = "/home/test/transport-required.bin";
+    let absent = "test ! -e /home/test/transport-required.bin && test ! -L /home/test/transport-required.bin";
+    control(&container, absent).await;
+    process.initialize().await;
+
+    let transports = [
+        ("missing", None),
+        ("legacy auto", Some(json!("auto"))),
+        ("null", Some(Value::Null)),
+        ("unknown", Some(json!("unknown"))),
+    ];
+    let mut request_id = 2;
+    for background in [false, true] {
+        for (case, transport) in &transports {
+            let mut arguments = json!({
+                "operation": "put",
+                "local_path": "transport-required.bin",
+                "remote_path": remote_path,
+                "kind": "file",
+                "background": background,
+                "timeout_ms": 5000
+            });
+            if let Some(transport) = transport {
+                arguments["transport"] = transport.clone();
+            }
+            process
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": "transfer", "arguments": arguments}
+                }))
+                .await;
+            let response = process.response(request_id).await;
+            assert_eq!(
+                response["error"]["code"], -32602,
+                "{case}, background={background} must fail argument parsing: {response}"
+            );
+            assert!(
+                response.get("result").is_none(),
+                "{case}, background={background} dispatched a transfer result: {response}"
+            );
+            assert!(
+                response.pointer("/result/job_id").is_none(),
+                "{case}, background={background} allocated a transfer job: {response}"
+            );
+            control(&container, absent).await;
+            request_id += 1;
+        }
+    }
+
+    assert_eq!(std::fs::read(&local_file).unwrap(), payload);
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+    control(&container, absent).await;
 }
 
 #[tokio::test]
@@ -623,7 +716,7 @@ kill -HUP "$(cat /run/sshd.pid)"
 }
 
 #[tokio::test]
-async fn inconclusive_tools_list_keeps_auto_after_probe_repair() {
+async fn inconclusive_tools_list_keeps_explicit_choice_after_probe_repair() {
     let (container, host, port) = ssh_fixture().await;
     control(&container, METADATA_FIXTURE).await;
     control(
@@ -647,7 +740,7 @@ chmod +x /home/test/probebin/cat
     assert_six_tool_budget(definitions);
     assert_eq!(
         transfer_description(definitions),
-        "Files/dirs. Startup unverified; default transport=auto."
+        "Files/dirs. Choose transport explicitly (startup unverified)."
     );
 
     control(&container, "rm /home/test/probebin/cat").await;
@@ -1351,6 +1444,14 @@ async fn background_transfer_is_immediately_pollable_and_completes() {
     let terminal = terminal.expect("background transfer should finish");
     assert_eq!(terminal["state"], "completed", "{terminal}");
     assert_eq!(terminal["result"]["ok"], true, "{terminal}");
+    assert_eq!(
+        terminal["result"]["transport_used"], "exec-raw",
+        "{terminal}"
+    );
+    assert!(
+        terminal["result"].get("fallback_chain").is_none(),
+        "completed transfer result must not expose a fallback chain: {terminal}"
+    );
 
     process
         .send(json!({
@@ -1380,6 +1481,14 @@ async fn background_transfer_is_immediately_pollable_and_completes() {
     let rejected_body: Value =
         serde_json::from_str(tool_text(&rejected)).expect("failed transfer response JSON");
     assert_eq!(rejected_body["ok"], false, "{rejected_body}");
+    assert_eq!(
+        rejected_body["transport_used"], "exec-raw",
+        "{rejected_body}"
+    );
+    assert!(
+        rejected_body.get("fallback_chain").is_none(),
+        "failed transfer result must not expose a fallback chain: {rejected_body}"
+    );
 
     process
         .send(json!({
@@ -1387,12 +1496,82 @@ async fn background_transfer_is_immediately_pollable_and_completes() {
             "id": 104,
             "method": "tools/call",
             "params": {
+                "name": "transfer",
+                "arguments": {
+                    "operation": "put",
+                    "local_path": "payload.txt",
+                    "remote_path": remote_path.clone(),
+                    "transport": "exec-raw",
+                    "kind": "file",
+                    "overwrite": false,
+                    "background": true,
+                    "timeout_ms": 30000
+                }
+            }
+        }))
+        .await;
+    let started = process.response(104).await;
+    assert!(started.get("error").is_none(), "{started}");
+    let started: Value =
+        serde_json::from_str(tool_text(&started)).expect("rejected background transfer JSON");
+    assert_eq!(started["job_type"], "transfer");
+    assert_eq!(started["state"], "running");
+    let failed_job_id = started["job_id"].as_str().expect("failed transfer job id");
+    assert_ne!(failed_job_id, job_id);
+    let mut terminal = None;
+    for request_id in 105..205 {
+        process
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_process",
+                    "arguments": {"job_id": failed_job_id, "wait_for": 0, "tail_lines": 0}
+                }
+            }))
+            .await;
+        let response = process.response(request_id).await;
+        assert!(response.get("error").is_none(), "{response}");
+        let status: Value =
+            serde_json::from_str(tool_text(&response)).expect("failed transfer status JSON");
+        assert_eq!(status["job_type"], "transfer");
+        if status["running"] == false {
+            terminal = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let terminal = terminal.expect("rejected background transfer should finish");
+    assert_eq!(terminal["state"], "failed", "{terminal}");
+    assert_eq!(terminal["result"]["ok"], false, "{terminal}");
+    assert_eq!(
+        terminal["result"]["transport_used"], "exec-raw",
+        "{terminal}"
+    );
+    assert!(
+        terminal["result"]["error"]
+            .as_str()
+            .is_some_and(|reason| !reason.trim().is_empty()),
+        "failed background transfer must include its reason: {terminal}"
+    );
+    assert!(
+        terminal["result"].get("fallback_chain").is_none(),
+        "failed background transfer result must not expose a fallback chain: {terminal}"
+    );
+
+    process
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 205,
+            "method": "tools/call",
+            "params": {
                 "name": "shell",
                 "arguments": {"command": format!("cat -- '{}' && rm -f -- '{}'", remote_path, remote_path)}
             }
         }))
         .await;
-    let remote = process.response(104).await;
+    let remote = process.response(205).await;
     assert_eq!(tool_text(&remote), "background transfer\n");
 
     process.close_stdin().await;

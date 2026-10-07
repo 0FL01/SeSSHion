@@ -492,7 +492,7 @@ mod unix_transfer_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_transfer_auto_uses_sftp_when_available() {
+    async fn test_transfer_explicit_sftp_for_file_and_directory() {
         init_test_env().expect("Failed to initialize test environment");
 
         let _ = tracing_subscriber::fmt()
@@ -500,15 +500,9 @@ mod unix_transfer_tests {
             .with_env_filter("ssh_mcp=debug,info")
             .try_init();
 
-        // Skip if local OpenSSH clients are missing/unusable.
-        // Note: some non-OpenSSH implementations may return non-zero for `-V`.
-        if !check_openssh_client("sftp") {
+        // Skip if the local SFTP client is unavailable.
+        if !check_sftp() {
             tracing::warn!("skipping: local 'sftp' client unavailable");
-            return;
-        }
-
-        if !check_openssh_client("scp") {
-            tracing::warn!("skipping: local 'scp' client unavailable");
             return;
         }
 
@@ -597,7 +591,7 @@ mod unix_transfer_tests {
                 operation: TransferOperation::Put,
                 local_path: local_path_param,
                 remote_path: remote_file.clone(),
-                transport: TransferTransport::Auto,
+                transport: TransferTransport::Sftp,
                 kind: Some(TransferKind::File),
                 overwrite: true,
                 timeout_ms: Some(30000),
@@ -610,7 +604,7 @@ mod unix_transfer_tests {
         assert_eq!(
             resp.transport_used,
             TransferTransport::Sftp,
-            "auto should prefer sftp when available"
+            "explicit SFTP file transfer should use the requested transport"
         );
 
         // Verify content on remote.
@@ -624,7 +618,7 @@ mod unix_transfer_tests {
         let verify_text = extract_text_from_result(&verify);
         assert!(verify_text.contains("hello via transfer"));
 
-        // Directory transfer sanity check (auto may still use sftp).
+        // Verify the same explicitly selected transport for a directory.
         let local_dir = local_base.join("dir");
         std::fs::create_dir_all(local_dir.join("nested")).expect("create local dir tree");
         std::fs::write(local_dir.join("nested").join("a.txt"), "a\n").expect("write nested file");
@@ -637,7 +631,7 @@ mod unix_transfer_tests {
                 operation: TransferOperation::Put,
                 local_path: local_dir_param,
                 remote_path: remote_dir.clone(),
-                transport: TransferTransport::Auto,
+                transport: TransferTransport::Sftp,
                 kind: Some(TransferKind::Directory),
                 overwrite: true,
                 timeout_ms: Some(30000),
@@ -649,6 +643,11 @@ mod unix_transfer_tests {
             dir_resp.ok,
             "directory transfer should succeed: {:?}",
             dir_resp.error
+        );
+        assert_eq!(
+            dir_resp.transport_used,
+            TransferTransport::Sftp,
+            "explicit SFTP directory transfer should use the requested transport"
         );
 
         let dir_verify = server

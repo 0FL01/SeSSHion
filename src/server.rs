@@ -1006,7 +1006,7 @@ mod tests {
         );
         assert_eq!(
             server.transfer_tool().description.as_deref(),
-            Some("Files/dirs. Startup unverified; default transport=auto.")
+            Some("Files/dirs. Choose transport explicitly (startup unverified).")
         );
         assert!(
             !server.connection().is_connected().await,

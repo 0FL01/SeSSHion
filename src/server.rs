@@ -79,6 +79,9 @@ pub struct SshMcpServer {
     /// Prepared before serving and immutable for this server's lifetime.
     startup_instructions: Option<String>,
 
+    /// Frozen evidence shared by instructions and the transfer tool description.
+    startup_transfer_preflight: StartupTransferPreflight,
+
     /// Command execution timeout
     timeout: Duration,
 
@@ -236,6 +239,7 @@ impl SshMcpServer {
             config,
             connection,
             startup_instructions: None,
+            startup_transfer_preflight: StartupTransferPreflight::default(),
             timeout,
             max_chars,
             spooler,
@@ -285,6 +289,7 @@ impl SshMcpServer {
         if !cancellation.is_cancelled() {
             self.startup_instructions =
                 Some(build_instructions(&self.config, &snapshot, &preflight));
+            self.startup_transfer_preflight = preflight;
         }
         self
     }
@@ -594,8 +599,8 @@ impl SshMcpServer {
     }
 
     /// Build transfer tool definition (compact)
-    fn transfer_tool() -> Tool {
-        tools::transfer_tool()
+    fn transfer_tool(&self) -> Tool {
+        tools::transfer_tool(self.startup_transfer_preflight.preferred_transport())
     }
 
     /// Build check_process tool definition
@@ -784,7 +789,7 @@ impl ServerHandler for SshMcpServer {
                 build_instructions(
                     &self.config,
                     &HostEnvironment::default(),
-                    &StartupTransferPreflight::default(),
+                    &self.startup_transfer_preflight,
                 )
             }))
     }
@@ -805,7 +810,7 @@ impl ServerHandler for SshMcpServer {
             tools.push(Self::sudo_apply_patch_tool());
         }
         tools.push(Self::check_process_tool());
-        tools.push(Self::transfer_tool());
+        tools.push(self.transfer_tool());
         tools.push(Self::apply_patch_tool());
 
         Ok(ListToolsResult {
@@ -998,6 +1003,10 @@ mod tests {
         assert_eq!(
             server.get_info().instructions.as_deref(),
             Some(instructions.as_str())
+        );
+        assert_eq!(
+            server.transfer_tool().description.as_deref(),
+            Some("Files/dirs. Startup unverified; default transport=auto.")
         );
         assert!(
             !server.connection().is_connected().await,

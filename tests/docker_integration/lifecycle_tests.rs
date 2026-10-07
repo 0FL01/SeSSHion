@@ -21,6 +21,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 // Cold readiness (10s) precedes the optional metadata probe (3s).
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const COLD_FAILURE_TIMEOUT: Duration = Duration::from_secs(13);
+const RAW_TRANSFER_DESCRIPTION: &str =
+    "Files/dirs. Prefer transport=exec-raw (startup; may be stale).";
 
 struct McpProcess {
     child: Child,
@@ -226,6 +228,26 @@ fn tool_text(response: &Value) -> &str {
     response["result"]["content"][0]["text"]
         .as_str()
         .expect("tool response text")
+}
+
+fn transfer_description(definitions: &Value) -> &str {
+    definitions["tools"]
+        .as_array()
+        .expect("tools/list definitions")
+        .iter()
+        .find(|tool| tool["name"] == "transfer")
+        .expect("transfer tool")["description"]
+        .as_str()
+        .expect("transfer tool description")
+}
+
+fn assert_six_tool_budget(definitions: &Value) {
+    assert_eq!(definitions["tools"].as_array().unwrap().len(), 6);
+    let bytes = serde_json::to_vec(&definitions["tools"]).unwrap().len();
+    assert!(
+        bytes <= 3200,
+        "six-tool definitions exceeded 3200 bytes: {bytes}"
+    );
 }
 
 async fn wait_for_tcp(host: &str, port: u16) {
@@ -515,6 +537,132 @@ fn opening_request(modern: bool) -> Value {
 }
 
 #[tokio::test]
+async fn password_only_tools_list_recommends_exec_raw_without_initialize() {
+    let (_container, host, port) = ssh_fixture().await;
+    let mut process = McpProcess::spawn(&host, port).await;
+    // A client can expose tools to the model without requesting instructions.
+    process.send(opening_request(true)).await;
+    let listed = process.response(1).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_six_tool_budget(&listed["result"]);
+    assert_eq!(
+        transfer_description(&listed["result"]),
+        RAW_TRANSFER_DESCRIPTION
+    );
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn key_authenticated_tools_list_recommends_sftp() {
+    assert!(
+        check_sftp() && check_openssh_client("ssh"),
+        "startup SFTP wire coverage requires local OpenSSH ssh and sftp clients"
+    );
+    let (_container, host, port) = ssh_fixture().await;
+    let (_key_dir, key_path) = setup_test_key();
+    let auth = [
+        OsString::from("--user=test"),
+        OsString::from(format!("--key={}", key_path.display())),
+        OsString::from("--strict-host-key-checking=no"),
+    ];
+    let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
+    process.send(opening_request(true)).await;
+    let listed = process.response(1).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_six_tool_budget(&listed["result"]);
+    assert_eq!(
+        transfer_description(&listed["result"]),
+        "Files/dirs. Prefer transport=sftp (startup; may be stale)."
+    );
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn key_authenticated_closed_sftp_tools_list_recommends_exec_raw() {
+    assert!(
+        check_sftp() && check_openssh_client("ssh"),
+        "closed SFTP wire coverage requires local OpenSSH ssh and sftp clients"
+    );
+    let (container, host, port) = ssh_fixture().await;
+    // Reconfigure only this disposable fixture, keeping key auth and exec open.
+    control(
+        &container,
+        r#"
+set -eu
+sed -i 's|^[[:space:]]*Subsystem[[:space:]][[:space:]]*sftp[[:space:]].*$|Subsystem sftp /bin/false|; s|^PasswordAuthentication .*|PasswordAuthentication no|' /etc/ssh/sshd_config
+/usr/sbin/sshd -t
+kill -HUP "$(cat /run/sshd.pid)"
+"#,
+    )
+    .await;
+    wait_for_tcp(&host, port).await;
+    let (_key_dir, key_path) = setup_test_key();
+    let auth = [
+        OsString::from("--user=test"),
+        OsString::from(format!("--key={}", key_path.display())),
+        OsString::from("--strict-host-key-checking=no"),
+    ];
+    let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
+    process.send(opening_request(true)).await;
+    let listed = process.response(1).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_six_tool_budget(&listed["result"]);
+    assert_eq!(
+        transfer_description(&listed["result"]),
+        RAW_TRANSFER_DESCRIPTION
+    );
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[tokio::test]
+async fn inconclusive_tools_list_keeps_auto_after_probe_repair() {
+    let (container, host, port) = ssh_fixture().await;
+    control(&container, METADATA_FIXTURE).await;
+    control(
+        &container,
+        r#"
+set -eu
+cat > /home/test/probebin/cat <<'SCRIPT'
+#!/bin/sh
+/bin/cat >/dev/null
+printf wrong
+SCRIPT
+chmod +x /home/test/probebin/cat
+"#,
+    )
+    .await;
+    let mut process = McpProcess::spawn(&host, port).await;
+    process.send(opening_request(true)).await;
+    let listed = process.response(1).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    let definitions = &listed["result"];
+    assert_six_tool_budget(definitions);
+    assert_eq!(
+        transfer_description(definitions),
+        "Files/dirs. Startup unverified; default transport=auto."
+    );
+
+    control(&container, "rm /home/test/probebin/cat").await;
+    let mut repeated = opening_request(true);
+    repeated["id"] = json!(2);
+    process.send(repeated).await;
+    let repeated = process.response(2).await;
+    assert!(repeated.get("error").is_none(), "{repeated}");
+    assert_eq!(&repeated["result"], definitions);
+
+    process.close_stdin().await;
+    process.assert_successful_exit().await;
+}
+
+#[tokio::test]
 async fn cold_rejected_password_has_no_mcp_response_or_credential_leak() {
     let (_container, host, port) = ssh_fixture().await;
     let password = "lifecycle-wrong-password-private";
@@ -633,16 +781,27 @@ async fn warm_outage_keeps_mcp_alive_and_authenticates_again_while_idle() {
     ];
     let mut process = McpProcess::spawn_with_auth(&host, port, None, None, &auth).await;
     process.initialize().await;
+    process
+        .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}))
+        .await;
+    let listed = process.response(2).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    let startup_definitions = listed["result"].clone();
+    assert_six_tool_budget(&startup_definitions);
+    assert_eq!(
+        transfer_description(&startup_definitions),
+        RAW_TRANSFER_DESCRIPTION
+    );
     let pinned_host_key = std::fs::read(known_hosts.path()).unwrap();
     assert!(
         !pinned_host_key.is_empty(),
         "cold startup did not enroll its host key"
     );
-    process.send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+    process.send(json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
         "name":"shell", "arguments":{"command":"printf x >> /home/test/lifecycle-once; printf warm"}
     }})).await;
-    assert_eq!(tool_text(&process.response(2).await), "warm");
-    process.send(json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+    assert_eq!(tool_text(&process.response(3).await), "warm");
+    process.send(json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{
         "name":"shell", "arguments":{"command":"printf x >> /home/test/lifecycle-inflight; sleep 120", "timeout_ms":10000}
     }})).await;
     // Witness the side effect before severing SSH, but never obtain a trustworthy
@@ -679,14 +838,14 @@ done
     // The listener and every session were SIGKILLed, rather than merely paused.
     // Remain down across multiple 5s recovery ticks and finite retry bursts.
     let outage_started = tokio::time::Instant::now();
-    let interrupted = process.response(3).await;
+    let interrupted = process.response(4).await;
     assert!(interrupted.get("error").is_none(), "{interrupted}");
     assert_eq!(interrupted["result"]["isError"], true, "{interrupted}");
     assert!(
         tool_text(&interrupted).contains("exit status unavailable"),
         "{interrupted}"
     );
-    let mut request_id = 4;
+    let mut request_id = 5;
     while outage_started.elapsed() < Duration::from_secs(16) {
         process
             .send(json!({"jsonrpc":"2.0", "id":request_id, "method":"ping", "params":{}}))
@@ -698,7 +857,7 @@ done
             .await;
         let listed = process.response(request_id).await;
         assert!(listed.get("error").is_none(), "{listed}");
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(listed["result"], startup_definitions);
         request_id += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -743,6 +902,13 @@ done
         "x",
         "recovery replayed an operation with an unknown terminal outcome"
     );
+    process
+        .send(json!({"jsonrpc":"2.0", "id":request_id, "method":"tools/list", "params":{}}))
+        .await;
+    let listed = process.response(request_id).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_eq!(listed["result"], startup_definitions);
+    request_id += 1;
     process
         .send(
             json!({"jsonrpc":"2.0", "id":request_id, "method":"tools/call", "params":{
@@ -883,9 +1049,11 @@ async fn startup_environment_stdio_init_and_discovery_are_frozen_without_a_tool(
         process
             .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":metadata}))
             .await;
-        let definitions = process.response(2).await["result"].clone();
-        assert_eq!(definitions["tools"].as_array().unwrap().len(), 6);
-        assert!(serde_json::to_vec(&definitions["tools"]).unwrap().len() <= 3200);
+        let listed = process.response(2).await;
+        assert!(listed.get("error").is_none(), "{listed}");
+        let definitions = listed["result"].clone();
+        assert_six_tool_budget(&definitions);
+        assert_eq!(transfer_description(&definitions), RAW_TRANSFER_DESCRIPTION);
         for id in 3..5 {
             let mut params = metadata.clone();
             params["name"] = json!("shell");

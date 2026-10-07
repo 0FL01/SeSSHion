@@ -46,7 +46,7 @@ pub(super) fn sudo_shell_tool() -> Tool {
     )
 }
 
-pub(super) fn transfer_tool() -> Tool {
+pub(super) fn transfer_tool(preferred: Option<&'static str>) -> Tool {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -88,11 +88,13 @@ pub(super) fn transfer_tool() -> Tool {
     });
 
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
-    Tool::new(
-        "transfer",
-        "Transfer a file or directory between local and remote hosts.",
-        Arc::new(schema_obj),
-    )
+    let description = match preferred {
+        Some(transport) => {
+            format!("Files/dirs. Prefer transport={transport} (startup; may be stale).")
+        }
+        None => "Files/dirs. Startup unverified; default transport=auto.".to_string(),
+    };
+    Tool::new("transfer", description, Arc::new(schema_obj))
 }
 
 pub(super) fn check_process_tool() -> Tool {
@@ -201,7 +203,7 @@ mod tests {
 
     #[test]
     fn non_background_tools_do_not_promise_client_deadlines() {
-        let tool = transfer_tool();
+        let tool = transfer_tool(None);
         let timeout_description = tool.input_schema["properties"]["timeout_ms"]["description"]
             .as_str()
             .expect("timeout_ms description");
@@ -213,7 +215,7 @@ mod tests {
 
     #[test]
     fn transfer_describes_fallback_and_key_requirements() {
-        let tool = transfer_tool();
+        let tool = transfer_tool(None);
         let transport_description = tool.input_schema["properties"]["transport"]["description"]
             .as_str()
             .expect("transport description");
@@ -224,41 +226,71 @@ mod tests {
     }
 
     #[test]
+    fn transfer_description_exposes_preference_without_changing_schema() {
+        let baseline = transfer_tool(None);
+        for (preferred, description) in [
+            (
+                None,
+                "Files/dirs. Startup unverified; default transport=auto.",
+            ),
+            (
+                Some("sftp"),
+                "Files/dirs. Prefer transport=sftp (startup; may be stale).",
+            ),
+            (
+                Some("exec-raw"),
+                "Files/dirs. Prefer transport=exec-raw (startup; may be stale).",
+            ),
+        ] {
+            let tool = transfer_tool(preferred);
+            assert_eq!(tool.name, baseline.name);
+            assert_eq!(tool.input_schema, baseline.input_schema);
+            assert_eq!(tool.description.as_deref(), Some(description));
+            assert_eq!(
+                serde_json::to_value(&tool).unwrap()["description"],
+                description
+            );
+        }
+    }
+
+    #[test]
     fn default_tool_surface_stays_within_wire_budget() {
         const WIRE_BUDGET_BYTES: usize = 3200;
-        let tools = vec![
-            shell_tool(),
-            sudo_shell_tool(),
-            sudo_apply_patch_tool(),
-            check_process_tool(),
-            transfer_tool(),
-            apply_patch_tool(),
-        ];
-        let names = tools
-            .iter()
-            .map(|tool| tool.name.as_ref())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            [
-                "shell",
-                "sudo_shell",
-                "sudo_apply_patch",
-                "check_process",
-                "transfer",
-                "apply_patch",
-            ]
-        );
+        for preferred in [None, Some("sftp"), Some("exec-raw")] {
+            let tools = vec![
+                shell_tool(),
+                sudo_shell_tool(),
+                sudo_apply_patch_tool(),
+                check_process_tool(),
+                transfer_tool(preferred),
+                apply_patch_tool(),
+            ];
+            let names = tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                [
+                    "shell",
+                    "sudo_shell",
+                    "sudo_apply_patch",
+                    "check_process",
+                    "transfer",
+                    "apply_patch",
+                ]
+            );
 
-        let bytes = serde_json::to_vec(&tools).expect("serialize default tool surface");
-        println!(
-            "default tool surface: {} bytes (budget {WIRE_BUDGET_BYTES})",
-            bytes.len()
-        );
-        assert!(
-            bytes.len() <= WIRE_BUDGET_BYTES,
-            "default tool surface is {} bytes; budget is {WIRE_BUDGET_BYTES}",
-            bytes.len()
-        );
+            let bytes = serde_json::to_vec(&tools).expect("serialize default tool surface");
+            println!(
+                "tool surface ({preferred:?}): {} bytes (budget {WIRE_BUDGET_BYTES})",
+                bytes.len()
+            );
+            assert!(
+                bytes.len() <= WIRE_BUDGET_BYTES,
+                "tool surface is {} bytes; budget is {WIRE_BUDGET_BYTES}",
+                bytes.len()
+            );
+        }
     }
 }

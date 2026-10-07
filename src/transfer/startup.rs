@@ -43,6 +43,16 @@ impl StartupTransferPreflight {
         }
     }
 
+    pub(crate) fn preferred_transport(&self) -> Option<&'static str> {
+        if self.sftp == StartupProbeStatus::Ok {
+            Some("sftp")
+        } else if self.exec_raw == StartupProbeStatus::Ok {
+            Some("exec-raw")
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn hint(&self) -> String {
         use StartupProbeStatus::{Ok, Unknown};
 
@@ -55,13 +65,7 @@ impl StartupTransferPreflight {
         if transports.iter().all(|(_, status)| *status == Unknown) {
             return "Transfer: startup preflight unknown; default auto.".to_string();
         }
-        let preferred = if self.sftp == Ok {
-            "sftp"
-        } else if self.exec_raw == Ok {
-            "exec-raw"
-        } else {
-            "auto"
-        };
+        let preferred = self.preferred_transport().unwrap_or("auto");
         let mut lists = Vec::new();
         for (label, status) in [
             ("ok", Ok),
@@ -364,6 +368,27 @@ mod tests {
             StartupTransferPreflight::default().hint(),
             "Transfer: startup preflight unknown; default auto."
         );
+    }
+
+    #[test]
+    fn preferred_transport_requires_a_positive_probe() {
+        use StartupProbeStatus::{Blocked, Ok, Unknown};
+
+        for (sftp, exec_raw, expected) in [
+            (Unknown, Unknown, None),
+            (Blocked, Unknown, None),
+            (Unknown, Ok, Some("exec-raw")),
+            (Blocked, Ok, Some("exec-raw")),
+            (Ok, Unknown, Some("sftp")),
+            (Ok, Ok, Some("sftp")),
+        ] {
+            let preflight = StartupTransferPreflight {
+                sftp,
+                exec_raw,
+                ..Default::default()
+            };
+            assert_eq!(preflight.preferred_transport(), expected);
+        }
     }
 
     #[test]

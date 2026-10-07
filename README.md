@@ -137,6 +137,10 @@ explicit `transport="exec-raw"`. Completed results survive another probe's timeo
 The external startup probe runs on Linux/macOS; elsewhere it stays unknown when
 eligible, without changing runtime transport support.
 
+The same frozen preference appears in the `transfer` tool's `description` returned
+by `tools/list`, so clients see it even when they omit server instructions. Detailed
+preflight statuses remain in `instructions`.
+
 This frozen, potentially stale advice is only a basic preflight: it does not
 guarantee path permissions, staging or directory/tar support. It does not change
 `auto`, the default or explicit transport behavior, tool-error narration, or add

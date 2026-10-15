@@ -543,7 +543,15 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     match tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                        // The process can disappear after procfs opens the file but
+                        // before it reads the stat data, yielding ESRCH, not ENOENT.
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                || error.raw_os_error()
+                                    == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+                        {
+                            return;
+                        }
                         Ok(stat) => {
                             // A container's PID 1 may leave killed orphans as zombies.
                             let state = stat.rsplit_once(") ").expect("proc stat state").1;

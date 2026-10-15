@@ -1,6 +1,6 @@
 # Goal: valid MCP discovery through the upstream rmcp fix
 
-Status: active
+Status: blocked
 Source: user-approved audited plan; copy the plan into a goal, implement iteratively, commit and push.
 Last updated: 2026-10-15
 
@@ -46,31 +46,42 @@ budget boundary; record the exact evidence and smallest unlock.
     `env.MCP_PROTOCOL_NEGOTIATION` key is removed; a fresh process without
     overrides can execute `hostname` through each server's MCP `shell`.
   - Primary evidence: artifact comparison and actual Claude discovery/tool results.
-  - Status: blocked
-  - Evidence: `/usr/bin/ssh-mcp` is root:root 0755; `sudo -n true` reports
-    `sudo: a password is required`. No NOPASSWD install permission exists.
-    Old binary preserved outside the repo; no deployment, client reconnect or
-    Claude settings change performed. Smallest unlock: user installs the verified
-    artifact atomically with root privileges, then the client smoke can continue.
+  - Status: verified
+  - Evidence: user performed the root installation; `cmp` confirms artifact
+    equality, root:root 0755 and release SHA-256. Claude 2.1.300 with temporary
+    v2/auto negotiated 2026-07-28 (protocolEra modern) on all three servers;
+    structured init events contain all six tools for each. A later read found
+    both global MCP env overrides absent without an agent settings edit. Fresh
+    Claude without temporary settings selected v2 by default and negotiated
+    2026-07-28 on all three; structured events confirm exactly one `hostname`
+    MCP shell call/result per target, no tool errors and no permission denials.
 - R4: Preserve OpenCode 2 compatibility and smoke an existing integration if present.
   - Source: user's explicit OpenCode 2 compatibility request and audited plan.
   - Acceptance: no OpenCode-specific code/config changes; one existing integration
     obtains its expected tools and executes MCP `shell` `hostname` after an
     address-specific child reconnect. Do not create an integration if none exists.
   - Primary evidence: protocol source review, plus one existing-integration smoke.
-  - Status: in_progress
+  - Status: blocked
   - Evidence: audit reviewed OpenCode 2.0.29 commit 4397ee44d038a5f17bf6ac161431673d93e563b5;
     legacy initialize and modern 0/private hints are compatible. Running service
-    version is confirmed by `/api/info` as 2.0.29. Existing SSH integrations are
-    connected in Location `/home/stfu/ai/trash-can/53`; their children execute the
-    old host `/usr/bin/ssh-mcp`. Runtime upgrade smoke awaits R3 installation and
-    confirmation that the selected integration can be reconnected without active work.
+    version is confirmed by `/api/info` as 2.0.29. User approved the idle
+    ssh-n-de2 reconnect in Location `/home/stfu/ai/trash-can/53`; it returned
+    connected, and its new child executable inode matches the installed artifact.
+    The subsequent read-only `opencode run --format json` smoke stopped before
+    tools with `provider.auth`, HTTP 403, `forbidden: access denied`. No tool
+    names/count or hostname result was fabricated. Smallest unlock: a working
+    provider for this existing OpenCode session's single MCP smoke. Provider
+    configuration is outside this fix and was not changed.
+    Failed smoke session: ses_ec1334024ffe9a05CuSmyYybkl; its structured error is
+    retained in the private diagnostic directory as `opencode-smoke.jsonl`.
 - R5: Commit and push the implementation and goal state.
   - Source: latest user instruction: implement iteratively, commit and push.
   - Acceptance: conventional commits with concrete bodies are published to origin/main.
   - Primary evidence: git commit and successful push/remote revision verification.
-  - Status: pending
-  - Evidence: starting revision 0f80647; clean main tracking origin/main.
+  - Status: verified
+  - Evidence: implementation commit 4bdb717b1de009cd0d0515a7ed8c368d2c9fda81
+    pushed to origin/main; `git ls-remote --heads origin main` returned the same
+    revision. Goal checkpoint updates are committed/pushed with delivery.
 
 ### Constraints
 - KISS/YAGNI/Pareto: five implementation files plus this explicitly requested goal.
@@ -135,22 +146,28 @@ budget boundary; record the exact evidence and smallest unlock.
    - Record actual evidence/blockers, commit and push the resulting work.
 
 ## Current Checkpoint
-- Closes: R3–R4; R5 remains independently deliverable.
-- Smallest next action: obtain the root installation of the verified artifact,
-  compare it, then run the already approved client smoke; commit/push the repo work.
-- Expected evidence: installed artifact equality and real client catalogs/tool calls.
-- Stop or replan if: root installation or a safe address-specific reconnect is
-  unavailable. Do not remove Claude's legacy override before actual modern success.
+- Closes: R4 only; R1–R3 and R5 are verified.
+- Smallest next action after external unlock: run the single existing OpenCode
+  ssh-n-de2 catalog/hostname smoke with a working provider.
+- Expected evidence: actual catalog and MCP shell result, not a model assertion.
+- Stop: the current provider rejects the request with HTTP 403 before tool use.
+  No approved source-code action can unblock it. Do not modify credentials,
+  routing or unrelated client configuration as part of this SDK fix.
 
 ## Current State
-- Resolved: R1–R2 implementation and all planned build/test gates.
+- Resolved: R1–R3 implementation, all planned gates, installation and real Claude
+  modern tools/hostname checks; R5 implementation commit/push.
 - Last relevant evidence: the five-file diff matches the plan; no unrelated lock
   changes; no additional runtime edits needed after the successful checks.
-- Blocker: root installation requires interactive user privileges. Global legacy
-  remains intact and no existing MCP child has been stopped.
+- Blocker: R4 model request is rejected by the OpenCode provider with HTTP 403.
+  Root installation is resolved. No broad client/service restart was performed.
 - Rollback artifact: `/home/stfu/.cache/opencode-tmp/opencode/ssh-mcp-rmcp-3.5.1.veQtwt/ssh-mcp.previous`;
   SHA-256: 45b815ebea167cb67afcefc15d1e0d83eb1bb5c4b5c58353dec688e8fc0442b2.
-- Next: user-assisted atomic installation, R3–R4 smoke, and R5 commit/push.
+- Diagnostics: private files in the rollback directory, including
+  `claude-modern.jsonl`, `claude-modern.debug.log`, `claude-final.jsonl`,
+  `claude-final.debug.log` and `opencode-smoke.jsonl`; none are committed.
+- Next: R4 after provider access is restored. No remaining source-code edit or
+  repeat build/test pass is required for the unchanged implementation.
 
 ## Material Decisions
 - 2026-10-15: preserve SDK-owned normalization; no application compatibility path.
@@ -161,7 +178,22 @@ budget boundary; record the exact evidence and smallest unlock.
 - 2026-10-15: R1–R2 verified in one fmt/Clippy/full-test/release pass. Reviewed
   the implementation diff once; exactly the approved changes. R3 installation
   is blocked on root privileges; preserved the previous artifact for rollback.
+- 2026-10-15: R5 implementation published as 4bdb717 to origin/main; matching
+  remote revision confirmed. Remaining rollout needs external root installation.
+- 2026-10-15: user installed the artifact and approved one idle OpenCode reconnect.
+  Artifact equality and real modern Claude catalogs verified; no global MCP env
+  overrides remain. OpenCode reconnect uses the new binary, but model auth 403
+  prevents the requested tool smoke; no provider changes attempted.
+- 2026-10-15: R3 verified in a fresh default-runtime Claude process: all three
+  negotiated modern 2026-07-28, exposed six tools each and returned MCP hostname
+  results without errors. Closure remains blocked only on R4's external provider.
 
 ## Completion
-- Final status: active; implementation is verified, runtime acceptance and delivery
-  remain open. Do not mark complete based on source review or transport health alone.
+- Resolved outcomes: R1, R2, R3 and implementation delivery R5.
+- Commands/artifacts: all four Approved Plan step 2 commands passed; installed
+  release matches its SHA-256; both Claude structured runs confirm modern catalogs,
+  and the default-runtime run confirms all three MCP hostname calls.
+- Constraint/diff check: only the five approved implementation files and this
+  goal changed; no list_tools/dispatch/schema/SSH changes, new tests, client config
+  edits, runtime protocol pins or provider workarounds were introduced.
+- Final status: blocked solely on R4's OpenCode provider auth; not complete.

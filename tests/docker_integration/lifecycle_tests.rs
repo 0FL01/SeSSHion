@@ -428,6 +428,8 @@ async fn modern_stdio_discovery_and_tool_results() {
     let response = process.response(2).await;
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["resultType"], "complete");
+    assert_eq!(response["result"]["ttlMs"], 0);
+    assert_eq!(response["result"]["cacheScope"], "private");
     assert_six_tool_budget(&response["result"]);
     let tools = response["result"]["tools"].as_array().expect("tools");
     assert_eq!(tools.len(), 6);
@@ -469,6 +471,9 @@ async fn default_tool_surface_is_exact_and_read_is_unknown() {
         .await;
     let response = process.response(2).await;
     assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].get("resultType").is_none());
+    assert!(response["result"].get("ttlMs").is_none());
+    assert!(response["result"].get("cacheScope").is_none());
     assert_six_tool_budget(&response["result"]);
     let tools = response["result"]["tools"]
         .as_array()

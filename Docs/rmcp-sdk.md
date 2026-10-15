@@ -1,6 +1,6 @@
-# rmcp - Official Rust MCP SDK (v3.2.0)
+# rmcp - Official Rust MCP SDK (v3.5.1)
 
-> Source: https://docs.rs/rmcp/3.2.0/rmcp/
+> Source: https://docs.rs/rmcp/3.5.1/rmcp/
 
 ## Overview
 
@@ -15,9 +15,13 @@ The manual `ServerHandler::call_tool` implementation returns `CallToolResponse`;
 internal handlers still return `CallToolResult`, converted at the dispatcher boundary.
 Tool failures remain completed results with `isError: true`, not JSON-RPC errors.
 
-`ProtocolVersion::LATEST` is MCP `2026-07-28`. The SDK handles discovery and
-per-request metadata for the modern lifecycle, as well as version negotiation
-for clients using `initialize`. There is no application compatibility layer.
+`get_info` returns `ServerConfig` and uses `ProtocolVersion::LATEST_WITH_INITIALIZE`
+(`2025-11-25`) as the fallback for clients using `initialize`.
+`ProtocolVersion::LATEST` is MCP `2026-07-28`; the SDK also supports its discovery
+and per-request metadata without an application compatibility layer.
+For modern cacheable results, including the manual `tools/list` handler, the SDK
+fills missing hints with `ttlMs: 0` and `cacheScope: "private"` before serialization.
+This does not enable application caching; legacy responses remain unchanged.
 The CLI gates authenticated SSH readiness before starting the stdio service, so
 cold failures also reject modern opening RPCs without `initialize`. Once ready,
 SSH recovery does not restart MCP or repeat initialization.

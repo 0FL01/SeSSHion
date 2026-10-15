@@ -781,9 +781,9 @@ fn build_instructions(
 
 impl ServerHandler for SshMcpServer {
     /// Return server information
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::LATEST)
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             .with_server_info(server_implementation())
             .with_instructions(self.startup_instructions.clone().unwrap_or_else(|| {
                 build_instructions(

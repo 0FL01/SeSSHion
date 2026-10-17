@@ -148,6 +148,7 @@ impl server::Handler for Peer {
 
 struct Fixture {
     port: u16,
+    identification: Arc<Mutex<String>>,
     transcript: Arc<Transcript>,
     listener: tokio::task::JoinHandle<()>,
 }
@@ -162,20 +163,25 @@ fn test_key() -> russh::keys::PrivateKey {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_identification("SSH-2.0-ROSSSH").await
+    }
+
+    async fn with_identification(identification: &str) -> Self {
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let transcript = Arc::new(Transcript::default());
         let state = transcript.clone();
-        let config = Arc::new(server::Config {
-            server_id: russh::SshId::Standard("SSH-2.0-ROSSSH".into()),
-            keys: vec![test_key()],
-            ..Default::default()
-        });
+        let identification = Arc::new(Mutex::new(identification.to_string()));
+        let server_id = identification.clone();
         let listener = tokio::spawn(async move {
             loop {
                 let (stream, _) = socket.accept().await.unwrap();
                 state.connections.fetch_add(1, Ordering::SeqCst);
-                let config = config.clone();
+                let config = Arc::new(server::Config {
+                    server_id: russh::SshId::Standard(server_id.lock().unwrap().clone().into()),
+                    keys: vec![test_key()],
+                    ..Default::default()
+                });
                 let peer = Peer(state.clone());
                 tokio::spawn(async move {
                     if let Ok(session) = server::run_stream(config, stream, peer).await {
@@ -186,6 +192,7 @@ impl Fixture {
         });
         Self {
             port,
+            identification,
             transcript,
             listener,
         }
@@ -403,18 +410,8 @@ fn text(response: &Value) -> String {
 async fn discovery_gating_and_raw_execution_match_for_legacy_and_modern_clients() {
     for modern in [false, true] {
         let fixture = Fixture::new().await;
-        // Exercise key auth, CLI-over-env selection, and env-only selection.
-        let mut mcp = if modern {
-            Mcp::spawn(fixture.port, true, &[], Some("routeros")).await
-        } else {
-            Mcp::spawn(
-                fixture.port,
-                false,
-                &["--remote-platform=routeros"],
-                Some("posix"),
-            )
-            .await
-        };
+        // Key-authenticated native startup needs no profile flag or environment.
+        let mut mcp = Mcp::spawn(fixture.port, modern, &[], None).await;
         let initial = if modern {
             mcp.rpc("tools/list", json!({})).await
         } else {
@@ -541,7 +538,7 @@ async fn discovery_gating_and_raw_execution_match_for_legacy_and_modern_clients(
 #[tokio::test]
 async fn timeout_and_reconnect_preserve_native_contract_without_jobs_or_replay() {
     let fixture = Fixture::new().await;
-    let mut mcp = Mcp::spawn(fixture.port, true, &["--remote-platform=routeros"], None).await;
+    let mut mcp = Mcp::spawn(fixture.port, true, &[], None).await;
     let before = mcp.rpc("server/discover", json!({})).await;
     let schema = mcp.rpc("tools/list", json!({})).await;
     fixture.assert_no_probes();
@@ -614,15 +611,17 @@ async fn timeout_and_reconnect_preserve_native_contract_without_jobs_or_replay()
 }
 
 #[tokio::test]
-async fn absent_profile_env_defaults_to_posix_and_cli_overrides_routeros_env() {
-    for profile_env in [None, Some("routeros")] {
-        let fixture = Fixture::new().await;
-        let args: &[&str] = if profile_env.is_some() {
-            &["--remote-platform=posix"]
-        } else {
-            &[]
-        };
-        let mut mcp = Mcp::spawn(fixture.port, true, args, profile_env).await;
+async fn non_routeros_identification_retains_posix_tools_without_profile_configuration() {
+    for (identification, args, profile_env) in [
+        ("SSH-2.0-OpenSSH_9.0", vec![], None),
+        (
+            "SSH-2.0-test ROSSSH in a comment",
+            vec!["--disable-sudo"],
+            Some("routeros"),
+        ),
+    ] {
+        let fixture = Fixture::with_identification(identification).await;
+        let mut mcp = Mcp::spawn(fixture.port, true, &args, profile_env).await;
         let result = mcp.rpc("tools/list", json!({})).await;
         assert!(result.get("error").is_none(), "{result}");
         let names = result["result"]["tools"]
@@ -631,17 +630,220 @@ async fn absent_profile_env_defaults_to_posix_and_cli_overrides_routeros_env() {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            [
+        let expected = if args.is_empty() {
+            vec![
                 "shell",
                 "sudo_shell",
                 "sudo_apply_patch",
                 "check_process",
                 "transfer",
-                "apply_patch"
+                "apply_patch",
             ]
-        );
+        } else {
+            vec!["shell", "check_process", "transfer", "apply_patch"]
+        };
+        assert_eq!(names, expected);
+        // POSIX retains its separate optional OpenSSH SFTP startup preflight.
         mcp.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn old_profile_environment_cannot_override_detected_routeros() {
+    let fixture = Fixture::new().await;
+    let mut mcp = Mcp::spawn(fixture.port, true, &[], Some("posix")).await;
+    let result = mcp.rpc("tools/list", json!({})).await;
+    let tools = result["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "shell");
+    assert!(
+        tools[0]["inputSchema"]["properties"]
+            .get("background")
+            .is_none()
+    );
+    fixture.assert_no_probes();
+    mcp.finish().await;
+}
+
+#[tokio::test]
+async fn changed_backend_is_rejected_without_changing_schema_or_sending_exec() {
+    let fixture = Fixture::new().await;
+    let mut mcp = Mcp::spawn(fixture.port, true, &[], None).await;
+    let before = mcp.rpc("server/discover", json!({})).await;
+    let schema = mcp.rpc("tools/list", json!({})).await;
+    *fixture.identification.lock().unwrap() = "SSH-2.0-OpenSSH_9.0".to_string();
+    let disconnected = mcp
+        .call("shell", json!({"command":":put \"disconnect\""}))
+        .await;
+    assert_eq!(disconnected["result"]["isError"], true);
+    let refused = mcp
+        .call(
+            "shell",
+            json!({"command":":put \"must not run\"", "timeout_ms":2000}),
+        )
+        .await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(text(&refused).contains("not started"));
+    assert_eq!(fixture.commands(), vec![b":put \"disconnect\"".to_vec()]);
+    assert_eq!(
+        mcp.rpc("server/discover", json!({})).await["result"],
+        before["result"]
+    );
+    assert_eq!(
+        mcp.rpc("tools/list", json!({})).await["result"],
+        schema["result"]
+    );
+    mcp.assert_empty_spool();
+    mcp.finish().await;
+}
+
+#[tokio::test]
+async fn detected_routeros_rejects_nonempty_elevation_before_mcp_serving() {
+    for args in [
+        vec!["--su-password= "],
+        vec!["--sudo-password=secret", "--disable-sudo"],
+    ] {
+        let fixture = Fixture::new().await;
+        let mut mcp = Mcp::spawn(fixture.port, false, &args, None).await;
+        let mut line = String::new();
+        assert_eq!(
+            timeout(Duration::from_secs(15), mcp.stdout.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let status = mcp.child.wait().await.unwrap();
+        let stderr = mcp.stderr.await.unwrap();
+        assert!(!status.success(), "MCP must reject RouterOS elevation");
+        assert!(stderr.contains("RouterOS"), "{stderr}");
+        fixture.assert_no_probes();
+    }
+}
+
+#[tokio::test]
+async fn lazy_library_server_resolves_platform_before_each_supported_opening_request() {
+    use clap::Parser;
+    use rmcp::{ServerHandler, ServiceExt};
+    use ssh_mcp::{
+        config::{Args, Config},
+        server::SshMcpServer,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    for method in ["initialize", "server/discover", "tools/list", "tools/call"] {
+        let fixture = Fixture::new().await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::from_args(
+            Args::try_parse_from([
+                "ssh-mcp".to_string(),
+                "--host=127.0.0.1".to_string(),
+                format!("--port={}", fixture.port),
+                "--user=test".to_string(),
+                "--password=test".to_string(),
+                "--strict-host-key-checking=no".to_string(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let server = SshMcpServer::new_with_spool_dir(config, Some(directory.path().join("spool")))
+            .await
+            .unwrap();
+        assert!(!server.connection().is_connected().await);
+        assert!(
+            server
+                .get_info()
+                .instructions
+                .unwrap()
+                .contains("not determined yet")
+        );
+        let (client, transport) = tokio::io::duplex(65536);
+        let cancellation = CancellationToken::new();
+        let served = server.clone();
+        let token = cancellation.clone();
+        let service = tokio::spawn(async move {
+            let running = served
+                .serve_with_ct(transport, token)
+                .await
+                .map_err(|error| error.to_string())?;
+            running.waiting().await.map_err(|error| error.to_string())
+        });
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+        let params = match method {
+            "initialize" => {
+                json!({"protocolVersion":"2024-11-05", "capabilities":{}, "clientInfo":{"name":"lazy-test","version":"1"}})
+            }
+            "tools/call" => {
+                json!({"_meta":meta(), "name":"shell", "arguments":{"command":":put \"lazy\""}})
+            }
+            _ => json!({"_meta":meta()}),
+        };
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut line = String::new();
+        timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        assert!(server.get_info().instructions.unwrap().contains("RouterOS"));
+        if method == "initialize" {
+            writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n").await.unwrap();
+        } else if method == "tools/list" {
+            assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 1);
+        } else if method == "tools/call" {
+            assert_ne!(response["result"]["isError"], true);
+            assert_eq!(fixture.commands(), vec![b":put \"lazy\"".to_vec()]);
+        }
+        if method != "tools/call" {
+            fixture.assert_no_probes();
+        }
+        // A response after notifications/initialized is the handshake barrier;
+        // do not cancel a still-pending legacy handshake during test teardown.
+        let params = if method == "initialize" {
+            json!({})
+        } else {
+            json!({"_meta":meta()})
+        };
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        line.clear();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            response["result"]["tools"].as_array().unwrap().len(),
+            1,
+            "{response}"
+        );
+        cancellation.cancel();
+        drop(writer);
+        drop(reader);
+        timeout(Duration::from_secs(5), service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.shutdown().await;
     }
 }

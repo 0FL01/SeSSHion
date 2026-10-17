@@ -52,7 +52,6 @@ async fn test_mcp_tools_with_docker() {
 
     // 2. Setup SshMcpServer configuration
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -536,7 +535,6 @@ mod unix_transfer_tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
         let config = Config {
-            remote_platform: ssh_mcp::config::RemotePlatform::Posix,
             host: host.to_string(),
             port,
             user: "test".to_string(),
@@ -696,7 +694,6 @@ async fn test_compact_response_has_paths() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

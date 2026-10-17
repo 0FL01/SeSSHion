@@ -99,7 +99,6 @@ async fn test_check_process_running() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -234,7 +233,6 @@ async fn test_check_process_completed() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -356,7 +354,6 @@ async fn test_check_process_not_exists() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -437,7 +434,6 @@ async fn test_check_process_log_tail() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -548,7 +544,6 @@ async fn test_check_process_full_workflow_timeout() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -752,7 +747,6 @@ async fn test_check_process_background_exec_workflow() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -875,7 +869,6 @@ async fn test_check_process_reports_missing_local_log() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -962,7 +955,6 @@ async fn test_check_process_recovers_persisted_state_in_new_server() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let config = Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

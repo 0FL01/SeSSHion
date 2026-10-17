@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 fn config(host: String, port: u16) -> Config {
     Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host,
         port,
         user: "test".into(),
@@ -523,6 +522,15 @@ async fn startup_environment_partial_timeout_flood_and_cancellation_preserve_ssh
     ct.cancel();
     let unprepared = unprepared.with_startup_environment(ct).await;
     assert!(!unprepared.connection().is_connected().await);
+    let pending = unprepared.get_info().instructions.unwrap();
+    assert!(pending.contains("platform is not determined yet"));
+    assert!(!pending.contains("POSIX"));
+    assert!(!pending.contains("RouterOS"));
+    assert!(!pending.contains("Transfer: "));
+    // An already-cancelled preparation cannot invent a backend. Once the
+    // normal lazy connection identifies POSIX, its unknown-preflight advice
+    // remains available without publishing cancelled probe results.
+    working_command(&unprepared).await;
     assert_eq!(
         transfer_hint(&unprepared),
         "Transfer: startup preflight unknown; choose transport explicitly."

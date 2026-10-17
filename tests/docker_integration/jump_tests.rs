@@ -39,7 +39,6 @@ async fn start_container() -> (testcontainers::ContainerAsync<GenericImage>, Str
 
 fn target_config(key_path: PathBuf, jump: JumpConfig) -> Config {
     Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: "127.0.0.1".to_string(),
         port: 2222,
         user: "test".to_string(),

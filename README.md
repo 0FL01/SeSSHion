@@ -9,6 +9,9 @@
 
 Its capability-bound toolset combines deterministic long-running jobs, bounded context, and atomic remote edits. Written in Rust, SeSSHion gives an AI agent secure, narrowly-scoped control of a remote Linux host over a single persistent SSH session through the [Model Context Protocol](https://modelcontextprotocol.io). It exposes four base tools plus two explicitly privileged sudo variants and is built to keep agent context small and operations deterministic.
 
+RouterOS is detected automatically on the same SSH connection and receives a
+native command-only toolset. No platform argument or environment setting is needed.
+
 ## Why
 
 - **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can run commands, patch files, transfer files, and inspect background jobs. Rootless host context arrives automatically in init instructions.
@@ -17,6 +20,8 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 - **Per-file atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo. Multi-file calls are not transactions.
 
 ## Tools
+
+The POSIX backend exposes the following tools; RouterOS exposes only native `shell`.
 
 | Tool | Purpose |
 |------|---------|
@@ -31,13 +36,27 @@ Full parameter schemas are served to the client at runtime; deeper references li
 
 ### RouterOS: native commands only
 
-The default `--remote-platform=posix` keeps the Linux/POSIX tools above unchanged.
-For MikroTik RouterOS, select the native profile explicitly (or set
-`SSH_MCP_REMOTE_PLATFORM=routeros`):
+Use the same connection arguments for Linux/POSIX and MikroTik RouterOS:
 
 ```sh
-ssh-mcp --host=192.168.88.1 --user=admin --key=~/.ssh/kin --remote-platform=routeros
+ssh-mcp --host=192.168.88.1 --user=admin --key=~/.ssh/kin
 ```
+
+Before authentication/tool publication, the SSH identification exchange selects
+compatibility: the **`ROSSSH` software token** selects RouterOS; other valid IDs
+retain the existing POSIX backend. This uses the actual transport, including the
+target stream through a jump, without a second connection or diagnostic command.
+Identification is compatibility evidence, not a replacement for host-key checks
+or proof that an arbitrary SSH server runs Linux. RouterOS with a hidden/changed
+software token is outside this detection scope; malformed or missing identification
+fails the connection rather than selecting a fallback.
+
+The backend is frozen only after host-key validation and authentication, before
+MCP discovery. Reconnect with a different backend fails without changing tools or
+replaying commands; reconnect the MCP process if the target system was replaced.
+The startup log records the selected backend. There is no CLI/env profile selector;
+remove older platform arguments from your MCP client's command and reconnect that
+MCP after replacing its binary. A running process does not load a replaced binary.
 
 RouterOS advertises only **`shell`**, with `command` and optional positive integer
 `timeout_ms`. For example:
@@ -53,7 +72,8 @@ RouterOS advertises only **`shell`**, with `command` and optional positive integ
 - `background` (even `false`), `log_path`, unknown fields and `timeout_ms:null`
   are invalid. `sudo_shell`, `sudo_apply_patch`, `check_process`, `transfer` and
   `apply_patch` are hidden and rejected on direct calls. Nonempty `su`/`sudo`
-  password settings are configuration errors, even with `--disable-sudo`.
+  password settings are configuration errors once RouterOS is identified, before
+  elevation or MCP serving, even with `--disable-sudo`.
 - Normal output uses the existing text tool response; nonzero/missing SSH status,
   request rejection, signal, interruption and timeout are errors. **SSH status 0
   does not verify the intended effect**: inspect output and verify relevant state.
@@ -77,8 +97,9 @@ RouterOS advertises only **`shell`**, with `command` and optional positive integ
   RouterOS 7.15.3 replies `SSH_MSG_UNIMPLEMENTED` to those requests. The recovery
   loop still restores closed routes, but **silent idle blackholes are detected by
   bounded channel opening for real operations**, not proactively. Target keepalive
-  timing settings do not apply in this profile; a configured jump host retains its
-  existing keepalives. POSIX health behavior and host-key policies are unchanged.
+  timing settings do not apply to RouterOS connections; a POSIX jump host retains
+  its configured keepalives independently of the target. POSIX health behavior
+  and host-key policies are unchanged.
 
 Compatibility is checked on RouterOS **7.15.3 stable, RB951Ui-2HnD (mipsbe)**;
 this is not a claim of coverage for every firmware version. Closing one native

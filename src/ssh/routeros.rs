@@ -693,6 +693,7 @@ mod tests {
             )
             .unwrap();
             let config = Arc::new(server::Config {
+                server_id: russh::SshId::Standard("SSH-2.0-ROSSSH".into()),
                 keys: vec![key],
                 ..Default::default()
             });
@@ -712,14 +713,9 @@ mod tests {
             let mut config = SshConfig::new("127.0.0.1", "test")
                 .with_port(port)
                 .with_password("test")
-                .with_max_output_tokens(max_tokens)
-                .with_su_password("must-not-be-used");
+                .with_max_output_tokens(max_tokens);
             config.host_key_checking = HostKeyCheckMode::No;
-            let manager = Arc::new(
-                SshConnectionManager::new(config)
-                    .await
-                    .with_target_openssh_keepalives(false),
-            );
+            let manager = Arc::new(SshConnectionManager::new(config).await);
             manager.ensure_connected_transport_only().await.unwrap();
             Self {
                 manager,

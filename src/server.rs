@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::background::job::NewRunningJob;
 use crate::background::transfer::{SharedTransferJob, TransferJobRegistry};
 use crate::background::{JobRegistry, JobState, LocalLogSpooler, SharedJobState};
-use crate::config::{Config, RemotePlatform};
+use crate::config::Config;
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
@@ -32,8 +32,8 @@ use crate::server::handlers::file_edit_common::{FileEditFaultInjection, FileEdit
 use crate::server::validation::validate_background_log_path;
 use crate::ssh::environment::{BOOTSTRAP_BUDGET, HostEnvironment};
 use crate::ssh::{
-    CommandOutput, SshConfig, SshConnectionManager, SshJumpConfig, sanitize_command,
-    wrap_sudo_command,
+    CommandOutput, RemotePlatform, SshConfig, SshConnectionManager, SshJumpConfig,
+    sanitize_command, wrap_sudo_command,
 };
 use crate::tools::ApplyPatchParams;
 use crate::transfer::startup::{StartupProbeStatus, StartupTransferPreflight, probe_sftp};
@@ -143,10 +143,6 @@ impl SshMcpServer {
 
     /// Create a new SeSSHion server with an optional local spool directory.
     pub async fn new_with_spool_dir(config: Config, spool_dir: Option<PathBuf>) -> Result<Self> {
-        config.remote_platform.validate_elevation(
-            config.su_password.as_deref(),
-            config.sudo_password.as_deref(),
-        )?;
         let local_root = std::env::current_dir()?;
 
         let spooler = Arc::new(resolve_local_spooler(spool_dir)?);
@@ -207,13 +203,13 @@ impl SshMcpServer {
 
         // Add elevation passwords if provided
         if let Some(ref su_password) = config.su_password
-            && config.remote_platform == RemotePlatform::Posix
+            && !su_password.is_empty()
         {
             ssh_config = ssh_config.with_su_password(su_password);
         }
 
         if let Some(ref sudo_password) = config.sudo_password
-            && config.remote_platform == RemotePlatform::Posix
+            && !sudo_password.is_empty()
         {
             ssh_config = ssh_config.with_sudo_password(sudo_password);
         }
@@ -238,11 +234,7 @@ impl SshMcpServer {
         ssh_config = ssh_config.with_max_output_tokens(config.max_output_tokens);
 
         // Create connection manager
-        let connection = Arc::new(
-            SshConnectionManager::new(ssh_config)
-                .await
-                .with_target_openssh_keepalives(config.remote_platform == RemotePlatform::Posix),
-        );
+        let connection = Arc::new(SshConnectionManager::new(ssh_config).await);
 
         let timeout = Duration::from_millis(config.timeout_ms);
         let max_chars = config.max_chars;
@@ -263,21 +255,55 @@ impl SshMcpServer {
         })
     }
 
+    /// Resolve the authenticated target before exposing a backend contract.
+    /// Once frozen, discovery stays available without requiring a healthy route.
+    async fn resolve_remote_platform(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<RemotePlatform, McpError> {
+        if let Some(platform) = self.connection.remote_platform() {
+            return Ok(platform);
+        }
+        let failure = |message: String| McpError::internal_error(message, None);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(failure("SSH platform detection cancelled".to_string())),
+            result = tokio::time::timeout(Duration::from_secs(10), self.connection.ensure_connected_transport_only()) => {
+                result.map_err(|_| failure("Initial SSH readiness timed out after 10000ms".to_string()))?
+                    .map_err(|error| failure(format!("SSH platform detection failed: {error}")))?;
+            }
+        }
+        self.connection
+            .remote_platform()
+            .ok_or_else(|| failure("Authenticated SSH platform unavailable".to_string()))
+    }
+
     /// Prepare one-off rootless metadata and transfer advice before MCP serving.
     /// All probes share a deadline; this hook does not mutate served clones.
     pub async fn with_startup_environment(mut self, cancellation: CancellationToken) -> Self {
         if self.startup_instructions.is_some() || cancellation.is_cancelled() {
             return self;
         }
-        if self.config.remote_platform == RemotePlatform::Routeros {
+        let deadline = tokio::time::Instant::now() + BOOTSTRAP_BUDGET;
+        let platform =
+            match tokio::time::timeout_at(deadline, self.resolve_remote_platform(&cancellation))
+                .await
+            {
+                Ok(Ok(platform)) => platform,
+                _ => {
+                    debug!("Startup platform unavailable; skipping platform-specific probes");
+                    return self;
+                }
+            };
+        if platform == RemotePlatform::Routeros {
             self.startup_instructions = Some(build_instructions(
                 &self.config,
+                Some(platform),
                 &HostEnvironment::default(),
                 &self.startup_transfer_preflight,
             ));
             return self;
         }
-        let deadline = tokio::time::Instant::now() + BOOTSTRAP_BUDGET;
         let options = self.transfer_ssh_options();
         let mut preflight = StartupTransferPreflight::for_options(&options);
         let (environment, raw, sftp) = tokio::join!(
@@ -307,8 +333,12 @@ impl SshMcpServer {
             }
         };
         if !cancellation.is_cancelled() {
-            self.startup_instructions =
-                Some(build_instructions(&self.config, &snapshot, &preflight));
+            self.startup_instructions = Some(build_instructions(
+                &self.config,
+                Some(platform),
+                &snapshot,
+                &preflight,
+            ));
             self.startup_transfer_preflight = preflight;
         }
         self
@@ -783,10 +813,20 @@ fn server_implementation() -> Implementation {
 
 fn build_instructions(
     config: &Config,
+    platform: Option<RemotePlatform>,
     environment: &HostEnvironment,
     preflight: &StartupTransferPreflight,
 ) -> String {
-    if config.remote_platform == RemotePlatform::Routeros {
+    if platform.is_none() {
+        return format!(
+            "SeSSHion v{} - SSH MCP server for {}@{}:{}\nRemote command platform is not determined yet; it is detected automatically from the authenticated SSH connection before tools are published. If a call fails, briefly explain it; do not leave the tool result as the only notice. Never automatically retry uncertain execution.",
+            env!("CARGO_PKG_VERSION"),
+            config.user,
+            config.host,
+            config.port,
+        );
+    }
+    if platform == Some(RemotePlatform::Routeros) {
         return format!(
             "SeSSHion v{} - RouterOS SSH MCP server for {}@{}:{}\nUse shell for native single-line RouterOS CLI, not POSIX sh. This profile and its tool schema are frozen for this process. No background jobs, sudo, process polling, transfer, or patch tools are supported. SSH exit status 0 is not verification of the intended configuration effect; inspect output and verify relevant state. If a call fails, briefly explain it in user-facing text; do not leave the tool result as the only notice. Never automatically retry an uncertain command. Timeout/cancellation closes only the channel best-effort: remote execution may continue and changes are not rolled back. Target OpenSSH keepalives and active health pings are disabled; closed routes recover, but silent idle failures are detected by bounded channel opening during real operations. No POSIX startup probes run.",
             env!("CARGO_PKG_VERSION"),
@@ -817,21 +857,43 @@ impl ServerHandler for SshMcpServer {
             .with_instructions(self.startup_instructions.clone().unwrap_or_else(|| {
                 build_instructions(
                     &self.config,
+                    self.connection.remote_platform(),
                     &HostEnvironment::default(),
                     &self.startup_transfer_preflight,
                 )
             }))
     }
 
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<InitializeResult, McpError> {
+        self.resolve_remote_platform(&context.ct).await?;
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
+    async fn discover(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<DiscoverResult, McpError> {
+        self.resolve_remote_platform(&context.ct).await?;
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
     /// List available tools
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         debug!("list_tools called");
 
-        if self.config.remote_platform == RemotePlatform::Routeros {
+        if self.resolve_remote_platform(&context.ct).await? == RemotePlatform::Routeros {
             return Ok(ListToolsResult {
                 tools: vec![tools::routeros_shell_tool()],
                 ..Default::default()
@@ -866,7 +928,7 @@ impl ServerHandler for SshMcpServer {
 
         let args = request.arguments.unwrap_or_default();
 
-        if self.config.remote_platform == RemotePlatform::Routeros {
+        if self.resolve_remote_platform(&context.ct).await? == RemotePlatform::Routeros {
             match tool_name {
                 "shell" => {
                     return self
@@ -1010,7 +1072,6 @@ mod tests {
         let spool = tempfile::tempdir().expect("temp spool parent");
         let server = SshMcpServer::new_with_spool_dir(
             Config {
-                remote_platform: RemotePlatform::Posix,
                 host: "example.test".to_string(),
                 port: 22,
                 user: "tester".to_string(),
@@ -1036,7 +1097,16 @@ mod tests {
         .await
         .expect("server construction");
 
-        let instructions = server.get_info().instructions.expect("server instructions");
+        let pending = server.get_info().instructions.expect("server instructions");
+        assert!(pending.contains("not determined yet"));
+        assert!(!pending.contains("POSIX"));
+        assert!(!pending.contains("RouterOS"));
+        let instructions = build_instructions(
+            &server.config,
+            Some(RemotePlatform::Posix),
+            &HostEnvironment::default(),
+            &StartupTransferPreflight::default(),
+        );
         assert!(instructions.contains("SSH MCP server for tester@example.test:22"));
         assert!(instructions.contains("do not separately narrate successful intermediate calls"));
         assert!(instructions.contains("do not leave the tool result as the only notice"));
@@ -1058,7 +1128,7 @@ mod tests {
         }
         assert_eq!(
             server.get_info().instructions.as_deref(),
-            Some(instructions.as_str())
+            Some(pending.as_str())
         );
         assert_eq!(
             server.transfer_tool().description.as_deref(),
@@ -1072,57 +1142,30 @@ mod tests {
         server.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn routeros_constructor_checks_elevation_before_side_effects_and_freezes_fallback() {
+    #[test]
+    fn routeros_instructions_describe_detected_contract_without_posix_advice() {
         use clap::Parser;
 
-        let directory = tempfile::tempdir().unwrap();
-        let spool = directory.path().join("spool");
-        let mut config = Config::from_args(
+        let config = Config::from_args(
             crate::config::Args::try_parse_from([
                 "ssh-mcp",
                 "--host=example.test",
                 "--user=test",
                 "--password=secret",
-                "--remote-platform=routeros",
             ])
             .unwrap(),
         )
         .unwrap();
-        config.su_password = Some(" ".to_string());
-        config.key = Some(directory.path().join("missing-key"));
-        let error = SshMcpServer::new_with_spool_dir(config.clone(), Some(spool.clone()))
-            .await
-            .err()
-            .expect("elevation rejected");
-        assert!(error.to_string().contains("RouterOS"));
-        assert!(
-            !spool.exists(),
-            "invalid elevation must precede spool/key work"
+        let instructions = build_instructions(
+            &config,
+            Some(RemotePlatform::Routeros),
+            &HostEnvironment::default(),
+            &StartupTransferPreflight::default(),
         );
-
-        config.key = None;
-        config.su_password = Some(String::new());
-        config.sudo_password = Some(String::new());
-        let server = SshMcpServer::new_with_spool_dir(config, Some(spool))
-            .await
-            .unwrap();
-        let fallback = server.get_info().instructions.unwrap();
-        assert!(fallback.contains("RouterOS"));
-        assert!(!fallback.contains("Remote environment snapshot"));
-        assert!(!fallback.contains("timeout handoff"));
-        let server = server
-            .with_startup_environment(CancellationToken::new())
-            .await;
-        assert_eq!(
-            server.get_info().instructions.as_deref(),
-            Some(fallback.as_str())
-        );
-        assert!(
-            !server.connection.is_connected().await,
-            "native startup hook must not connect or probe"
-        );
-        server.shutdown().await;
+        assert!(instructions.contains("RouterOS"));
+        assert!(!instructions.contains("Remote environment snapshot"));
+        assert!(!instructions.contains("timeout handoff"));
+        assert!(!instructions.contains("Transfer:"));
     }
 
     #[test]

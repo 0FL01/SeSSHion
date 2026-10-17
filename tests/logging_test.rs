@@ -12,13 +12,7 @@ use ssh_mcp::config::Args;
 #[test]
 fn test_logging_config_defaults() {
     // Test that args can be parsed with default logging settings
-    let args = Args::try_parse_from([
-        "ssh-mcp",
-        "--host=test",
-        "--user=test",
-        "--remote-platform=posix",
-    ])
-    .unwrap();
+    let args = Args::try_parse_from(["ssh-mcp", "--host=test", "--user=test"]).unwrap();
 
     // Verify default logging config values
     assert_eq!(args.log_level, "info");
@@ -34,7 +28,6 @@ fn test_logging_config_with_file() {
 
     let args = Args::try_parse_from([
         "ssh-mcp",
-        "--remote-platform=posix",
         "--host=test",
         "--user=test",
         "--log-file",
@@ -62,7 +55,6 @@ async fn test_logging_file_integration() {
 
     let args = Args::try_parse_from([
         "ssh-mcp",
-        "--remote-platform=posix",
         "--host=test",
         "--user=test",
         "--log-file",

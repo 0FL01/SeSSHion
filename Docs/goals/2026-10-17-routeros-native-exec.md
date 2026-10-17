@@ -1,12 +1,12 @@
-# Goal: native RouterOS commands and successful delivery
+# Goal: automatic RouterOS detection and verified delivery
 
 Status: active
-Source: user-approved RouterOS audit/plan and request to implement, commit, push, build, and finish only after GitHub Actions succeeds.
+Source: approved automatic-detection plan; user: «никаких ... --remote-platform=routeros ... автоматически понимать с чем работаем», then «делай копию плана в цель и итеративно реализовать и коммит пуш билд ... задача закрыта когда github action после пуша кооректно завершился»; KISS/YAGNI/Pareto.
 Last updated: 2026-10-17
 
 ## Objective
 
-Ship an explicit, command-only RouterOS profile without changing the default POSIX contract. Verify it locally and on the authorized router, push the implementation, and observe successful GitHub Actions for the pushed commit.
+The same SSH connection configuration (host, port, user, credentials) automatically selects the existing RouterOS or POSIX backend before publishing MCP tools. Deliver the verified implementation with successful GitHub Actions for the pushed SHA.
 
 ## Execution Directive
 
@@ -16,107 +16,96 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 
 ### Required Outcomes
 
-- R1: Explicit profile, coherent MCP discovery, validation, and startup.
-  - Source: corrected plan steps 1–3.
-  - Acceptance: `--remote-platform posix|routeros` / `SSH_MCP_REMOTE_PLATFORM`, default POSIX; RouterOS exposes only native `shell(command, timeout_ms?)`; unsupported arguments/tools rejected before jobs/logs; no optional POSIX/raw/SFTP probes; profile-aware frozen instructions and fallback; incompatible nonempty elevation rejected at CLI and constructor boundaries.
-  - Primary evidence: config/schema/parser tests and real MCP subprocess tests against a fake SSH peer.
+- R1: Select compatibility automatically on the actual SSH transport.
+  - Source: approved plan, identification helper and SSH integration sections.
+  - Acceptance: exchange the configured client identification exactly once, read and replay bounded server identification/preamble/KEX bytes on the same stream, match the actual software token ROSSSH, choose keepalive policy before russh connect_stream. No second connection or diagnostic EXEC. Freeze target backend only after host-key validation/authentication. Reconnect rejects backend changes without publishing another contract; jump and target are classified independently.
+  - Primary evidence: identification adapter tests, connection tests and real MCP fake-peer transcript.
   - Status: verified
-  - Evidence: 2026-10-17 config/schema/parser/constructor unit tests and `cargo test --all-features --test routeros_test -- --nocapture`: 3 passed, including key-authenticated legacy/modern startup, strict runtime/schema gating, no probes/jobs and isolated env/CLI precedence.
-- R2: Native, bounded, non-replaying execution with truthful failures and owned cleanup.
-  - Source: corrected plan steps 4–5 and pending-OPEN correction.
-  - Acceptance: raw one-line EXEC, no PTY/POSIX wrappers/jobs; deadline starts before slot; bounded byte-prefix output, partial output retained; close/status/event handling; timeout/cancellation never replay EXEC; late OPEN closes without EXEC; exhausted OPEN budget retires only its captured generation; normal cancellation preserves sibling channels; existing text result model with uncertainty/truncation diagnostics.
-  - Primary evidence: deterministic fake-peer execution tests and read-only MCP smoke.
+  - Evidence: 9 identification adapter tests and 22 connection tests passed; parent reviewed bounded replay/duplicate-write suppression and authenticated publication. Direct/jump classification, authentication/host-key refusal without freezing, reconnect mismatch/cleanup and zero diagnostic EXEC are covered. Actual flagless MCP selected RouterOS and executed the reported command.
+- R2: Remove manual profile configuration and publish a coherent automatically selected MCP surface.
+  - Source: approved plan, config and MCP sections.
+  - Acceptance: remove CLI/env/Config remote_platform; RouterOS exposes only native shell, POSIX retains its tool surface; startup probes only after backend selection, no POSIX/raw/SFTP probes on RouterOS. Lazy construction stays lazy; initialize/discover/list/call entry points share bounded first resolution, and offline get_info never invents POSIX. Incompatible nonempty RouterOS su/sudo configuration fails before elevation/tool publication; exact-empty normalization retained.
+  - Primary evidence: config/server unit tests and legacy/modern real MCP subprocess tests without profile flags/env.
   - Status: verified
-  - Evidence: 2026-10-17 reviewed native owner/event-loop implementation; 15 native executor tests and 3 actual MCP subprocess tests passed. Release binary on the authorized RouterOS returned normal/nonzero output, preserved partial output on a 1-second timeout, served a parallel command and follow-up without jobs, and completed a 7-second command across recovery ticks.
-- R3: RouterOS-compatible target health policy without POSIX/jump regression.
-  - Source: audit's confirmed `SSH_MSG_UNIMPLEMENTED` incompatibility and corrected plan step 3.
-  - Acceptance: RouterOS target sends neither active OpenSSH health pings nor automatic OpenSSH keepalives; closed routes still recover and real channel opens are bounded; POSIX defaults and jump-host keepalives remain unchanged; passive idle-health limitation documented.
-  - Primary evidence: policy/route tests, fake-peer transcript, live MCP idle/long-command smoke.
+  - Evidence: `cargo test --all-features --test routeros_test -- --nocapture`: 7 passed (legacy and modern flagless discovery/raw execution, old env ignored, POSIX six/four tools, changed backend no EXEC, RouterOS elevation rejected, all four lazy-library opening requests). Server/config focused unit selections also passed. CLI and Config selector removed, existing literals mechanically updated.
+- R3: Preserve affected execution, health, security and concurrency contracts.
+  - Source: approved plan, invariants and reconnect sections.
+  - Acceptance: reuse existing native/POSIX executors; preserve no replay, owned OPEN/channel cleanup, output/deadline limits and truthful partial failures. RouterOS target automatic keepalive/active ping disabled; POSIX and POSIX jump settings unchanged. Readiness remains 10 seconds and optional POSIX startup probes 3 seconds; warm discovery/schema stays available/frozen. Host-key/auth policy and explicit-only transfer transport unchanged.
+  - Primary evidence: focused tests and existing library/Docker gates.
   - Status: verified
-  - Evidence: 2026-10-17 connection policy/passive route/jump closure tests passed. Release binary on RouterOS with explicit JSON application logging produced 678 records, exactly one successful SSH connection and zero route invalidations while serving capped output, a 7-second command and a command after 35 seconds idle. Target keepalives/pings disabled, jump/default POSIX configuration retained by tests; passive idle limitation documented.
-- R4: Documented, tested, locally built implementation preserving affected contracts.
-  - Source: corrected plan steps 6–7; user asks for build.
-  - Acceptance: README documents RouterOS usage/limits; focused tests, formatting, clippy, cargo check, full suite including existing Docker regressions, and release build succeed; authorized real device works through the new MCP binary.
-  - Primary evidence: command results and read-only live observations.
+  - Evidence: full `cargo test --all-features --verbose` passed: 396 tests, including 273 library, 88 Docker, 7 real MCP/lazy-library cases; 4 pre-existing ignored. Existing native ownership tests retained. Actual MCP completed parallel/long commands, retained partial timeout output and remained usable after 35 seconds idle. No runtime production changes to the native executor, no Cargo/lock/workflow changes.
+- R4: Document, build and verify the actual connected MCP with no profile argument.
+  - Source: approved plan, tests and real activation sections.
+  - Acceptance: README explains auto-selection/limits; fmt, clippy, check, full tests and local release build succeed. Actual connected ssh-mikrotik-router uses the new binary without platform flags and executes the reported read-only command, expected error, timeout/parallel follow-up and >30-second idle. No direct SSH from local shell for follow-up device validation.
+  - Primary evidence: command results, model-visible MCP tool calls, effective client configuration/process args.
   - Status: verified
-  - Evidence: 2026-10-17 `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all-features --verbose`, `cargo test --all-features --verbose` (375 passed, 4 pre-existing ignored; 88 Docker tests), `cargo build --release` all passed. README documents native usage/limits. New release binary authenticated with strict host-key checking and passed read-only live version/error/literal/block/timeout/parallel/long-command/35-second-idle checks on RouterOS 7.15.3; post-idle call completed in 9 ms. No router configuration changes.
-- R5: Commit, push, and successful GitHub Actions for the delivered SHA.
-  - Source: user: «итеративно реализовать и коммит пуш билд … задача закрыта когда github action после пуша кооректно завершился».
-  - Acceptance: changes committed with repository commit style and pushed to origin; `CI and Release` completes successfully for the exact delivered head SHA, including main-branch build/release jobs.
-  - Primary evidence: git SHA/remote and GitHub Actions run URL, head SHA, conclusion and jobs.
+  - Evidence: fmt, all-target/all-feature clippy with -D warnings, cargo check, full tests and cargo build --release passed. Supported location-scoped OpenCode API activated the known workspace release binary with unchanged host/port/user/key arguments and no profile selector; process arguments confirmed. Model-visible MCP returned SSH_MCP_AUTODETECT_OK plus /system resource print, expected exit 1, partial timeout, parallel success, long-command start/end and SSH_MCP_AFTER_IDLE_OK after 35 seconds idle on RouterOS 7.15.3. README updated. No direct SSH or router writes in follow-up; user project config unchanged.
+- R5: Commit, push, build, and observe successful exact-SHA GitHub Actions.
+  - Source: latest explicit user finish line.
+  - Acceptance: conventional commits with body; ordinary push to origin/main; CI and Release for the delivered head SHA completes successfully including platform build/release jobs. Stop only after this evidence and closure check.
+  - Primary evidence: git head/remote and exact-SHA GitHub Actions URL/conclusion/jobs.
   - Status: in_progress
-  - Evidence: local implementation and acceptance complete; commit/push and exact-SHA workflow observation next.
+  - Evidence: prior manual-profile implementation 88397dbf04f643263dadfe7fc0536d69e7ede5f4 passed CI run https://github.com/0FL01/SeSSHion/actions/runs/39025593602; that does not verify this automatic-detection revision.
 
 ### Constraints
 
-- Keep POSIX parser leniency, tool names/order/schemas, sudo flag behavior, error model, host-key/authentication policy, reconnect generations and transfer guarantees unchanged.
-- Transfers still require explicit transport; no fallback or automatic selection.
-- Reject RouterOS empty commands, NUL, internal CR/LF; never flatten multiline commands or infer errors from output keywords.
-- SSH status zero does not verify the intended configuration effect. Closing a channel does not guarantee remote termination/rollback.
-- Deadline covers all request waits; up to 100 ms best-effort close applies to an owned channel, not all pending-OPEN cleanup. An unresolved OPEN exhausting the existing acquisition budget may retire its generation and interrupt siblings.
-- Preserve configured output-limit semantics, including explicitly unlimited settings; decode bounded bytes safely and drain after truncation.
-- Keep common startup logging/spool initialization; no per-command RouterOS jobs/logs. Normalize exactly empty elevation passwords, never trim real passwords.
-- Device access is read-only: no router configuration changes, upgrades, files, or disruptive commands.
-- No blanket `--include-ignored`: existing ignored placeholders are not runnable acceptance tests.
+- KISS/YAGNI/Pareto: one small identification helper/adapter, existing SSH manager and executors; no platform registry, generic framework, extra connection, diagnostic EXEC, new dependency, fork, image or CI job.
+- Match ROSSSH as the software token, not a substring in comments; other valid IDs retain the legacy POSIX compatibility backend, not a claim that their OS is Linux. Malformed/absent/timed-out identification fails connection, never a POSIX fallback. Preserve russh's accepted 2.0/1.99, LF/CRLF and bounded preamble behavior.
+- Identification is compatibility evidence, not trust. Preserve host-key verification/authentication. Pending classification must not be published as an authenticated route or trigger elevation.
+- Keep POSIX parser leniency, names/order/schemas, disable-sudo behavior, error model and explicit transfer transport/no fallback guarantees.
+- Keep native one-line validation, output limits/UTF-8, truthful status/errors, no replay/jobs/PIDs/POSIX wrappers, cancellation/late OPEN ownership and captured-generation-only retirement.
+- SSH zero does not prove configuration success; timeout/close does not guarantee remote termination or rollback.
+- Preserve common logging/spool initialization. Device operations read-only; no router config changes, files, upgrades or disruptive commands.
+- No blanket include-ignored gate; existing placeholders remain ignored. Preserve user's uncommitted opencode.jsonc entry (already has no platform flag).
 
 ### Non-goals
 
-- Auto-detection, capability registry, REST/API, PTY/interactive/Safe Mode, background jobs, RouterOS transfer/patch support.
-- New public result envelope, crypto downgrades, dependency upgrades/forks, new dependencies/images/CI jobs, shared test framework, broad fixture cleanup, automatic encoding conversion.
-- Proactive idle-blackhole detection for RouterOS or removal of common spool initialization.
+- Universal OS/CLI detection (Windows/Cisco/JunOS/etc), hidden-banner RouterOS detection, native hardware inventory, background/file/patch/REST support, encoding conversion, broad test-fixture cleanup.
+- Proactive RouterOS idle-blackhole detection, changing crypto/auth or the native executor's production behavior.
 
 ## Change Envelope
 
-- Target: application config, profile-aware server dispatch/instructions/schema/parser, one native executor and local failure formatter, narrow target health policy, direct tests and README.
-- Expected paths: `src/config.rs`, `src/server.rs`, `src/server/{args,tools}.rs`, `src/server/handlers/{mod,routeros}.rs`, `src/ssh/{mod,connection,routeros}.rs`, `tests/routeros_test.rs`, existing Config/Args test literals, README, this goal.
-- If SSH config must carry internal policy, preserve existing public construction/default behavior; no public remote-platform enum throughout transport.
-- Tests: one small fake peer/MCP harness, existing unit and Docker suites; mechanical POSIX additions to existing literals, no fixture redesign.
-- No Cargo/lockfile/workflow edits expected; expand only for a concrete blocker to R1–R5 or a regression introduced by this diff.
-- Delivery: current clean `main`, origin `0FL01/SeSSHion`; ordinary fast-forward commits/push, no force push.
+- src/ssh/identification.rs (new adapter/classifier/tests), src/ssh/{mod,connection}.rs and necessary existing inline native fixture adjustments.
+- src/config.rs, src/server.rs and minimal src/main.rs wiring; directly affected config literals, CLI tests and tests/routeros_test.rs; README; this goal.
+- Runtime: update/reconnect only the existing authorized ssh-mikrotik-router MCP via supported OpenCode APIs; preserve other configuration and do not restart the whole service.
+- Install verified release binary at the actual configured executable if permitted; otherwise point only this MCP at the verified workspace binary. No sudo/package-wide changes required.
+- No Cargo/lock/workflow edits expected. Main baseline 88397db; ordinary fast-forward commits/push only.
 
-## Copied Implementation Plan
+## Copied Approved Plan
 
-1. Add explicit POSIX(default)/RouterOS config; validate elevation before constructor side effects, preserve exact-empty normalization.
-2. RouterOS advertises only `shell` with command and positive optional timeout; strict unknown fields (including background false/log_path); schema/parser agree on null; reject hidden tools before work; preserve unknown-name errors and the full POSIX surface.
-3. Preserve initial transport readiness/recovery cadence, skip optional probes, freeze native instructions including fallback. Disable target OpenSSH ping/keepalive for RouterOS only; retain jump keepalives and document passive health.
-4. Native slot → connection → channel → raw EXEC → collection → close. One line only. One owner handles channel/open lifecycle, deadline, cancellation, bounded bytes, late OPEN cleanup and generation-scoped unresolved-OPEN recovery. No command replay or POSIX/background machinery. One event loop records status/output, closes on Close without requiring EOF, handles signals/incomplete reads as errors.
-5. Reuse CommandOutput/text results; small local failure holds partial output/cause/EXEC-queued state. Failures stay errors even after status zero; report not-started versus may-have-run, no automatic retry, no guaranteed remote termination, and neutral truncation notices.
-6. Test config and environment isolation, discovery/strict parsing/hidden tools, frozen reconnect behavior; exact raw payload and no probes/PTY/subsystem; event/error orders, limits/UTF-8/partial output, deadline/cancel/late OPEN/no replay/siblings; target-versus-jump health policy. Reuse patterns, not a new test framework.
-7. README usage/limitations; new MCP binary read-only smoke (success/error/timeout/parallel/idle >30 seconds/long command across recovery ticks); existing CI gates and local release build; commit/push, observe exact-SHA GitHub Actions success.
-
-## Primary Device Evidence (pre-implementation)
-
-- Authorized RouterOS 7.15.3 stable, RB951Ui-2HnD, mipsbe; OpenSSH and Paramiko key-file authentication work without agent or crypto downgrade.
-- Native single-line commands/blocks work; ordinary errors return status 1 on stdout. Simple LF-separated commands work but a multiline brace block printed `missing closing brace` with status 0: keep one-line scope.
-- Observed Success → Data → ExitStatus → Close, no EOF. Sequential/parallel channels work, closing a delayed command's channel leaves the shared route usable.
-- Both idle and running-command `keepalive@openssh.com` requests receive SSH_MSG_UNIMPLEMENTED while the route remains usable. russh 0.61.2 ignores that reply; active pings hang and automatic response entries can accumulate.
-- Literal non-ASCII text in a direct `:put` was filtered by this firmware; do not promise remote Unicode semantics or add automatic conversion. Locally preserve valid UTF-8 output safely.
-- No router configuration was modified. This is not yet proof of the new russh/MCP execution path.
+1. Read server identification on the same stream, sending client ID once. Replay all consumed bytes to russh and consume its duplicate initial ID write; delegate all later I/O. Bound lines/preamble and all waits inside connection deadlines; do not break servers waiting for the client ID.
+2. Match software token ROSSSH, choose per-connection keepalive configuration before connect_stream, then authenticate and freeze target backend. Do not use jump identity as target identity. Reject a different backend on reconnect; never replay commands or change MCP schema in place.
+3. Remove Args/Config remote_platform and SSH_MCP_REMOTE_PLATFORM selection; backend enum becomes an internal detection result. Validate incompatible RouterOS elevation after identification/auth, before publishing tools/elevation; exact-empty semantics unchanged.
+4. Replace config branches with detected backend. Keep 10-second readiness then 3-second optional POSIX metadata/preflight; skip those probes for RouterOS. Lazy constructors plus one bounded async resolution guard for initialize/discover/list/call; synchronous get_info before resolution is neutral. Warm discovery uses the frozen result without requiring a new connection.
+5. Update existing fake peer/MCP tests: no flags/env, one connection and zero startup EXEC for RouterOS, native raw command, correct POSIX six/four tools, comment false-positive exclusion, direct/jump, event/timeout/output/no-replay regressions, reconnect stability/mismatch. Test adapter fragmentation, preamble, LF/CRLF, server-waits-client, readahead and duplicate-write suppression.
+6. README ordinary no-profile usage, observed backend log and identification limits. Build, activate actual MCP, test read-only success/error/timeout/parallel/idle via the tool. Run existing gates, commit/push, and observe full exact-SHA CI success.
 
 ## Current Checkpoint
 
 - Closes: R5.
-- Smallest next action: commit/push the verified implementation and wait for exact-SHA GitHub Actions.
-- Expected evidence: pushed commit's CI and Release workflow completes successfully, including platform build/release jobs.
-- Stop or replan if: a concrete required outcome cannot be achieved inside the envelope; record evidence and smallest expansion first.
+- Smallest next action: commit/push the verified revision, then observe the full exact-SHA CI and Release workflow.
+- Expected evidence: pushed SHA matches the successful workflow, including platform build/release jobs.
+- Stop or replan if: a concrete required outcome crosses the envelope; record minimal expansion before editing.
 
 ## Current State
 
-- Resolved: R1–R4 verified; baseline `a2d233326a65927b1ed4b16e6e85b5dcc0798bad`.
-- Last relevant evidence: all local CI gates, full Docker suite and release build passed; read-only real-device MCP smoke passed. Explicit JSON application logging confirmed one connection, zero invalidations (678 records) across long command and idle. Stderr remains text by existing logger design; only actual JSON file records were used for this count.
-- Blocker: none.
+- Resolved: R1–R4 verified; only current revision's commit/push and exact-SHA CI delivery remain.
+- Last relevant evidence: all local gates and release build passed, 396 tests passed with 4 pre-existing ignored. Actual connected MCP ran the reported command and all read-only acceptance cases without profile flags. Known workspace release binary selected via runtime-only supported MCP replacement; user's opencode.jsonc changes preserved and not included in delivery.
+- Blocker: none. Docker and local SSH transfer clients available.
 - Next: exact-SHA R5 delivery.
 
 ## Material Decisions
 
-- 2026-10-17: Apply the corrected audited plan, with one-line scope and existing text response. User now explicitly authorizes implementation and commit/push/build; CI success is mandatory.
+- 2026-10-17: Latest user request supersedes the old explicit-profile R1 and manual-flag client fix R6. Update the nearest goal instead of creating a duplicate. Remove the selector, not move it into an environment variable.
+- 2026-10-17: Approved auto-selection is intentionally two-backend compatibility detection; no claims of universal OS identification. Keep the established native executor unchanged.
 
 ## Checkpoint History
 
-- 2026-10-17: Freeze contract and copy plan before code changes; no new dependencies or CI changes planned.
-- 2026-10-17: R1 verified through strict config/parser/schema and actual stdio MCP fake-peer tests; integrated library tests, clippy and cargo check green. Continue full-suite/build and real-device verification without expanding scope.
-- 2026-10-17: R2/R4 verified: reviewed single-owner cleanup and typed OPEN timeout behavior; all local gates (375 passing tests) and release build succeeded; actual release binary passed read-only RouterOS acceptance including timeout/parallel, long command and 35-second idle. Complete concrete R3 log evidence, then commit/push and observe CI.
-- 2026-10-17: R3 verified with nonempty structured application logs: 678 records, one connection, no invalidations across long native command/35-second idle; real device also confirmed output capping. Only delivery/CI remains.
+- 2026-10-17: 88397db delivered native RouterOS execution; local gates/live read-only acceptance and CI run 39025593602 succeeded. Actual client missing manual profile reproduced marker failure.
+- 2026-10-17: User rejected manual profile requirement, approved automatic-detection plan and authorized implementation/commit/push/build. Freeze this replacement contract before code edits.
+- 2026-10-17: R2 focused evidence passed: 7 actual MCP/lazy-library tests and server/config unit selections. Initial fixture failures were a missing String→Cow conversion, an incorrect no-SFTP-connection assumption for POSIX, and teardown before the legacy handshake barrier; corrected fixtures without weakening runtime behavior.
+- 2026-10-17: R1 transport slice verified and reviewed. Full Docker run exposed one superseded assertion: an already-cancelled lazy server cannot publish a POSIX transfer hint before any target is identified. That case now asserts neutral pending instructions/no connection, then the original unknown-preflight POSIX hint after normal lazy authentication. No runtime workaround or suppressed check.
+- 2026-10-17: R3–R4 verified: full gates/release build green (396 passed, 4 existing ignored). Activated the exact workspace release executable only for this location's router MCP through the supported API; no profile flags or project-config edits. Actual tool passed reported command, expected error, timeout/parallel, 7-second command and 35-second idle follow-up, read-only.
 
 ## Completion
 

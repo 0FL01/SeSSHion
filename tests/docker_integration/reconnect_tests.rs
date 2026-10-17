@@ -5,7 +5,6 @@ use std::time::Instant;
 
 fn docker_test_config(host: &str, port: u16) -> Config {
     Config {
-        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

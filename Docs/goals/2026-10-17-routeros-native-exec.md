@@ -1,6 +1,6 @@
 # Goal: automatic RouterOS detection and verified delivery
 
-Status: active
+Status: complete
 Source: approved automatic-detection plan; user: «никаких ... --remote-platform=routeros ... автоматически понимать с чем работаем», then «делай копию плана в цель и итеративно реализовать и коммит пуш билд ... задача закрыта когда github action после пуша кооректно завершился»; KISS/YAGNI/Pareto.
 Last updated: 2026-10-17
 
@@ -44,8 +44,8 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Source: latest explicit user finish line.
   - Acceptance: conventional commits with body; ordinary push to origin/main; CI and Release for the delivered head SHA completes successfully including platform build/release jobs. Stop only after this evidence and closure check.
   - Primary evidence: git head/remote and exact-SHA GitHub Actions URL/conclusion/jobs.
-  - Status: in_progress
-  - Evidence: prior manual-profile implementation 88397dbf04f643263dadfe7fc0536d69e7ede5f4 passed CI run https://github.com/0FL01/SeSSHion/actions/runs/39025593602; that does not verify this automatic-detection revision.
+  - Status: verified
+  - Evidence: automatic-detection implementation `1eb9acff1cd9ac75e0c814e3da08e4b4847f5b07` committed and pushed to origin/main. Exact-SHA [CI and Release run 39028283658](https://github.com/0FL01/SeSSHion/actions/runs/39028283658) completed successfully: Test, Lint, Linux x86_64, Windows x86_64, macOS aarch64 builds and rolling release all succeeded; manual stable release correctly skipped. No failed steps.
 
 ### Constraints
 
@@ -82,17 +82,16 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 
 ## Current Checkpoint
 
-- Closes: R5.
-- Smallest next action: commit/push the verified revision, then observe the full exact-SHA CI and Release workflow.
-- Expected evidence: pushed SHA matches the successful workflow, including platform build/release jobs.
-- Stop or replan if: a concrete required outcome crosses the envelope; record minimal expansion before editing.
+- Closes: none; all required outcomes verified.
+- Smallest next action: none; substantive work is complete.
+- Completion evidence: exact-SHA implementation workflow succeeded, including all platform builds and rolling release.
 
 ## Current State
 
-- Resolved: R1–R4 verified; only current revision's commit/push and exact-SHA CI delivery remain.
-- Last relevant evidence: all local gates and release build passed, 396 tests passed with 4 pre-existing ignored. Actual connected MCP ran the reported command and all read-only acceptance cases without profile flags. Known workspace release binary selected via runtime-only supported MCP replacement; user's opencode.jsonc changes preserved and not included in delivery.
-- Blocker: none. Docker and local SSH transfer clients available.
-- Next: exact-SHA R5 delivery.
+- Resolved: R1–R5 verified.
+- Last relevant evidence: all local gates/release build and exact-SHA GitHub Actions succeeded, including all three release platforms and rolling publication. Actual connected MCP passed reported command and all read-only acceptance cases without profile flags. Known workspace release binary selected via runtime-only supported MCP replacement; user's opencode.jsonc changes preserved and excluded from commits.
+- Blocker: none.
+- Next: none.
 
 ## Material Decisions
 
@@ -106,10 +105,11 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 - 2026-10-17: R2 focused evidence passed: 7 actual MCP/lazy-library tests and server/config unit selections. Initial fixture failures were a missing String→Cow conversion, an incorrect no-SFTP-connection assumption for POSIX, and teardown before the legacy handshake barrier; corrected fixtures without weakening runtime behavior.
 - 2026-10-17: R1 transport slice verified and reviewed. Full Docker run exposed one superseded assertion: an already-cancelled lazy server cannot publish a POSIX transfer hint before any target is identified. That case now asserts neutral pending instructions/no connection, then the original unknown-preflight POSIX hint after normal lazy authentication. No runtime workaround or suppressed check.
 - 2026-10-17: R3–R4 verified: full gates/release build green (396 passed, 4 existing ignored). Activated the exact workspace release executable only for this location's router MCP through the supported API; no profile flags or project-config edits. Actual tool passed reported command, expected error, timeout/parallel, 7-second command and 35-second idle follow-up, read-only.
+- 2026-10-17: R5 verified: implementation 1eb9acff1cd9ac75e0c814e3da08e4b4847f5b07 pushed; full CI and Release run 39028283658 succeeded with all expected test/lint/build/rolling jobs. Closure check passed; no further implementation, cleanup or expanded audit.
 
 ## Completion
 
-- Resolved outcomes: pending.
-- Commands and artifacts: pending.
-- Constraint and diff-scope check: pending.
-- Final status: active.
+- Resolved outcomes: R1–R5, all verified with evidence above.
+- Commands and artifacts: cargo fmt --all -- --check; cargo clippy --all-targets --all-features -- -D warnings; cargo check --all-features --verbose; cargo test --all-features --verbose (396 passed, 4 pre-existing ignored); cargo build --release. Real model-visible MCP acceptance on RouterOS 7.15.3. Implementation commit 1eb9acf, CI run 39028283658, three platform artifacts and rolling release.
+- Constraint and diff-scope check: one bounded identification adapter plus existing connection/MCP integration; no new dependencies, framework, Cargo/lock/workflow edits, diagnostic connection/EXEC, crypto downgrade or router writes. POSIX/native/explicit-transport guarantees tested. User-owned opencode.jsonc left unchanged and unstaged.
+- Final status: complete. This closing document records already verified delivery; publishing it does not reopen substantive implementation work.

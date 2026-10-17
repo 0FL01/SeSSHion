@@ -425,29 +425,42 @@ Transfer behavior through a jump host:
 - When either hop uses a password, explicitly choose `exec-raw`. Requesting `rsync`, `sftp`, or `scp` returns an error; the server never switches transports.
 - Jump-backed local OpenSSH transports are currently Unix-only; on other platforms explicitly choose `exec-raw`.
 
-<details>
-<summary><b>Claude Code</b> — .mcp.json or ~/.claude.json</summary>
+### Claude Code
 
-Add to your project's `.mcp.json` (shared via git) or to `~/.claude.json` under the top-level `mcpServers` key:
+Add to `.mcp.json` in your project root (merge entries into `mcpServers` if the file already exists). The first entry connects directly; the second uses a jump host:
 
 ```json
 {
   "mcpServers": {
-    "ssh-remote": {
+    "ssh-direct": {
       "type": "stdio",
-      "command": "/absolute/path/to/ssh-mcp",
+      "command": "/usr/local/bin/ssh-mcp",
       "args": [
-        "--host=example.com",
+        "--host=app.example.com",
+        "--port=2222",
+        "--user=deploy",
+        "--key=${HOME}/.ssh/id_ed25519"
+      ]
+    },
+    "ssh-via-jump": {
+      "type": "stdio",
+      "command": "/usr/local/bin/ssh-mcp",
+      "args": [
+        "--host=private.example.com",
         "--port=22",
-        "--user=alice",
-        "--key=/path/to/private/key"
+        "--user=deploy",
+        "--key=${HOME}/.ssh/target_ed25519",
+        "--jump=jump-user@bastion.example.com:22",
+        "--jump-key=${HOME}/.ssh/jump_ed25519"
       ]
     }
   }
 }
 ```
 
-</details>
+- Replace the example hosts, ports, users, executable and key paths with your own. Claude Code expands `${HOME}` locally; use resolvable DNS names or IP addresses, not SSH-config-only aliases.
+- `--key` authenticates the target; `--jump-key` authenticates the jump host. Private keys stay local. RouterOS is detected automatically; no platform flag is needed.
+- Start Claude Code, approve the project MCP servers when prompted, and check connections with `/mcp`. See the [Claude Code MCP reference](https://code.claude.com/docs/en/mcp).
 
 <details>
 <summary><b>Strict production</b> — verified host key</summary>

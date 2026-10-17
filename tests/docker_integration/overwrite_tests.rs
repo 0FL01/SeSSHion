@@ -32,6 +32,7 @@ async fn test_overwrite_false_prevents_overwrite_execraw() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -202,6 +203,7 @@ async fn test_overwrite_false_prevents_overwrite_sftp() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -372,6 +374,7 @@ async fn test_overwrite_false_prevents_overwrite_scp() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -542,6 +545,7 @@ async fn test_overwrite_false_prevents_overwrite_rsync() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -705,6 +709,7 @@ async fn test_overwrite_false_then_true_succeeds() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

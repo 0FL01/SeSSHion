@@ -1,6 +1,6 @@
 //! Configuration and CLI argument parsing for SeSSHion
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,34 @@ pub const MIN_HEALTH_PROBE_TIMEOUT_MS: u64 = 100;
 /// Maximum health probe timeout in milliseconds
 pub const MAX_HEALTH_PROBE_TIMEOUT_MS: u64 = 30_000;
 
+/// Fixed remote command contract; never inferred from optional startup probes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum RemotePlatform {
+    #[default]
+    Posix,
+    Routeros,
+}
+
+impl RemotePlatform {
+    pub(crate) fn validate_elevation(
+        self,
+        su_password: Option<&str>,
+        sudo_password: Option<&str>,
+    ) -> Result<()> {
+        if self == Self::Routeros
+            && [su_password, sudo_password]
+                .into_iter()
+                .flatten()
+                .any(|password| !password.is_empty())
+        {
+            return Err(SshMcpError::config(
+                "RouterOS does not support --su-password or --sudo-password",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// SeSSHion CLI arguments
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ssh-mcp")]
@@ -47,6 +75,10 @@ pub const MAX_HEALTH_PROBE_TIMEOUT_MS: u64 = 30_000;
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = env!("CARGO_PKG_DESCRIPTION"))]
 pub struct Args {
+    /// Remote command profile: POSIX shell or native single-line RouterOS CLI
+    #[arg(long, env = "SSH_MCP_REMOTE_PLATFORM", value_enum, default_value_t = RemotePlatform::Posix)]
+    pub remote_platform: RemotePlatform,
+
     /// SSH host to connect to
     #[arg(long, env = "SSH_MCP_HOST")]
     pub host: String,
@@ -167,6 +199,9 @@ pub struct Args {
 /// Parsed and validated configuration
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Fixed execution profile; POSIX preserves the existing tool contract.
+    pub remote_platform: RemotePlatform,
+
     /// SSH host
     pub host: String,
 
@@ -274,6 +309,7 @@ impl Config {
         let max_output_tokens = parse_max_output_tokens(args.max_output_tokens.as_deref());
 
         Ok(Config {
+            remote_platform: args.remote_platform,
             host: args.host,
             port: args.port,
             user: args.user,
@@ -351,6 +387,13 @@ fn expand_key_path(path: PathBuf, home: Option<&OsStr>) -> Result<PathBuf> {
 /// Validate CLI arguments
 fn validate_args(args: &Args) -> Result<()> {
     let mut errors = Vec::new();
+
+    if let Err(error) = args
+        .remote_platform
+        .validate_elevation(args.su_password.as_deref(), args.sudo_password.as_deref())
+    {
+        errors.push(error.to_string());
+    }
 
     if args.host.is_empty() {
         errors.push("Missing required --host".to_string());
@@ -499,6 +542,7 @@ mod tests {
 
     fn base_args() -> Args {
         Args {
+            remote_platform: RemotePlatform::Posix,
             host: "localhost".to_string(),
             port: 22,
             user: "test".to_string(),
@@ -567,6 +611,62 @@ mod tests {
         assert_eq!(config.max_chars, Some(64_000));
         assert_eq!(config.strict_host_key_checking, HostKeyCheckMode::AcceptNew);
         assert!(config.known_hosts.is_none());
+        assert_eq!(config.remote_platform, RemotePlatform::Posix);
+    }
+
+    #[test]
+    fn routeros_profile_rejects_elevation_but_preserves_empty_normalization() {
+        let mut args = base_args();
+        args.remote_platform = RemotePlatform::Routeros;
+        args.su_password = Some(String::new());
+        args.sudo_password = Some(String::new());
+        let config = Config::from_args(args.clone()).unwrap();
+        assert_eq!(config.remote_platform, RemotePlatform::Routeros);
+        assert!(config.su_password.is_none());
+        assert!(config.sudo_password.is_none());
+        for sudo in [false, true] {
+            let mut invalid = args.clone();
+            invalid.disable_sudo = true;
+            if sudo {
+                invalid.sudo_password = Some(" ".to_string());
+            } else {
+                invalid.su_password = Some("secret".to_string());
+            }
+            assert!(
+                Config::from_args(invalid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("RouterOS")
+            );
+        }
+    }
+
+    #[test]
+    fn remote_platform_cli_values_are_explicit() {
+        for (value, expected) in [
+            ("posix", RemotePlatform::Posix),
+            ("routeros", RemotePlatform::Routeros),
+        ] {
+            let args = Args::try_parse_from([
+                "ssh-mcp",
+                "--host=test",
+                "--user=test",
+                "--password=secret",
+                "--remote-platform",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.remote_platform, expected);
+        }
+        assert!(
+            Args::try_parse_from([
+                "ssh-mcp",
+                "--host=test",
+                "--user=test",
+                "--remote-platform=auto",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -669,6 +769,7 @@ mod tests {
     fn test_args_parse_host_key_options() {
         let args = Args::try_parse_from([
             "ssh-mcp",
+            "--remote-platform=posix",
             "--host",
             "example.com",
             "--user",
@@ -690,6 +791,7 @@ mod tests {
     fn test_args_parse_spool_dir() {
         let args = Args::try_parse_from([
             "ssh-mcp",
+            "--remote-platform=posix",
             "--host",
             "example.com",
             "--user",

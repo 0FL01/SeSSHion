@@ -48,6 +48,7 @@ async fn test_rsync_put_file_timeout() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -213,6 +214,7 @@ async fn test_rsync_get_file_timeout() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -360,6 +362,7 @@ async fn test_rsync_put_directory_timeout() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

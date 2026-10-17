@@ -28,6 +28,19 @@ const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
 const MIN_HEALTH_PROBE_TTL_MS: u64 = 250;
 const MAX_HEALTH_PROBE_TTL_MS: u64 = 5_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChannelOpenFailureKind {
+    Other,
+    BudgetElapsed,
+}
+
+/// Keep timeout metadata separate from the legacy, human-readable SSH error.
+pub(super) struct ChannelOpenAttemptFailure {
+    pub(super) generation: Option<u64>,
+    pub(super) error: SshMcpError,
+    pub(super) kind: ChannelOpenFailureKind,
+}
+
 struct ConnectAttemptGuard<'a> {
     is_connecting: &'a AtomicBool,
     connect_notify: &'a Notify,
@@ -105,6 +118,9 @@ pub struct SshConnectionManager {
 
     /// Lock to avoid concurrent active health probes
     health_probe_lock: Arc<Mutex<()>>,
+
+    /// Some command-only targets do not implement OpenSSH global requests.
+    target_openssh_keepalives: bool,
 }
 
 impl SshConnectionManager {
@@ -130,7 +146,14 @@ impl SshConnectionManager {
             channel_semaphore: Arc::new(Semaphore::new(CHANNEL_SEMAPHORE_CAPACITY)),
             last_health_probe_ok_at: Arc::new(Mutex::new(None)),
             health_probe_lock: Arc::new(Mutex::new(())),
+            target_openssh_keepalives: true,
         }
+    }
+
+    /// Set target policy before publishing the manager. Jump-host policy is unchanged.
+    pub(crate) fn with_target_openssh_keepalives(mut self, enabled: bool) -> Self {
+        self.target_openssh_keepalives = enabled;
+        self
     }
 
     pub(crate) async fn acquire_command_slot_raw(
@@ -240,11 +263,7 @@ impl SshConnectionManager {
 
         let connection_timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
 
-        let ssh_config = Arc::new(client::Config {
-            keepalive_interval: Some(Duration::from_secs(self.config.keepalive_interval)),
-            keepalive_max: self.config.keepalive_max as usize,
-            ..Default::default()
-        });
+        let target_config = self.client_config(self.target_openssh_keepalives);
 
         let (target, jump) = if let Some(jump_config) = &self.config.jump {
             info!(
@@ -253,7 +272,7 @@ impl SshConnectionManager {
             );
             let mut jump = self
                 .connect_tcp_endpoint(
-                    &ssh_config,
+                    &self.client_config(true),
                     &jump_config.host,
                     jump_config.port,
                     "jump connection",
@@ -303,7 +322,7 @@ impl SshConnectionManager {
             let target_handler = self.target_handler();
             let target = match timeout(
                 connection_timeout,
-                client::connect_stream(ssh_config.clone(), tunnel.into_stream(), target_handler),
+                client::connect_stream(target_config.clone(), tunnel.into_stream(), target_handler),
             )
             .await
             {
@@ -326,7 +345,7 @@ impl SshConnectionManager {
         } else {
             let target = self
                 .connect_tcp_endpoint(
-                    &ssh_config,
+                    &target_config,
                     &self.config.host,
                     self.config.port,
                     "target connection",
@@ -337,6 +356,15 @@ impl SshConnectionManager {
         };
 
         self.finish_connect(target, jump).await
+    }
+
+    fn client_config(&self, openssh_keepalives: bool) -> Arc<client::Config> {
+        Arc::new(client::Config {
+            keepalive_interval: openssh_keepalives
+                .then(|| Duration::from_secs(self.config.keepalive_interval)),
+            keepalive_max: self.config.keepalive_max as usize,
+            ..Default::default()
+        })
     }
 
     fn target_handler(&self) -> SshHandler {
@@ -609,6 +637,12 @@ impl SshConnectionManager {
                     .await;
                 continue;
             }
+            // RouterOS answers these OpenSSH requests with SSH_MSG_UNIMPLEMENTED,
+            // which russh 0.61.2 does not resolve as a ping response. Reuse an
+            // open transport passively, without taking either health-cache lock.
+            if !self.target_openssh_keepalives {
+                return Ok(());
+            }
             if self.is_health_probe_fresh(generation).await {
                 return Ok(());
             }
@@ -803,9 +837,26 @@ impl SshConnectionManager {
     pub(crate) async fn open_channel_attempt(
         &self,
     ) -> std::result::Result<(u64, Channel<client::Msg>), (Option<u64>, SshMcpError)> {
+        self.open_channel_attempt_detailed(Duration::from_secs(CONNECTION_TIMEOUT_SECS), true)
+            .await
+            .map_err(|failure| (failure.generation, failure.error))
+    }
+
+    /// Native owners must not cancel a queued OPEN when the request ends: plain
+    /// russh Channels do not close on drop, and a late confirmation would be lost.
+    /// They keep this future alive to its own acquisition budget, then retire the
+    /// captured generation if that budget expires. Legacy callers still interrupt
+    /// acquisition on shutdown and receive the same error shape as before.
+    pub(super) async fn open_channel_attempt_detailed(
+        &self,
+        budget: Duration,
+        interrupt_on_shutdown: bool,
+    ) -> std::result::Result<(u64, Channel<client::Msg>), ChannelOpenAttemptFailure> {
         let mut generation = None;
-        let result = self
-            .bounded_transport(Duration::from_secs(CONNECTION_TIMEOUT_SECS), async {
+        let mut kind = ChannelOpenFailureKind::Other;
+        let result = async {
+            self.ensure_not_shutting_down()?;
+            let operation = async {
                 let session_guard = self.session.lock().await;
                 let route = session_guard
                     .as_ref()
@@ -821,9 +872,29 @@ impl SshConnectionManager {
                         SshMcpError::connection(format!("Failed to open channel: {e}"))
                     })?;
                 Ok((route.generation, channel))
-            })
-            .await;
-        result.map_err(|error| (generation, error))
+            };
+            tokio::select! {
+                biased;
+                _ = self.shutdown_token.cancelled(), if interrupt_on_shutdown => {
+                    Err(SshMcpError::connection("SSH connection manager is shutting down"))
+                }
+                result = timeout(budget, operation) => match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        kind = ChannelOpenFailureKind::BudgetElapsed;
+                        Err(SshMcpError::connection(format!(
+                            "SSH transport acquisition timed out after {}ms", budget.as_millis()
+                        )))
+                    }
+                },
+            }
+        }
+        .await;
+        result.map_err(|error| ChannelOpenAttemptFailure {
+            generation,
+            error,
+            kind,
+        })
     }
 
     /// Check if currently elevated to root via su
@@ -1507,6 +1578,141 @@ mod tests {
         assert!(!manager.is_health_probe_fresh(1).await);
         assert!(!manager.mark_health_probe_ok(1).await);
         assert!(manager.run_health_probe(1).await.is_err());
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_target_keepalive_policy_leaves_jump_and_posix_defaults_unchanged() {
+        let config = SshConfig::new("unit-test", "test")
+            .with_keepalive_interval(17)
+            .with_keepalive_max(6);
+        let posix = SshConnectionManager::new(config.clone()).await;
+        assert!(posix.target_openssh_keepalives);
+        assert_eq!(
+            posix
+                .client_config(posix.target_openssh_keepalives)
+                .keepalive_interval,
+            Some(Duration::from_secs(17))
+        );
+        let native = SshConnectionManager::new(config)
+            .await
+            .with_target_openssh_keepalives(false);
+        let target = native.client_config(native.target_openssh_keepalives);
+        let jump = native.client_config(true);
+        assert_eq!(target.keepalive_interval, None);
+        assert_eq!(target.keepalive_max, 6);
+        assert_eq!(jump.keepalive_interval, Some(Duration::from_secs(17)));
+        assert_eq!(jump.keepalive_max, 6);
+    }
+
+    #[tokio::test]
+    async fn test_passive_target_reuses_route_past_ttl_without_health_locks_or_cache() {
+        let manager = SshConnectionManager::new(
+            SshConfig::new("127.0.0.1", "test")
+                .with_port(9)
+                .with_reconnect_retries(0)
+                .with_health_probe_timeout_ms(1)
+                .with_su_password("unused"),
+        )
+        .await
+        .with_target_openssh_keepalives(false);
+        *manager.session.lock().await = Some(test_route(false, Arc::new(Notify::new())).await);
+        let probe_lock = manager.health_probe_lock.lock().await;
+        let cache_lock = manager.last_health_probe_ok_at.lock().await;
+        sleep(manager.health_probe_ttl() + Duration::from_millis(10)).await;
+        timeout(
+            Duration::from_millis(100),
+            manager.ensure_connected_transport_only(),
+        )
+        .await
+        .expect("passive readiness must not take either health lock")
+        .unwrap();
+        assert!(
+            cache_lock.is_none(),
+            "do not manufacture an active health result"
+        );
+        assert!(!manager.is_elevated());
+        assert!(
+            !manager
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .auto_elevation_attempted
+        );
+        drop(cache_lock);
+        drop(probe_lock);
+
+        manager
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .target
+            .disconnect(russh::Disconnect::ByApplication, "test", "")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while manager.is_connected().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(manager.ensure_connected_transport_only().await.is_err());
+        assert!(manager.session.lock().await.is_none());
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_passive_route_still_checks_jump_closure() {
+        let manager = SshConnectionManager::new(SshConfig::new("unit-test", "test"))
+            .await
+            .with_target_openssh_keepalives(false);
+        let mut route = test_route(false, Arc::new(Notify::new())).await;
+        route.jump = Some(test_route(false, Arc::new(Notify::new())).await.target);
+        route
+            .jump
+            .as_ref()
+            .unwrap()
+            .disconnect(russh::Disconnect::ByApplication, "test", "")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !route.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!route.target.is_closed());
+        *manager.session.lock().await = Some(route);
+        assert!(!manager.is_connected().await);
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_channel_open_budget_metadata_distinguishes_pre_generation_wait() {
+        let manager = SshConnectionManager::new(SshConfig::new("unit-test", "test")).await;
+        *manager.session.lock().await = Some(test_route(true, Arc::new(Notify::new())).await);
+        let guard = manager.session.lock().await;
+        let failure = manager
+            .open_channel_attempt_detailed(Duration::from_millis(20), false)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.generation, None);
+        assert_eq!(failure.kind, ChannelOpenFailureKind::BudgetElapsed);
+        drop(guard);
+        let failure = manager
+            .open_channel_attempt_detailed(Duration::from_millis(20), false)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.generation, Some(1));
+        assert_eq!(failure.kind, ChannelOpenFailureKind::BudgetElapsed);
         manager.close().await;
     }
 

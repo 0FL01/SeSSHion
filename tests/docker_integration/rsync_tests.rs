@@ -42,6 +42,7 @@ async fn test_rsync_file_put_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -164,6 +165,7 @@ async fn test_rsync_file_get_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -288,6 +290,7 @@ async fn test_rsync_directory_put_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -420,6 +423,7 @@ async fn test_rsync_directory_get_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -590,6 +594,7 @@ async fn test_explicit_rsync_missing_remote_binary_is_terminal() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -731,6 +736,7 @@ async fn test_rsync_with_options() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

@@ -62,6 +62,7 @@ async fn test_stdout_truncation() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -175,6 +176,7 @@ async fn test_stderr_truncation() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -275,6 +277,7 @@ async fn test_truncation_notice_present() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -373,6 +376,7 @@ async fn test_no_truncation_small_output() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

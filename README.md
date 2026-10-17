@@ -29,6 +29,69 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
+### RouterOS: native commands only
+
+The default `--remote-platform=posix` keeps the Linux/POSIX tools above unchanged.
+For MikroTik RouterOS, select the native profile explicitly (or set
+`SSH_MCP_REMOTE_PLATFORM=routeros`):
+
+```sh
+ssh-mcp --host=192.168.88.1 --user=admin --key=~/.ssh/kin --remote-platform=routeros
+```
+
+RouterOS advertises only **`shell`**, with `command` and optional positive integer
+`timeout_ms`. For example:
+
+```json
+{"command": ":put [/system resource get version]", "timeout_ms": 5000}
+```
+
+- Commands are native **single-line RouterOS CLI**, sent directly by SSH EXEC
+  without PTY, `sh`, escaping, elevation, or background wrappers. Empty/NUL and
+  internal CR/LF commands are rejected, not flattened. One-line `{ ... }` blocks
+  are supported; multiline scripting is deliberately outside this profile.
+- `background` (even `false`), `log_path`, unknown fields and `timeout_ms:null`
+  are invalid. `sudo_shell`, `sudo_apply_patch`, `check_process`, `transfer` and
+  `apply_patch` are hidden and rejected on direct calls. Nonempty `su`/`sudo`
+  password settings are configuration errors, even with `--disable-sudo`.
+- Normal output uses the existing text tool response; nonzero/missing SSH status,
+  request rejection, signal, interruption and timeout are errors. **SSH status 0
+  does not verify the intended effect**: inspect output and verify relevant state.
+  No text-pattern error guessing is performed. Commands are never replayed after
+  EXEC is queued; nonzero status does not imply that no changes occurred.
+- The server-side deadline includes slot, connection and channel waits. Partial
+  output and received status survive failures. Timeout/cancellation closes only
+  that channel best-effort (up to 100 ms); remote execution may continue and no
+  rollback or pollable job is promised. A cancelled pending OPEN remains owned
+  through its transport acquisition budget; a late channel is closed without
+  EXEC. Exhausting that OPEN budget can retire its route generation and interrupt
+  sibling channels. Do not automatically retry uncertain execution.
+- Output retains the configured per-stream `--max-output-tokens` limit (about four
+  bytes/token, approximately twice the limit across stdout plus stderr); `none`
+  remains explicitly unlimited. Truncation is reported without POSIX helper tips.
+- Initial authenticated readiness remains mandatory. RouterOS runs no optional
+  POSIX metadata, raw or SFTP probes; its instructions and tool schema stay frozen
+  across reconnect. Common application logging/spool initialization still occurs,
+  but native calls create no job IDs, PID records or per-command log/state files.
+- RouterOS targets disable OpenSSH active health pings and automatic keepalives:
+  RouterOS 7.15.3 replies `SSH_MSG_UNIMPLEMENTED` to those requests. The recovery
+  loop still restores closed routes, but **silent idle blackholes are detected by
+  bounded channel opening for real operations**, not proactively. Target keepalive
+  timing settings do not apply in this profile; a configured jump host retains its
+  existing keepalives. POSIX health behavior and host-key policies are unchanged.
+
+Compatibility is checked on RouterOS **7.15.3 stable, RB951Ui-2HnD (mipsbe)**;
+this is not a claim of coverage for every firmware version. Closing one native
+channel preserves other channels on a healthy connection. Firmware CLI encoding
+behavior is not changed or automatically converted.
+
+After changes, smoke-test the actual MCP binary with a read-only success/error,
+timeout and parallel command, an idle interval over 30 seconds, and a long command
+across recovery ticks. A synthetic SSH peer alone cannot establish firmware
+compatibility.
+
+### POSIX file transfers
+
 Every `transfer` call must set `transport` to `rsync`, `sftp`, `scp`, or `exec-raw`.
 There is no wire default: `auto`, an omitted field, and `null` are rejected as invalid
 parameters before dispatch or background job creation. A call attempts only the
@@ -63,6 +126,8 @@ patches or transfers. After a lost response the operation's outcome may be unkno
 check remote state before retrying a side-effecting operation yourself.
 
 ### Rootless startup environment
+
+This optional snapshot and transfer preflight apply to the **POSIX** profile only.
 
 Before serving MCP, the CLI automatically collects one best-effort remote snapshot
 and embeds its compact JSON in `instructions`, delivered by both `initialize` and

@@ -39,6 +39,7 @@ async fn test_sftp_file_put_with_key_auth() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -159,6 +160,7 @@ async fn test_sftp_file_get_with_key_auth() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -281,6 +283,7 @@ async fn test_sftp_directory_put_with_key_auth() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -411,6 +414,7 @@ async fn test_sftp_directory_get_with_key_auth() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -557,6 +561,7 @@ async fn test_sftp_overwrite_false() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host: host.to_string(),
         port,
         user: "test".to_string(),

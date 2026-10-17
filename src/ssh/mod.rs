@@ -9,6 +9,7 @@ pub mod connection;
 pub mod elevation;
 pub mod environment;
 pub mod handler;
+mod routeros;
 pub mod sanitize;
 
 // Re-exports
@@ -19,4 +20,5 @@ pub use elevation::{escape_for_shell, sanitize_password, wrap_sudo_command};
 pub use handler::{
     KeyCheckOutcome, SshHandler, default_known_hosts_path, remove_known_hosts_entry,
 };
+pub(crate) use routeros::RouterOsExecFailure;
 pub use sanitize::{escape_command_for_shell, escape_for_timeout_wrapper, sanitize_command};

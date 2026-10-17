@@ -14,6 +14,49 @@ pub(super) struct CommonToolArgs {
     pub(super) log_path: Option<String>,
 }
 
+#[derive(Debug)]
+pub(super) struct RouterOsToolArgs {
+    pub(super) command: String,
+    pub(super) timeout_ms: Option<u64>,
+}
+
+pub(super) fn parse_routeros_tool_args(
+    args: &Map<String, Value>,
+    max_chars: Option<usize>,
+) -> std::result::Result<RouterOsToolArgs, McpError> {
+    if let Some(name) = args
+        .keys()
+        .find(|name| !matches!(name.as_str(), "command" | "timeout_ms"))
+    {
+        return Err(McpError::invalid_params(
+            format!("Unknown RouterOS shell parameter: {name}"),
+            None,
+        ));
+    }
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("command must be a string", None))?;
+    let command = crate::ssh::sanitize_command(command, max_chars)
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+    if command.contains(['\0', '\r', '\n']) {
+        return Err(McpError::invalid_params(
+            "RouterOS command must be one line without NUL or internal CR/LF; multiline commands are not flattened",
+            None,
+        ));
+    }
+    let timeout_ms = match args.get("timeout_ms") {
+        None => None,
+        Some(value) => Some(value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
+            McpError::invalid_params("timeout_ms must be a positive integer (not null)", None)
+        })?),
+    };
+    Ok(RouterOsToolArgs {
+        command,
+        timeout_ms,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct CheckProcessToolArgs {
     #[serde(flatten)]
@@ -108,7 +151,53 @@ mod tests {
     use rmcp::model::ErrorCode;
     use serde_json::json;
 
-    use super::{CheckProcessToolArgs, parse_common_tool_args};
+    use super::{CheckProcessToolArgs, parse_common_tool_args, parse_routeros_tool_args};
+
+    #[test]
+    fn routeros_arguments_are_strict_and_single_line() {
+        let command = r#":put "literal $ [ ] \\"; :put [/system resource get version]"#;
+        for timeout in [None, Some(json!(1)), Some(json!(300_000))] {
+            let mut params = json!({"command": command});
+            if let Some(timeout) = timeout {
+                params["timeout_ms"] = timeout;
+            }
+            let parsed = parse_routeros_tool_args(params.as_object().unwrap(), Some(1000)).unwrap();
+            assert_eq!(parsed.command, command);
+        }
+        for invalid in [
+            json!({}),
+            json!({"command": 1}),
+            json!({"command": "  "}),
+            json!({"command": "a\0b"}),
+            json!({"command": ":put 1\n:put 2"}),
+            json!({"command": ":put 1\r:put 2"}),
+            json!({"command": ":put 1", "background": false}),
+            json!({"command": ":put 1", "background": true}),
+            json!({"command": ":put 1", "log_path": null}),
+            json!({"command": ":put 1", "extra": 1}),
+        ] {
+            let error =
+                parse_routeros_tool_args(invalid.as_object().unwrap(), Some(1000)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "{invalid}");
+        }
+        for timeout in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("10"),
+            json!(true),
+        ] {
+            let params = json!({"command": ":put 1", "timeout_ms": timeout});
+            assert!(
+                parse_routeros_tool_args(params.as_object().unwrap(), None).is_err(),
+                "{params}"
+            );
+        }
+        let params = json!({"command": "12345"});
+        assert!(parse_routeros_tool_args(params.as_object().unwrap(), Some(4)).is_err());
+        assert!(parse_routeros_tool_args(params.as_object().unwrap(), None).is_ok());
+    }
 
     #[test]
     fn check_process_wait_for_defaults_to_zero() {

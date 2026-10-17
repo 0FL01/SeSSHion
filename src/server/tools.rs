@@ -39,6 +39,23 @@ pub(super) fn shell_tool() -> Tool {
     )
 }
 
+pub(super) fn routeros_shell_tool() -> Tool {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "minLength": 1, "description": "One native RouterOS CLI line; no NUL or internal CR/LF."},
+            "timeout_ms": {"type": "integer", "minimum": 1, "description": "Whole-call wait budget, including slot/connection/open; channel cleanup is best-effort. Execution may continue after timeout."}
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    });
+    Tool::new(
+        "shell",
+        "Native single-line RouterOS CLI, no POSIX shell or jobs. SSH status 0 does not verify the intended effect; inspect output/state. Never automatically retry uncertain execution.",
+        Arc::new(schema.as_object().cloned().unwrap()),
+    )
+}
+
 pub(super) fn sudo_shell_tool() -> Tool {
     command_tool(
         "sudo_shell",
@@ -157,9 +174,27 @@ fn patch_tool(name: &'static str, description: &'static str) -> Tool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_patch_tool, check_process_tool, shell_tool, sudo_apply_patch_tool, sudo_shell_tool,
-        transfer_tool,
+        apply_patch_tool, check_process_tool, routeros_shell_tool, shell_tool,
+        sudo_apply_patch_tool, sudo_shell_tool, transfer_tool,
     };
+
+    #[test]
+    fn routeros_has_only_native_foreground_arguments() {
+        let tool = routeros_shell_tool();
+        assert_eq!(tool.name, "shell");
+        let schema = &tool.input_schema;
+        assert_eq!(schema["required"], serde_json::json!(["command"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+        assert_eq!(schema["properties"]["timeout_ms"]["type"], "integer");
+        assert_eq!(schema["properties"]["timeout_ms"]["minimum"], 1);
+        assert!(
+            tool.description
+                .as_deref()
+                .unwrap()
+                .contains("does not verify")
+        );
+    }
 
     #[test]
     fn check_process_schema_exposes_wait_for_seconds() {

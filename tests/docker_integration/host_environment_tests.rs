@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 fn config(host: String, port: u16) -> Config {
     Config {
+        remote_platform: ssh_mcp::config::RemotePlatform::Posix,
         host,
         port,
         user: "test".into(),

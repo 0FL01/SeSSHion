@@ -25,7 +25,7 @@ The POSIX backend exposes the following tools; RouterOS exposes only native `she
 
 | Tool | Purpose |
 |------|---------|
-| `shell` | Run a command via POSIX `sh` as the connected user; `background=true` for long tasks. |
+| `shell` | Run a command as the connected user; Bash when installed, POSIX `sh` otherwise. Use `background=true` for long tasks. |
 | `sudo_shell` | Same, under `sudo` (uses `--sudo-password`); can be disabled with `--disable-sudo`. |
 | `check_process` | Poll a command or transfer background job by `job_id`. |
 | `apply_patch` | Create, update, or delete remote UTF-8 files with one exact patch (atomic per file, conflict-checked). |
@@ -33,6 +33,12 @@ The POSIX backend exposes the following tools; RouterOS exposes only native `she
 | `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. Requires an explicit transport; no automatic fallback. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
+
+`--command-shell auto` (default) uses non-login Bash from `/bin/bash` or
+`/usr/bin/bash` when executable, otherwise POSIX `sh`. Use `bash` to require Bash
+or `sh` to preserve POSIX-only behavior. This applies to `shell` and `sudo_shell`
+in both foreground and background, not internal scripts or RouterOS. An error
+or timeout never triggers a retry in another interpreter.
 
 ### RouterOS: native commands only
 
@@ -505,6 +511,7 @@ Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--
 | `--jump-password` | `SSH_MCP_JUMP_PASSWORD` | Jump SSH login password (alternative to jump key) |
 | `--spool-dir` | `SSH_MCP_SPOOL_DIR` | Absolute local directory for background job logs and state |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
+| `--command-shell` | `SSH_MCP_COMMAND_SHELL` | POSIX payload interpreter: `auto` (default), `sh`, or `bash` |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
 | `--max-output-tokens` | `SSH_MCP_MAX_OUTPUT_TOKENS` | Shell output token limit (default: 16000 ≈ 64KB; `none` to disable) |
 | `--disable-sudo` | `SSH_MCP_DISABLE_SUDO` | Disable the `sudo_shell` and `sudo_apply_patch` tools |

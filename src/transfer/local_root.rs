@@ -25,7 +25,7 @@ pub fn safe_join_local_root(local_root: &Path, user_path: &str) -> Result<PathBu
         // Absolute path: must be within local_root
         let stripped = path.strip_prefix(local_root).map_err(|_| {
             format!(
-                "local_path {} is outside local_root {}",
+                "local_path {} is outside local_root {}; use a relative path within local_root",
                 path.display(),
                 local_root.display()
             )

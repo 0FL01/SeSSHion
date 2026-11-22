@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,8 @@ use crate::background::response::{
     BackgroundTimeoutSnapshot, background_json_err, background_json_ok, background_json_timeout,
 };
 use crate::background::wrapper::{build_background_wrapper_script, remote_job_log_path};
+use crate::config::CommandShell;
+use crate::shell_escape::escape_for_shell;
 use crate::ssh::command::read_local_log_tail;
 use crate::ssh::sanitize::wrap_in_posix_shell;
 use crate::ssh::{CommandOutput, sanitize_command, wrap_sudo_command};
@@ -20,6 +23,28 @@ use crate::tools::DEFAULT_CHECK_PROCESS_TAIL_LINES;
 
 use super::SshMcpServer;
 use super::validation::validate_background_log_path;
+
+pub(super) fn user_payload(mode: CommandShell, command: &str) -> Cow<'_, str> {
+    let fallback = match mode {
+        CommandShell::Sh => return Cow::Borrowed(command),
+        CommandShell::Auto => r#"exec sh -c "$1""#,
+        CommandShell::Bash => {
+            "printf '%s\\n' 'Bash required but not executable at /bin/bash or /usr/bin/bash' >&2; exit 127"
+        }
+    };
+    let escaped = escape_for_shell(command);
+    // The POSIX wrapper chooses the interpreter before parsing the payload. An
+    // exec replaces it, so payload failures never trigger a second attempt.
+    // Use only system paths, including when the wrapper is running under sudo.
+    Cow::Owned(format!(
+        r#"set -- '{escaped}'; for ssh_mcp_bash in /bin/bash /usr/bin/bash; do
+  if [ -f "$ssh_mcp_bash" ] && [ -x "$ssh_mcp_bash" ]; then
+    BASH_ENV= exec "$ssh_mcp_bash" --noprofile --norc -c "$1"
+  fi
+done
+{fallback}"#,
+    ))
+}
 
 pub(super) enum BackgroundPrivilege<'a> {
     Normal,
@@ -249,7 +274,9 @@ impl SshMcpServer {
                     out.push_str(
                         "\n[Tip: Use 'head -n 100' for first lines, 'tail -n 100' for last lines]",
                     );
-                    out.push_str("\n[Tip: For large output use SFTP/SCP tools to download files]");
+                    out.push_str(
+                        "\n[Tip: Save large output to a remote file; use transfer (get).]",
+                    );
                     if !tail.is_empty() {
                         out.push('\n');
                         out.push_str(&String::from_utf8_lossy(&tail));
@@ -495,21 +522,22 @@ impl SshMcpServer {
             return Ok(background_json_err(&e.to_string(), ""));
         }
 
+        let payload = user_payload(self.command_shell, &sanitized);
         let (command_for_exec, command_for_registry, attempt_su_elevation, log_msg) =
             match privilege {
                 BackgroundPrivilege::Normal => (
-                    sanitized.clone(),
+                    payload,
                     sanitized.clone(),
                     true,
                     "streaming failed for background job",
                 ),
                 BackgroundPrivilege::Sudo { password } => {
-                    let wrapped_command = wrap_sudo_command(&sanitized, password);
+                    let wrapped_command = wrap_sudo_command(&payload, password);
                     debug!(
                         "Wrapped sudo command (password hidden): sudo -n sh -c '...' or printf '...' | sudo ..."
                     );
                     (
-                        wrapped_command,
+                        Cow::Owned(wrapped_command),
                         format!("sudo {sanitized}"),
                         false,
                         "streaming failed for background sudo job",
@@ -592,5 +620,35 @@ impl SshMcpServer {
         });
 
         Ok(background_json_ok(&job_id, markers.pid, &final_log_path))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{CommandShell, user_payload};
+
+    #[test]
+    fn auto_preserves_payload_and_does_not_retry_a_bash_exit() {
+        if !["/bin/bash", "/usr/bin/bash"]
+            .iter()
+            .any(|path| std::path::Path::new(path).is_file())
+        {
+            return;
+        }
+        let payload = r#"printf '%s\n' {left,right} "a'b"
+cat <<'DATA'
+\1 \( \d \n ${HOME}
+DATA
+exit 127"#;
+        let startup = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(startup.path(), "echo unexpected-startup\n").unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &user_payload(CommandShell::Auto, payload)])
+            .env("BASH_ENV", startup.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(127));
+        assert_eq!(out.stdout, b"left\nright\na'b\n\\1 \\( \\d \\n ${HOME}\n");
+        assert!(out.stderr.is_empty());
     }
 }

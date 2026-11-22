@@ -37,6 +37,7 @@ async fn run() -> Result<()> {
     let _guard = init_logging(&args)?;
 
     let spool_dir = args.spool_dir.take();
+    let command_shell = args.command_shell;
 
     // Validate and create config
     let config = Config::from_args(args)?;
@@ -78,7 +79,9 @@ async fn run() -> Result<()> {
     }
 
     // Create MCP server
-    let server = SshMcpServer::new_with_spool_dir(config, spool_dir).await?;
+    let server = SshMcpServer::new_with_spool_dir(config, spool_dir)
+        .await?
+        .with_command_shell(command_shell);
 
     let lifecycle = CancellationToken::new();
     let signal_lifecycle = lifecycle.clone();

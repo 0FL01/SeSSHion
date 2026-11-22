@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use rmcp::model::Tool;
 
+use crate::config::CommandShell;
+
 fn command_tool(name: &'static str, tool_description: &'static str) -> Tool {
     let schema = serde_json::json!({
         "type": "object",
@@ -12,7 +14,7 @@ fn command_tool(name: &'static str, tool_description: &'static str) -> Tool {
             "background": {
                 "type": "boolean",
                 "default": false,
-                "description": "Run asynchronously and return job_id immediately; use for long commands."
+                "description": "For long commands: job_id immediately; poll for result."
             },
             "timeout_ms": {
                 "type": "integer",
@@ -32,10 +34,14 @@ fn command_tool(name: &'static str, tool_description: &'static str) -> Tool {
     Tool::new(name, tool_description, Arc::new(schema_obj))
 }
 
-pub(super) fn shell_tool() -> Tool {
+pub(super) fn shell_tool(mode: CommandShell) -> Tool {
     command_tool(
         "shell",
-        "POSIX sh: use explicit paths, not {a,b}; bound output and file reads.",
+        match mode {
+            CommandShell::Auto => "Bash if installed, else POSIX sh; bound output.",
+            CommandShell::Sh => "POSIX sh: no {a,b}; bound output.",
+            CommandShell::Bash => "Bash required; bound output.",
+        },
     )
 }
 
@@ -56,10 +62,14 @@ pub(super) fn routeros_shell_tool() -> Tool {
     )
 }
 
-pub(super) fn sudo_shell_tool() -> Tool {
+pub(super) fn sudo_shell_tool(mode: CommandShell) -> Tool {
     command_tool(
         "sudo_shell",
-        "POSIX sh under sudo: use explicit paths, not {a,b}; bound output and file reads.",
+        match mode {
+            CommandShell::Auto => "Bash if installed, else POSIX sh under sudo; bound output.",
+            CommandShell::Sh => "POSIX sh under sudo: no {a,b}; bound output.",
+            CommandShell::Bash => "Bash required under sudo; bound output.",
+        },
     )
 }
 
@@ -72,7 +82,8 @@ pub(super) fn transfer_tool(preferred: Option<&'static str>) -> Tool {
                 "enum": ["put", "get"]
             },
             "local_path": {
-                "type": "string"
+                "type": "string",
+                "description": "Relative to MCP server cwd, or absolute within it."
             },
             "remote_path": {
                 "type": "string"
@@ -129,7 +140,7 @@ pub(super) fn check_process_tool() -> Tool {
                 "type": "integer",
                 "minimum": 0,
                 "default": 0,
-                "description": "If initially running, wait locally this many seconds, then return one snapshot. Terminal states/errors return immediately; cancellation does not stop the remote job."
+                "description": "Seconds to wait if running, then one snapshot. Cancel does not stop the remote job."
             }
         },
         "required": ["job_id"]
@@ -138,7 +149,7 @@ pub(super) fn check_process_tool() -> Tool {
     let schema_obj = schema.as_object().cloned().unwrap_or_default();
     Tool::new(
         "check_process",
-        "Check a background job by job_id.",
+        "Poll job_id; inspect state, not tool success.",
         Arc::new(schema_obj),
     )
 }
@@ -174,7 +185,7 @@ fn patch_tool(name: &'static str, description: &'static str) -> Tool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_patch_tool, check_process_tool, routeros_shell_tool, shell_tool,
+        CommandShell, apply_patch_tool, check_process_tool, routeros_shell_tool, shell_tool,
         sudo_apply_patch_tool, sudo_shell_tool, transfer_tool,
     };
 
@@ -213,7 +224,10 @@ mod tests {
 
     #[test]
     fn command_tools_explain_client_specific_deadlines() {
-        for tool in [shell_tool(), sudo_shell_tool()] {
+        for tool in [
+            shell_tool(CommandShell::Auto),
+            sudo_shell_tool(CommandShell::Auto),
+        ] {
             let background_description =
                 tool.input_schema["properties"]["background"]["description"]
                     .as_str()
@@ -303,8 +317,8 @@ mod tests {
         const WIRE_BUDGET_BYTES: usize = 3200;
         for preferred in [None, Some("sftp"), Some("exec-raw")] {
             let tools = vec![
-                shell_tool(),
-                sudo_shell_tool(),
+                shell_tool(CommandShell::Auto),
+                sudo_shell_tool(CommandShell::Auto),
                 sudo_apply_patch_tool(),
                 check_process_tool(),
                 transfer_tool(preferred),

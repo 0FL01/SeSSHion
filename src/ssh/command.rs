@@ -762,7 +762,7 @@ impl SshConnectionManager {
                                     "\n[Tip: Use 'head -n 100' for first lines, 'tail -n 100' for last lines]",
                                 );
                                 output.stdout.push_str(
-                                    "\n[Tip: For large output use SFTP/SCP tools to download files]",
+                                    "\n[Tip: Save large output to a remote file; use transfer (get).]",
                                  );
 
                                 stdout_truncation_added = true;
@@ -824,7 +824,7 @@ impl SshConnectionManager {
                                         "\n[Tip: Use 'head -n 100' for first lines, 'tail -n 100' for last lines]",
                                     );
                                     output.stderr.push_str(
-                                        "\n[Tip: For large output use SFTP/SCP tools to download files]",
+                                        "\n[Tip: Save large output to a remote file; use transfer (get).]",
                                     );
 
                                     stderr_truncation_added = true;

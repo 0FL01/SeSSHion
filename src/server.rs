@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::background::job::NewRunningJob;
 use crate::background::transfer::{SharedTransferJob, TransferJobRegistry};
 use crate::background::{JobRegistry, JobState, LocalLogSpooler, SharedJobState};
-use crate::config::Config;
+use crate::config::{CommandShell, Config};
 use crate::error::{Result, SshMcpError};
 #[cfg(unix)]
 use crate::platform::O_NOFOLLOW_FLAG;
@@ -72,6 +72,9 @@ fn make_job_id() -> String {
 pub struct SshMcpServer {
     /// Server configuration
     config: Config,
+
+    /// Interpreter policy for user payloads, not internal POSIX scripts.
+    command_shell: CommandShell,
 
     /// SSH connection manager
     connection: Arc<SshConnectionManager>,
@@ -241,6 +244,7 @@ impl SshMcpServer {
 
         Ok(Self {
             config,
+            command_shell: CommandShell::default(),
             connection,
             startup_instructions: None,
             startup_transfer_preflight: StartupTransferPreflight::default(),
@@ -253,6 +257,13 @@ impl SshMcpServer {
             transfer_shutdown: CancellationToken::new(),
             transfer: TransferEngine::new(local_root),
         })
+    }
+
+    /// Select the POSIX user payload interpreter before serving tools.
+    #[must_use]
+    pub fn with_command_shell(mut self, command_shell: CommandShell) -> Self {
+        self.command_shell = command_shell;
+        self
     }
 
     /// Resolve the authenticated target before exposing a backend contract.
@@ -519,7 +530,8 @@ impl SshMcpServer {
             )]));
         }
 
-        self.execute_detachable_foreground_impl(&sanitized, &sanitized, timeout)
+        let payload = exec::user_payload(self.command_shell, &sanitized);
+        self.execute_detachable_foreground_impl(&payload, &sanitized, timeout)
             .await
     }
 
@@ -560,7 +572,8 @@ impl SshMcpServer {
 
         // Wrap the command with sudo
         let sudo_password = self.connection.get_sudo_password();
-        let wrapped_command = wrap_sudo_command(&sanitized, sudo_password);
+        let payload = exec::user_payload(self.command_shell, &sanitized);
+        let wrapped_command = wrap_sudo_command(&payload, sudo_password);
         debug!(
             "Wrapped sudo command (password hidden): sudo -n sh -c '...' or printf '...' | sudo ..."
         );
@@ -636,16 +649,6 @@ impl SshMcpServer {
                 CallToolResult::error(vec![ContentBlock::text(result_text)])
             }
         }
-    }
-
-    /// Build shell tool definition (compact)
-    fn shell_tool() -> Tool {
-        tools::shell_tool()
-    }
-
-    /// Build sudo_shell tool definition (compact)
-    fn sudo_shell_tool() -> Tool {
-        tools::sudo_shell_tool()
     }
 
     /// Build transfer tool definition (compact)
@@ -843,7 +846,10 @@ fn build_instructions(
         config.user,
         config.host,
         config.port,
-        preflight.hint(),
+        format_args!(
+            "{}\nCode Mode: use String.raw`...` for backslashes; JS still expands ${{...}}.",
+            preflight.hint()
+        ),
         snapshot,
     )
 }
@@ -900,11 +906,11 @@ impl ServerHandler for SshMcpServer {
             });
         }
 
-        let mut tools = vec![Self::shell_tool()];
+        let mut tools = vec![tools::shell_tool(self.command_shell)];
 
         // Stable order: shell, optional sudo tools, check_process, transfer, apply_patch.
         if !self.config.disable_sudo {
-            tools.push(Self::sudo_shell_tool());
+            tools.push(tools::sudo_shell_tool(self.command_shell));
             tools.push(Self::sudo_apply_patch_tool());
         }
         tools.push(Self::check_process_tool());
@@ -1220,14 +1226,14 @@ mod tests {
 
     #[test]
     fn test_shell_tool_definition() {
-        let tool = SshMcpServer::shell_tool();
+        let tool = tools::shell_tool(CommandShell::default());
         assert_eq!(tool.name.as_ref(), "shell");
         assert!(tool.description.is_some());
     }
 
     #[test]
     fn test_sudo_shell_tool_definition() {
-        let tool = SshMcpServer::sudo_shell_tool();
+        let tool = tools::sudo_shell_tool(CommandShell::default());
         assert_eq!(tool.name.as_ref(), "sudo_shell");
         assert!(tool.description.is_some());
     }

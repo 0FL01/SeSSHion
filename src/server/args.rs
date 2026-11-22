@@ -74,10 +74,12 @@ pub(super) fn parse_common_tool_args(
         .ok_or_else(|| McpError::invalid_params("Missing required parameter: command", None))?
         .to_string();
 
-    let background = args
-        .get("background")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let background = match args.get("background") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| McpError::invalid_params("background must be a boolean", None))?,
+    };
 
     let invalid_timeout =
         || McpError::invalid_params("timeout_ms must be a positive integer", None);
@@ -228,6 +230,16 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_background_is_not_treated_as_foreground() {
+        for background in [json!("true"), json!(1), json!(null)] {
+            let params = json!({"command": "echo hi", "background": background});
+            let error = parse_common_tool_args(params.as_object().unwrap()).unwrap_err();
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message.as_ref(), "background must be a boolean");
+        }
     }
 
     #[test]

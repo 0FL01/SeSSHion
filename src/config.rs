@@ -40,6 +40,18 @@ pub const MIN_HEALTH_PROBE_TIMEOUT_MS: u64 = 100;
 /// Maximum health probe timeout in milliseconds
 pub const MAX_HEALTH_PROBE_TIMEOUT_MS: u64 = 30_000;
 
+/// Interpreter policy for user payloads on POSIX targets.
+#[derive(clap::ValueEnum, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CommandShell {
+    /// Use system Bash when installed, otherwise use POSIX sh.
+    #[default]
+    Auto,
+    /// Always use POSIX sh.
+    Sh,
+    /// Require system Bash.
+    Bash,
+}
+
 /// SeSSHion CLI arguments
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ssh-mcp")]
@@ -90,6 +102,15 @@ pub struct Args {
     /// Password for `sudo` commands (if different from su_password)
     #[arg(long, env = "SSH_MCP_SUDO_PASSWORD")]
     pub sudo_password: Option<String>,
+
+    /// Interpreter for shell/sudo_shell on POSIX targets only
+    #[arg(
+        long,
+        env = "SSH_MCP_COMMAND_SHELL",
+        value_enum,
+        default_value = "auto"
+    )]
+    pub command_shell: CommandShell,
 
     /// Command execution timeout in milliseconds
     #[arg(long, default_value = "300000", env = "SSH_MCP_TIMEOUT")]
@@ -510,6 +531,7 @@ mod tests {
             spool_dir: None,
             su_password: None,
             sudo_password: None,
+            command_shell: CommandShell::Auto,
             timeout: DEFAULT_TIMEOUT_MS,
             max_chars: None,
             disable_sudo: false,

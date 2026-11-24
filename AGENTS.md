@@ -3,6 +3,7 @@
 SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM agents. It provides persistent connections, command execution, and explicit root elevation for remote Linux systems.
 
 Transfer calls require explicit `rsync`, `sftp`, `scp`, or `exec-raw`; reject missing/`null`/`auto` before dispatch or job creation. Never select or retry another transport. Rust `TransferParams::default()` uses `ExecRaw` only for construction, not as a serde/schema wire default.
+When changing truncation hints, keep Docker E2E assertions aligned with the MCP tool (`transfer (get)`, not SFTP/SCP tool names); run `cargo test --all-features --test docker_integration_test oom_tests`.
 
 ## Repository Structure
 

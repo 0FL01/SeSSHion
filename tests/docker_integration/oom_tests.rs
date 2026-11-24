@@ -129,8 +129,8 @@ async fn test_stdout_truncation() {
         "Output should contain head/tail tips"
     );
     assert!(
-        output.contains("SFTP") || output.contains("SCP"),
-        "Output should mention SFTP/SCP for large files"
+        output.contains("transfer (get)"),
+        "Output should point to transfer (get) for large files"
     );
 
     // Verify 4: Output is significantly smaller than the original ~800KB
@@ -329,10 +329,10 @@ async fn test_truncation_notice_present() {
         "Truncation notice should mention 'tail' command"
     );
 
-    // Verify 4: Contains "SFTP" or "SCP" tip
+    // Verify 4: Points to the MCP tool, not a specific transport
     assert!(
-        output.contains("SFTP") || output.contains("SCP"),
-        "Truncation notice should mention SFTP/SCP for large file transfers"
+        output.contains("transfer (get)"),
+        "Truncation notice should point to transfer (get)"
     );
 
     // Verify 5: Contains token count information
